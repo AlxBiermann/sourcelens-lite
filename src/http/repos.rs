@@ -402,7 +402,8 @@ async fn repo_ref(state: &AppState, id: i64) -> ApiResult<RepoRow> {
 }
 
 /// A disconnected repository gets one reconnect attempt: when GitHub confirms that the app can
-/// read it, it is connected through that installation again and a job is queued.
+/// read it, it is connected through that installation again. Callers queue the job themselves, so
+/// a reconnect does not queue a second one when a worker claims the first in between.
 async fn ensure_connected(state: &AppState, repo: RepoRow) -> ApiResult<RepoRow> {
     if repo.state == RepoState::Connected {
         return Ok(repo);
@@ -415,13 +416,10 @@ async fn ensure_connected(state: &AppState, repo: RepoRow) -> ApiResult<RepoRow>
         Err(err) => return Err(err),
     };
     let id = repo.id;
-    let reconnected = state
+    state
         .db
         .write(move |conn| repositories::reconnect(conn, Target::Id(id), installation_id))
         .await?;
-    if !reconnected.is_empty() {
-        jobs::enqueue(state, id, Trigger::Manual, None, false).await?;
-    }
     state
         .db
         .read(move |conn| repositories::get(conn, id))

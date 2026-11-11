@@ -292,15 +292,17 @@
   gap: var(--space-4) var(--space-5);
 }
 
+/* Tabs scroll sideways on narrow screens: a wrapped tab would read as a heading below the row. */
 .sl-tabs {
   display: flex;
-  flex-wrap: wrap;
   gap: var(--space-5);
+  overflow-x: auto;
   border-bottom: 1px solid var(--rule);
 }
 
 .sl-tab {
   display: inline-flex;
+  flex: none;
   align-items: center;
   min-height: var(--control-height);
   padding: var(--space-1) 0 0;
@@ -312,6 +314,11 @@
   font-weight: 600;
   text-decoration: none;
   cursor: pointer;
+}
+
+/* Inside the scrolling tab row an outer ring would be clipped. */
+.sl-tab:focus-visible {
+  outline-offset: -3px;
 }
 
 .sl-tab:hover {

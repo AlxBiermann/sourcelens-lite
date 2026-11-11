@@ -1061,6 +1061,45 @@ async fn forbidden_installation_lookup_disconnects_the_repository() {
     assert_eq!(env.repo_state().await.0, "disconnected");
 }
 
+/// The installation token still works when only this repository was removed from the installation,
+/// but GitHub answers 404 for its branch. The installation lookup separates that from a branch that
+/// does not exist.
+#[tokio::test]
+async fn branch_404_without_repository_access_disconnects_the_repository() {
+    for (lookup, expected_state) in [
+        (Some(StatusCode::NOT_FOUND), "disconnected"),
+        (None, "connected"),
+    ] {
+        let env = setup().await;
+        first_commit(&mut env.fake());
+        env.run("connect", false).await.unwrap();
+        let repo_id = env.repo_id;
+        env.state
+            .db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE repositories SET branch = 'gone' WHERE id = ?1",
+                    [repo_id],
+                )
+            })
+            .await
+            .unwrap();
+        env.fake().installation_status = lookup;
+
+        let job = env.run("manual", false).await.unwrap();
+        assert_eq!(job.status, "failed", "lookup {lookup:?}");
+        let (state, reason) = env.repo_state().await;
+        assert_eq!(state, expected_state, "lookup {lookup:?}");
+        if expected_state == "disconnected" {
+            assert_eq!(reason.as_deref(), Some("GitHub App has no access"));
+            assert!(job.error.is_some_and(|e| e.contains("no access")));
+        } else {
+            assert_eq!(reason, None);
+            assert!(job.error.is_some_and(|e| e.contains("gone")));
+        }
+    }
+}
+
 #[tokio::test]
 async fn tarball_is_written_owner_only() {
     use std::os::unix::fs::PermissionsExt;

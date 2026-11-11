@@ -864,6 +864,34 @@ async fn search_code_cuts_long_lines_in_text_and_structured_content() {
 }
 
 #[tokio::test]
+async fn get_code_cuts_long_lines_in_text_and_structured_content() {
+    let env = env();
+    let r1 = insert_repo(&env.state, 1, "acme/api", "connected").await;
+    let data_line = "B".repeat(400_000);
+    let content = format!("line 1\n{data_line}\nline 3\n");
+    insert_file(&env.state, r1, "notes/export.txt", None, Some(content)).await;
+    mark_indexed(&env.state, r1).await;
+    let key = create_key(&env.state, None).await;
+
+    let result = call(
+        &env.app,
+        &key,
+        "get_code",
+        json!({ "repository": "acme/api", "path": "notes/export.txt" }),
+    )
+    .await;
+    assert!(!is_error(&result), "{}", text(&result));
+    let body = text(&result);
+    assert!(body.len() < 2_000, "text has {} bytes", body.len());
+    assert!(body.contains("… [+399600 chars]"), "{body}");
+    assert!(body.contains("line 3"));
+    let structured = result["structuredContent"]["content"].as_str().unwrap();
+    assert!(structured.len() < 2_000, "content has {} bytes", structured.len());
+    assert!(structured.starts_with("line 1\nBBB"));
+    assert!(structured.ends_with("… [+399600 chars]\nline 3"), "{structured}");
+}
+
+#[tokio::test]
 async fn search_code_names_the_symbols_of_a_block() {
     let env = env();
     let r1 = insert_repo(&env.state, 1, "acme/api", "connected").await;

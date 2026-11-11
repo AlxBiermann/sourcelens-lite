@@ -75,7 +75,10 @@ function CreatedKey({ created, publicUrl, titleId }: { created: Created; publicU
     if (next === null) return;
     event.preventDefault();
     setTab(tabs[next].id);
-    tabRefs.current[next]?.focus();
+    const target = tabRefs.current[next];
+    target?.focus();
+    // The tab row scrolls sideways on narrow screens; focus alone leaves a partly hidden tab cut off.
+    target?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   }
 
   return (
