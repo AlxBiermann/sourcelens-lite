@@ -2,12 +2,17 @@
 
 use std::time::Duration;
 
+use rusqlite::Connection;
+
 use crate::index::embed;
 use crate::index::store::{self, knn};
 use crate::search::{retain_matching, Filter};
 use crate::state::AppState;
 
 const QUERY_EMBED_TIMEOUT: Duration = Duration::from_secs(5);
+/// Neighbours fetched per repository when a language or path filter drops some of them
+/// (sqlite-vec allows up to 4096).
+const FILTERED_K: usize = 1000;
 
 /// Chunk ids nearest to the embedded query, filtered like the other channels. `None` when
 /// embeddings are off, the vector table is missing or the query cannot be embedded.
@@ -54,13 +59,7 @@ pub async fn search(
     let filter = filter.clone();
     let result = state
         .db
-        .read(move |conn| {
-            let ids: Vec<i64> = knn(conn, &filter.repo_ids, &vector, limit)?
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect();
-            retain_matching(conn, &ids, &filter)
-        })
+        .read(move |conn| nearest(conn, &filter, &vector, limit))
         .await;
     match result {
         Ok(ids) => Some(ids),
@@ -69,4 +68,27 @@ pub async fn search(
             None
         }
     }
+}
+
+/// Up to `limit` chunk ids nearest to `vector` within `filter`, nearest first. With a language or
+/// path filter, [`FILTERED_K`] neighbours are fetched before filtering, so a narrow filter still
+/// finds its chunks.
+pub fn nearest(
+    conn: &Connection,
+    filter: &Filter,
+    vector: &[f32],
+    limit: usize,
+) -> rusqlite::Result<Vec<i64>> {
+    let k = if filter.filters_files() {
+        FILTERED_K.max(limit)
+    } else {
+        limit
+    };
+    let ids: Vec<i64> = knn(conn, &filter.repo_ids, vector, k)?
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let mut ids = retain_matching(conn, &ids, filter)?;
+    ids.truncate(limit);
+    Ok(ids)
 }

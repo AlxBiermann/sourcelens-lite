@@ -10,6 +10,7 @@ use sourcelens::http::session;
 use sourcelens::index::store;
 use sourcelens::mcp::authenticate;
 use sourcelens::state::{now, AppState};
+use std::time::Duration;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -453,20 +454,117 @@ async fn key_scope_excludes_disconnected_and_foreign_repositories() {
     let result = call(&env.app, &key_a, "list_repositories", json!({})).await;
     assert!(!text(&result).contains("acme/orders"));
 
-    // A key that was used gets last_used_at.
-    let used: Option<i64> = env
-        .state
-        .db
-        .read(move |c| {
-            c.query_row(
-                "SELECT last_used_at FROM api_keys WHERE id = ?1",
-                [scope.key_id],
-                |r| r.get(0),
-            )
+    // A key that was used gets last_used_at (written in the background).
+    assert!(last_used_at(&env.state, scope.key_id, true).await.is_some());
+}
+
+/// `api_keys.last_used_at`; with `wait`, polls for up to five seconds until it is set.
+async fn last_used_at(state: &AppState, key_id: i64, wait: bool) -> Option<i64> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let used: Option<i64> = state
+            .db
+            .read(move |c| {
+                c.query_row(
+                    "SELECT last_used_at FROM api_keys WHERE id = ?1",
+                    [key_id],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        if used.is_some() || !wait || std::time::Instant::now() > deadline {
+            return used;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn last_used_at_is_written_without_delaying_the_response() {
+    let env = env();
+    let key = create_key(&env.state, None).await;
+    let key_id = only_key_id(&env.state).await;
+
+    // Hold the writer until the response has arrived.
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let db = env.state.db.clone();
+    let holder = tokio::spawn(async move {
+        db.write(move |_conn| {
+            started_tx.send(()).ok();
+            release_rx.recv().ok();
+            Ok::<_, rusqlite::Error>(())
         })
         .await
         .unwrap();
-    assert!(used.is_some());
+    });
+    tokio::task::spawn_blocking(move || started_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let ping = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }).to_string();
+    let (status, _, _) =
+        tokio::time::timeout(Duration::from_secs(5), post_mcp(&env.app, Some(&key), ping))
+            .await
+            .expect("the response does not wait for the writer");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(last_used_at(&env.state, key_id, false).await, None);
+
+    release_tx.send(()).unwrap();
+    holder.await.unwrap();
+    assert!(last_used_at(&env.state, key_id, true).await.is_some());
+}
+
+/// Id of the only key, read directly so that no request touches it.
+async fn only_key_id(state: &AppState) -> i64 {
+    state
+        .db
+        .read(|c| c.query_row("SELECT id FROM api_keys", [], |r| r.get(0)))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn requests_beyond_the_burst_are_rate_limited_per_key() {
+    let env = env();
+    let key = create_key(&env.state, None).await;
+    let ping = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }).to_string();
+
+    let mut allowed = 0;
+    let mut limited = None;
+    for _ in 0..200 {
+        let (status, headers, body) = post_mcp(&env.app, Some(&key), ping.clone()).await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            limited = Some((headers, body));
+            break;
+        }
+        assert_eq!(status, StatusCode::OK);
+        allowed += 1;
+    }
+    assert!(allowed >= 20, "the burst allows 20 requests, got {allowed}");
+    let (headers, body) = limited.expect("a request beyond the burst is limited");
+    let retry_after: u64 = headers[header::RETRY_AFTER]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(retry_after >= 1);
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], -32000);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("Rate limit exceeded"));
+
+    let other = create_key(&env.state, None).await;
+    let ping = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }).to_string();
+    assert_eq!(
+        post_mcp(&env.app, Some(&other), ping).await.0,
+        StatusCode::OK,
+        "keys have separate budgets"
+    );
 }
 
 #[tokio::test]
@@ -1020,4 +1118,129 @@ async fn find_symbol_scopes_and_reports_unknown_repositories() {
     .await;
     assert!(!is_error(&scoped));
     assert_eq!(scoped["structuredContent"]["symbols"], json!([]));
+}
+
+#[tokio::test]
+async fn search_code_cuts_long_lines_in_text_and_structured_content() {
+    let env = env();
+    let r1 = insert_repo(&env.state, 1, "acme/api", "connected").await;
+    let mut notebook = String::new();
+    for i in 0..1000 {
+        notebook.push_str(&format!("cell {i}\n"));
+        if i == 500 {
+            // One 420 KB line; the file's average line stays far below the minified threshold.
+            notebook.push_str(&"pixel ".repeat(70_000));
+            notebook.push('\n');
+        }
+    }
+    index(
+        &env.state,
+        r1,
+        vec![("notes/analysis.txt".into(), notebook.into_bytes())],
+    )
+    .await;
+    let key = create_key(&env.state, None).await;
+
+    let result = call(&env.app, &key, "search_code", json!({ "query": "pixel" })).await;
+    assert!(!is_error(&result), "{}", text(&result));
+    let body = text(&result);
+    assert!(body.len() < 30_000, "text has {} bytes", body.len());
+    assert!(body.contains("… [+"), "{body}");
+    let results = result["structuredContent"]["results"].as_array().unwrap();
+    assert!(!results.is_empty());
+    let contents: Vec<&str> = results
+        .iter()
+        .map(|hit| hit["content"].as_str().unwrap())
+        .collect();
+    assert!(contents.iter().any(|content| content.contains("… [+")));
+    for content in contents {
+        assert!(
+            content.len() < 10_000,
+            "content has {} bytes",
+            content.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn search_code_names_the_symbols_of_a_block() {
+    let env = env();
+    let r1 = insert_repo(&env.state, 1, "acme/api", "connected").await;
+    let tiny = "export function tinyAlpha(): number {\n  return 1;\n}\n\n\
+                export function tinyBeta(): number {\n  return 2;\n}\n";
+    index(&env.state, r1, vec![("src/tiny.ts".into(), tiny.into())]).await;
+    let key = create_key(&env.state, None).await;
+
+    let result = call(
+        &env.app,
+        &key,
+        "search_code",
+        json!({ "query": "tinyBeta" }),
+    )
+    .await;
+    assert!(!is_error(&result), "{}", text(&result));
+    assert!(
+        text(&result).contains("src/tiny.ts:1-7  block tinyAlpha, tinyBeta"),
+        "{}",
+        text(&result)
+    );
+    assert_eq!(
+        result["structuredContent"]["results"][0]["names"],
+        json!(["tinyAlpha", "tinyBeta"])
+    );
+}
+
+#[tokio::test]
+async fn find_symbol_returns_headings_only_when_asked() {
+    let env = env();
+    let r1 = insert_repo(&env.state, 1, "acme/api", "connected").await;
+    index(
+        &env.state,
+        r1,
+        vec![
+            (
+                "README.md".into(),
+                b"# Shop\n\n## Retry and backoff\n\nFailed calls are attempted again.\n".to_vec(),
+            ),
+            (
+                "src/retry.ts".into(),
+                b"export function retryRequest(url: string): string {\n  return url;\n}\n".to_vec(),
+            ),
+        ],
+    )
+    .await;
+    let key = create_key(&env.state, None).await;
+
+    let kinds = |result: &Value| -> Vec<String> {
+        result["structuredContent"]["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["kind"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let default = call(&env.app, &key, "find_symbol", json!({ "name": "Retry" })).await;
+    assert_eq!(kinds(&default), ["function"], "{}", text(&default));
+
+    let headings = call(
+        &env.app,
+        &key,
+        "find_symbol",
+        json!({ "name": "Retry", "kind": "heading" }),
+    )
+    .await;
+    assert_eq!(kinds(&headings), ["heading_2"], "{}", text(&headings));
+    assert_eq!(
+        headings["structuredContent"]["symbols"][0]["path"],
+        "README.md"
+    );
+
+    let level = call(
+        &env.app,
+        &key,
+        "find_symbol",
+        json!({ "name": "Retry", "kind": "heading_2" }),
+    )
+    .await;
+    assert_eq!(kinds(&level), ["heading_2"]);
 }

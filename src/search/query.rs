@@ -4,6 +4,12 @@ use crate::index::store::camel_parts;
 
 const MAX_QUERY_CHARS: usize = 512;
 const MAX_SYMBOL_CANDIDATES: usize = 4;
+/// More groups make one request expensive (every group is a prefix term over the whole index).
+pub const MAX_GROUPS: usize = 16;
+/// Suffix rules for the stemmed variant of a natural-language word, tried in order.
+const STEM_RULES: &[(&str, &str)] = &[("ies", "y"), ("es", ""), ("s", ""), ("ed", ""), ("ing", "")];
+/// A stem must keep at least this many chars.
+const MIN_STEM_CHARS: usize = 3;
 
 const STOP_WORDS: &[&str] = &[
     "a", "an", "the", "of", "in", "on", "to", "for", "is", "are", "was", "be", "how", "what",
@@ -11,18 +17,31 @@ const STOP_WORDS: &[&str] = &[
     "and", "or", "with", "from", "at", "as", "by",
 ];
 
-/// One query token: matched as a whole (prefix) or as all of its identifier parts.
+/// One query token: matched as a whole (prefix), as its stemmed variant, or as all of its
+/// identifier parts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Group {
     pub whole: String,
+    /// Stem of a natural-language word (`retries` → `retry`); `None` for code-like words.
+    pub variant: Option<String>,
     pub parts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryPlan {
+    /// At most [`MAX_GROUPS`].
     pub groups: Vec<Group>,
     pub symbol_candidates: Vec<String>,
     pub terms: Vec<String>,
+}
+
+/// `retries` → `retry`, `handled` → `handl`, `users` → `user`; `None` when no rule leaves
+/// [`MIN_STEM_CHARS`].
+fn stem(word: &str) -> Option<String> {
+    STEM_RULES.iter().find_map(|(suffix, replacement)| {
+        let base = word.strip_suffix(suffix)?;
+        (base.chars().count() >= MIN_STEM_CHARS).then(|| format!("{base}{replacement}"))
+    })
 }
 
 fn is_code_like(word: &str) -> bool {
@@ -48,9 +67,12 @@ pub fn plan(query: &str) -> Option<QueryPlan> {
             }
             let parts = camel_parts(piece);
             let parts = if parts.len() > 1 { parts } else { Vec::new() };
+            let whole = piece.to_lowercase();
+            let variant = if code_like { None } else { stem(&whole) };
             candidates.push((
                 Group {
-                    whole: piece.to_lowercase(),
+                    whole,
+                    variant,
                     parts,
                 },
                 code_like,
@@ -71,6 +93,9 @@ pub fn plan(query: &str) -> Option<QueryPlan> {
             continue;
         }
         groups.push(candidate.0);
+        if groups.len() == MAX_GROUPS {
+            break;
+        }
     }
     if groups.is_empty() {
         return None;
@@ -78,7 +103,10 @@ pub fn plan(query: &str) -> Option<QueryPlan> {
 
     let mut terms: Vec<String> = Vec::new();
     for group in &groups {
-        for term in std::iter::once(&group.whole).chain(&group.parts) {
+        let words = std::iter::once(&group.whole)
+            .chain(&group.variant)
+            .chain(&group.parts);
+        for term in words {
             if !terms.contains(term) {
                 terms.push(term.clone());
             }

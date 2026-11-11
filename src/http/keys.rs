@@ -16,6 +16,7 @@ use crate::state::{lock, now, AppState};
 
 pub const KEY_PREFIX: &str = "sl_";
 const ALLOWED_EXPIRY_DAYS: [i64; 3] = [30, 90, 365];
+pub(crate) const SECS_PER_DAY: i64 = 86_400;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -157,7 +158,7 @@ pub async fn create_key(
     let name = valid_name(&input.name)?;
     let expires_at = match input.expires_in_days {
         None => None,
-        Some(days) if ALLOWED_EXPIRY_DAYS.contains(&days) => Some(now() + days * 86_400),
+        Some(days) if ALLOWED_EXPIRY_DAYS.contains(&days) => Some(now() + days * SECS_PER_DAY),
         Some(_) => {
             return Err(ApiError::unprocessable(
                 "invalid_expiry",
@@ -177,7 +178,8 @@ pub async fn create_key(
         .write(move |conn| -> ApiResult<ApiKey> {
             let tx = conn.transaction()?;
             tx.execute(
-                "INSERT INTO api_keys (name, key_hash, last4, all_repos, created_by, created_at, expires_at)
+                "INSERT INTO api_keys
+                   (name, key_hash, last4, all_repos, created_by, created_at, expires_at)
                  VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6)",
                 params![name, key_hash, last4, created_by, now(), expires_at],
             )?;
@@ -252,9 +254,11 @@ fn load_keys(conn: &Connection, only_id: Option<i64>) -> rusqlite::Result<Vec<Ap
         }
     }
     let mut stmt = conn.prepare(
-        "SELECT k.id, k.name, k.last4, k.all_repos, u.login, k.created_at, k.expires_at, k.last_used_at
+        "SELECT k.id, k.name, k.last4, k.all_repos, u.login, k.created_at, k.expires_at,
+                k.last_used_at
          FROM api_keys k LEFT JOIN users u ON u.id = k.created_by
-         WHERE ?1 IS NULL OR k.id = ?1 ORDER BY k.id DESC",
+         WHERE ?1 IS NULL OR k.id = ?1
+         ORDER BY k.id DESC",
     )?;
     let keys = stmt
         .query_map([only_id], |r| {
