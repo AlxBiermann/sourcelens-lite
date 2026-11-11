@@ -15,11 +15,11 @@ use serde_json::{json, Map, Value};
 
 use crate::crypto::sha256_hex;
 use crate::error::{ApiError, ApiResult};
-use crate::http::keys::{KEY_PREFIX, SECS_PER_DAY};
+use crate::http::keys::KEY_PREFIX;
 use crate::repositories::{self, RepoRow, CONNECTED_IDS};
 use crate::search::symbols::{self, SymbolRow};
 use crate::search::{self, Filter, SearchHit, SearchRequest};
-use crate::state::{lock, now, AppState};
+use crate::state::{lock, now, AppState, SECS_PER_DAY};
 
 const SUPPORTED_VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "2025-03-26"];
 const LATEST_VERSION: &str = SUPPORTED_VERSIONS[0];

@@ -1,20 +1,16 @@
+mod common;
+
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::Router;
+use common::{index_files, insert_repo_async as insert_repo, mcp_request, new_state, PUBLIC_URL};
 use serde_json::{json, Value};
-use sourcelens::config::Config;
-use sourcelens::crypto;
-use sourcelens::github::oauth::GhToken;
 use sourcelens::http::keys::{self, NewKey};
-use sourcelens::http::session;
-use sourcelens::index::store;
 use sourcelens::mcp::authenticate;
 use sourcelens::state::{now, AppState};
 use std::time::Duration;
 use tempfile::TempDir;
-use tower::ServiceExt;
 
-const PUBLIC_ORIGIN: &str = "http://localhost:3000";
 const COMMIT: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
 /// 2026-11-11 00:00:00 UTC.
 const INDEXED_AT: i64 = 1_794_355_200;
@@ -27,30 +23,13 @@ struct Env {
 
 fn env() -> Env {
     let tmp = tempfile::tempdir().unwrap();
-    let state = AppState::new(Config::new(PUBLIC_ORIGIN, tmp.path())).unwrap();
+    let state = new_state(&tmp, |_| {});
     let app = sourcelens::http::router(state.clone());
     Env {
         _tmp: tmp,
         state,
         app,
     }
-}
-
-async fn insert_repo(state: &AppState, github_id: i64, full_name: &str, repo_state: &str) -> i64 {
-    let full_name = full_name.to_string();
-    let repo_state = repo_state.to_string();
-    state
-        .db
-        .write(move |c| {
-            c.execute(
-                "INSERT INTO repositories (github_id, installation_id, full_name, private, default_branch, state, created_at)
-                 VALUES (?1, 1, ?2, 0, 'main', ?3, 0)",
-                rusqlite::params![github_id, full_name, repo_state],
-            )?;
-            Ok::<_, rusqlite::Error>(c.last_insert_rowid())
-        })
-        .await
-        .unwrap()
 }
 
 async fn mark_indexed(state: &AppState, repo_id: i64) {
@@ -70,15 +49,7 @@ async fn mark_indexed(state: &AppState, repo_id: i64) {
 
 /// Indexes files through the real store.
 async fn index(state: &AppState, repo_id: i64, files: Vec<(String, Vec<u8>)>) {
-    let prepared: Vec<_> = files
-        .iter()
-        .map(|(path, bytes)| store::prepare_file(path, &crypto::git_blob_sha1(bytes), bytes))
-        .collect();
-    state
-        .db
-        .write(move |c| store::apply_files(c, repo_id, &prepared))
-        .await
-        .unwrap();
+    index_files(state, repo_id, files.as_slice()).await;
     mark_indexed(state, repo_id).await;
 }
 
@@ -121,24 +92,8 @@ async fn create_key(state: &AppState, repository_ids: Option<Vec<i64>>) -> Strin
 }
 
 async fn send(app: &Router, req: Request<Body>) -> (StatusCode, HeaderMap, Vec<u8>) {
-    let res = app.clone().oneshot(req).await.unwrap();
-    let status = res.status();
-    let headers = res.headers().clone();
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
-        .await
-        .unwrap()
-        .to_vec();
-    (status, headers, body)
-}
-
-fn mcp_request(key: Option<&str>) -> axum::http::request::Builder {
-    let mut builder = Request::post("/mcp")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::ACCEPT, "application/json, text/event-stream");
-    if let Some(key) = key {
-        builder = builder.header(header::AUTHORIZATION, format!("Bearer {key}"));
-    }
-    builder
+    let reply = common::send(app, req).await;
+    (reply.status, reply.headers, reply.text.into_bytes())
 }
 
 async fn post_mcp(
@@ -218,27 +173,6 @@ async fn expired_key_is_unauthorized() {
         .unwrap();
     let (status, _, _) = post_mcp(&env.app, Some(&key), ping).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn deleted_key_is_unauthorized() {
-    let env = env();
-    let key = create_key(&env.state, None).await;
-    let ping = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }).to_string();
-    assert_eq!(
-        post_mcp(&env.app, Some(&key), ping.clone()).await.0,
-        StatusCode::OK
-    );
-
-    env.state
-        .db
-        .write(|c| c.execute("DELETE FROM api_keys", []))
-        .await
-        .unwrap();
-    assert_eq!(
-        post_mcp(&env.app, Some(&key), ping).await.0,
-        StatusCode::UNAUTHORIZED
-    );
 }
 
 #[tokio::test]
@@ -393,7 +327,7 @@ async fn transport_rejects_wrong_method_origin_and_body() {
         .unwrap();
     assert_eq!(send(&env.app, foreign).await.0, StatusCode::FORBIDDEN);
     let own = mcp_request(Some(&key))
-        .header(header::ORIGIN, PUBLIC_ORIGIN)
+        .header(header::ORIGIN, PUBLIC_URL)
         .body(Body::from(ping))
         .unwrap();
     assert_eq!(send(&env.app, own).await.0, StatusCode::OK);
@@ -565,239 +499,6 @@ async fn requests_beyond_the_burst_are_rate_limited_per_key() {
         StatusCode::OK,
         "keys have separate budgets"
     );
-}
-
-#[tokio::test]
-async fn create_key_validates_input() {
-    let env = env();
-    let repo = insert_repo(&env.state, 1, "acme/api", "connected").await;
-
-    let blank = NewKey {
-        name: "  ".into(),
-        expires_in_days: None,
-        repository_ids: None,
-    };
-    assert_eq!(
-        keys::create_key(&env.state, blank, None)
-            .await
-            .unwrap_err()
-            .code,
-        "name_required"
-    );
-    let empty = NewKey {
-        name: "ci".into(),
-        expires_in_days: None,
-        repository_ids: Some(vec![]),
-    };
-    assert_eq!(
-        keys::create_key(&env.state, empty, None)
-            .await
-            .unwrap_err()
-            .code,
-        "no_repositories"
-    );
-    let odd_expiry = NewKey {
-        name: "ci".into(),
-        expires_in_days: Some(7),
-        repository_ids: None,
-    };
-    assert_eq!(
-        keys::create_key(&env.state, odd_expiry, None)
-            .await
-            .unwrap_err()
-            .status,
-        StatusCode::UNPROCESSABLE_ENTITY
-    );
-
-    let input = NewKey {
-        name: "ci".into(),
-        expires_in_days: Some(90),
-        repository_ids: Some(vec![repo]),
-    };
-    let (key, secret) = keys::create_key(&env.state, input, None).await.unwrap();
-    assert!(secret.starts_with("sl_"));
-    assert_eq!(secret.len(), 67);
-    assert_eq!(key.last4, secret[63..]);
-    assert!(!key.all_repositories);
-    assert_eq!(key.repository_ids, vec![repo]);
-    let expires_at = key.expires_at.unwrap();
-    assert!((expires_at - (now() + 90 * 86_400)).abs() < 60);
-
-    let stored: String = env
-        .state
-        .db
-        .read(|c| c.query_row("SELECT key_hash FROM api_keys", [], |r| r.get(0)))
-        .await
-        .unwrap();
-    assert_eq!(stored, crypto::sha256_hex(secret.as_bytes()));
-}
-
-async fn api(
-    app: &Router,
-    method: Method,
-    path: &str,
-    cookie: &str,
-    body: Option<Value>,
-) -> (StatusCode, Value, String) {
-    let mut builder = Request::builder()
-        .method(method)
-        .uri(path)
-        .header(header::ORIGIN, PUBLIC_ORIGIN)
-        .header(
-            header::COOKIE,
-            format!("{}={cookie}", session::SESSION_COOKIE),
-        );
-    let body = match body {
-        Some(body) => {
-            builder = builder.header(header::CONTENT_TYPE, "application/json");
-            Body::from(body.to_string())
-        }
-        None => Body::empty(),
-    };
-    let (status, _, bytes) = send(app, builder.body(body).unwrap()).await;
-    let raw = String::from_utf8_lossy(&bytes).into_owned();
-    let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, value, raw)
-}
-
-#[tokio::test]
-async fn keys_api_through_the_router() {
-    let env = env();
-    let r1 = insert_repo(&env.state, 1, "acme/api", "connected").await;
-    let r2 = insert_repo(&env.state, 2, "acme/orders", "connected").await;
-    let user_id = env
-        .state
-        .db
-        .write(|c| {
-            c.execute("INSERT INTO users (github_id, login, role, created_at) VALUES (7, 'alex', 'member', 0)", [])?;
-            Ok::<_, rusqlite::Error>(c.last_insert_rowid())
-        })
-        .await
-        .unwrap();
-    let token = GhToken {
-        access_token: "gho_test".into(),
-        refresh_token: None,
-        expires_at: i64::MAX,
-    };
-    let cookie = session::create_session(&env.state, user_id, &token)
-        .await
-        .unwrap();
-    let app = &env.app;
-
-    let (status, body, _) = api(
-        app,
-        Method::POST,
-        "/api/keys",
-        &cookie,
-        Some(json!({ "name": " ", "expiresInDays": null, "repositoryIds": null })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body["error"]["code"], "name_required");
-    let (status, body, _) = api(
-        app,
-        Method::POST,
-        "/api/keys",
-        &cookie,
-        Some(json!({ "name": "ci", "expiresInDays": null, "repositoryIds": [] })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body["error"]["code"], "no_repositories");
-
-    let (status, created, _) = api(
-        app,
-        Method::POST,
-        "/api/keys",
-        &cookie,
-        Some(json!({ "name": "ci", "expiresInDays": 30, "repositoryIds": [r1] })),
-    )
-    .await;
-    assert!(status.is_success(), "{created}");
-    let secret = created["secret"].as_str().unwrap().to_string();
-    let id = created["key"]["id"].as_i64().unwrap();
-    assert_eq!(created["key"]["createdBy"], "alex");
-    assert_eq!(created["key"]["allRepositories"], false);
-    assert_eq!(created["key"]["repositoryIds"], json!([r1]));
-
-    let (status, listed, raw) = api(app, Method::GET, "/api/keys", &cookie, None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(listed.as_array().unwrap().len(), 1);
-    assert!(
-        !raw.contains(&secret),
-        "the secret must only appear in the create response"
-    );
-    assert!(!raw.contains(&secret[3..]));
-
-    assert_eq!(
-        authenticate(&env.state, &secret).await.unwrap().repo_ids,
-        vec![r1]
-    );
-
-    let (status, patched, _) = api(
-        app,
-        Method::PATCH,
-        &format!("/api/keys/{id}"),
-        &cookie,
-        Some(json!({ "repositoryIds": [r2] })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(patched["repositoryIds"], json!([r2]));
-    assert_eq!(
-        authenticate(&env.state, &secret).await.unwrap().repo_ids,
-        vec![r2]
-    );
-
-    let (_, patched, _) = api(
-        app,
-        Method::PATCH,
-        &format!("/api/keys/{id}"),
-        &cookie,
-        Some(json!({ "name": "renamed" })),
-    )
-    .await;
-    assert_eq!(patched["name"], "renamed");
-    assert_eq!(patched["repositoryIds"], json!([r2]));
-
-    let (_, patched, _) = api(
-        app,
-        Method::PATCH,
-        &format!("/api/keys/{id}"),
-        &cookie,
-        Some(json!({ "repositoryIds": null })),
-    )
-    .await;
-    assert_eq!(patched["allRepositories"], true);
-    assert_eq!(
-        authenticate(&env.state, &secret).await.unwrap().repo_ids,
-        vec![r1, r2]
-    );
-
-    let (status, _, raw) = api(
-        app,
-        Method::DELETE,
-        &format!("/api/keys/{id}"),
-        &cookie,
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    assert!(raw.is_empty());
-    let ping = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }).to_string();
-    assert_eq!(
-        post_mcp(app, Some(&secret), ping).await.0,
-        StatusCode::UNAUTHORIZED
-    );
-    let (status, _, _) = api(
-        app,
-        Method::DELETE,
-        &format!("/api/keys/{id}"),
-        &cookie,
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 // ── get_code ─────────────────────────────────────────────────────────────────

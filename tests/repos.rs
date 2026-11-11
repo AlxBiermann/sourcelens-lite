@@ -1,24 +1,17 @@
+mod common;
+
 use axum::body::Body;
 use axum::extract::Path;
 use axum::http::{header, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use ring::hmac;
+use common::{api, credentials, error_code, new_state, owner_session, serve, sign_webhook};
 use serde_json::{json, Value};
-use sourcelens::config::Config;
-use sourcelens::crypto;
-use sourcelens::github::app::AppCredentials;
-use sourcelens::github::oauth::GhToken;
 use sourcelens::http;
-use sourcelens::http::session::create_session;
-use sourcelens::index::jobs;
-use sourcelens::model::Trigger;
-use sourcelens::state::{now, AppState};
+use sourcelens::state::AppState;
 use tempfile::TempDir;
 use tower::ServiceExt;
-
-const PUBLIC_URL: &str = "http://localhost:3000";
 
 // ── Fake GitHub ──────────────────────────────────────────────────────────────
 
@@ -92,31 +85,10 @@ async fn start_fake() -> String {
                 ] }))
             }),
         );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    format!("http://{addr}")
+    serve(app).await
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-fn credentials() -> AppCredentials {
-    let pem = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/test_only_app_key.pem"
-    ))
-    .unwrap();
-    AppCredentials {
-        app_id: 4242,
-        slug: "sourcelens-test".into(),
-        client_id: "Iv1.test".into(),
-        client_secret: "client-secret".into(),
-        webhook_secret: Some("hook-secret".into()),
-        private_key_pem: pem,
-        html_url: "https://github.com/apps/sourcelens-test".into(),
-        source: "env",
-    }
-}
 
 struct Env {
     _tmp: TempDir,
@@ -126,27 +98,12 @@ struct Env {
 
 async fn setup() -> Env {
     let tmp = tempfile::tempdir().unwrap();
-    let mut cfg = Config::new(PUBLIC_URL, tmp.path());
-    cfg.github = Some(credentials());
-    cfg.github_api_url = start_fake().await;
-    let state = AppState::new(cfg).unwrap();
-    let user_id: i64 = state
-        .db
-        .write(|conn| {
-            conn.query_row(
-                "INSERT INTO users (github_id, login, role, created_at) VALUES (1, 'alex', 'owner', ?1) RETURNING id",
-                [now()],
-                |row| row.get(0),
-            )
-        })
-        .await
-        .unwrap();
-    let token = GhToken {
-        access_token: "gho_user".into(),
-        refresh_token: None,
-        expires_at: i64::MAX,
-    };
-    let cookie = create_session(&state, user_id, &token).await.unwrap();
+    let base = start_fake().await;
+    let state = new_state(&tmp, |cfg| {
+        cfg.github = Some(credentials());
+        cfg.github_api_url = base;
+    });
+    let cookie = owner_session(&state, "alex").await;
     Env {
         _tmp: tmp,
         state,
@@ -156,29 +113,8 @@ async fn setup() -> Env {
 
 impl Env {
     async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
-        let mut builder = Request::builder()
-            .method(method)
-            .uri(uri)
-            .header(header::COOKIE, format!("sl_session={}", self.cookie));
-        if method != "GET" {
-            builder = builder.header(header::ORIGIN, PUBLIC_URL);
-        }
-        let request = match body {
-            Some(body) => builder
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-            None => builder.body(Body::empty()).unwrap(),
-        };
-        let response = http::router(self.state.clone())
-            .oneshot(request)
-            .await
-            .unwrap();
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        let app = http::router(self.state.clone());
+        let (status, body, _) = api(&app, method, uri, &self.cookie, body).await;
         (status, body)
     }
 
@@ -206,10 +142,6 @@ impl Env {
             .await
             .unwrap()
     }
-}
-
-fn error_code(body: &Value) -> &str {
-    body["error"]["code"].as_str().unwrap_or_default()
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -265,19 +197,6 @@ async fn connect_without_access_is_not_found() {
 }
 
 #[tokio::test]
-async fn requests_without_session_are_rejected() {
-    let env = setup().await;
-    let request = Request::get("/api/repositories")
-        .body(Body::empty())
-        .unwrap();
-    let response = http::router(env.state.clone())
-        .oneshot(request)
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
 async fn branch_change_is_verified_and_queues_a_job() {
     let env = setup().await;
     let (_, body) = env.connect().await;
@@ -318,6 +237,13 @@ async fn branch_change_is_verified_and_queues_a_job() {
         (body["branch"].clone(), body["effectiveBranch"].as_str()),
         (Value::Null, Some("main"))
     );
+}
+
+#[tokio::test]
+async fn branches_lists_the_default_and_the_repository_branches() {
+    let env = setup().await;
+    let (_, body) = env.connect().await;
+    let id = body["id"].as_i64().unwrap();
 
     let (status, body) = env
         .call("GET", &format!("/api/repositories/{id}/branches"), None)
@@ -562,11 +488,7 @@ async fn webhook_disconnect_removes_the_queued_job() {
     let payload =
         json!({ "action": "deleted", "repository": { "id": 5001, "full_name": "acme/api" } })
             .to_string();
-    let key = hmac::Key::new(hmac::HMAC_SHA256, b"hook-secret");
-    let signature = format!(
-        "sha256={}",
-        crypto::hex(hmac::sign(&key, payload.as_bytes()).as_ref())
-    );
+    let signature = sign_webhook(payload.as_bytes());
     let request = Request::post("/webhooks/github")
         .header(header::CONTENT_TYPE, "application/json")
         .header("x-github-event", "repository")
@@ -586,136 +508,4 @@ async fn webhook_disconnect_removes_the_queued_job() {
     assert_eq!(list[0]["state"], "disconnected");
     assert_eq!(list[0]["stateReason"], "Deleted on GitHub");
     assert_eq!(list[0]["activeJob"], Value::Null);
-}
-
-/// A state without GitHub credentials: every job fails at once with `app_not_configured`.
-async fn bare_state() -> (TempDir, AppState) {
-    let tmp = tempfile::tempdir().unwrap();
-    let state = AppState::new(Config::new(PUBLIC_URL, tmp.path())).unwrap();
-    (tmp, state)
-}
-
-async fn insert_repo(state: &AppState, github_id: i64, repo_state: &str) -> i64 {
-    let repo_state = repo_state.to_string();
-    state
-        .db
-        .write(move |conn| {
-            conn.query_row(
-                "INSERT INTO repositories (github_id, installation_id, full_name, private, default_branch, state, created_at)
-                 VALUES (?1, 42, 'acme/repo-' || ?1, 0, 'main', ?2, 0)
-                 RETURNING id",
-                rusqlite::params![github_id, repo_state],
-                |row| row.get(0),
-            )
-        })
-        .await
-        .unwrap()
-}
-
-#[tokio::test]
-async fn failed_result_write_is_retried_and_the_job_does_not_stay_running() {
-    let (_tmp, state) = bare_state().await;
-    let repo_id = insert_repo(&state, 1, "connected").await;
-    // The first two attempts at writing a final status fail, as on a full disk.
-    state
-        .db
-        .write(|conn| {
-            conn.execute_batch(
-                "CREATE TABLE test_result_failures (remaining INTEGER NOT NULL);
-                 INSERT INTO test_result_failures VALUES (2);
-                 CREATE TRIGGER test_fail_result BEFORE UPDATE OF status ON jobs
-                 WHEN NEW.status IN ('succeeded', 'failed')
-                   AND (SELECT remaining FROM test_result_failures) > 0
-                 BEGIN
-                   UPDATE test_result_failures SET remaining = remaining - 1;
-                   SELECT RAISE(FAIL, 'simulated full disk');
-                 END;",
-            )
-        })
-        .await
-        .unwrap();
-    jobs::enqueue(&state, repo_id, Trigger::Manual, None, false)
-        .await
-        .unwrap();
-
-    assert!(jobs::run_next(&state).await.unwrap());
-    let (status, error, remaining): (String, Option<String>, i64) = state
-        .db
-        .read(move |conn| {
-            conn.query_row(
-                "SELECT status, error, (SELECT remaining FROM test_result_failures)
-                 FROM jobs WHERE repo_id = ?1",
-                [repo_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-        })
-        .await
-        .unwrap();
-    assert_eq!((status.as_str(), remaining), ("failed", 0));
-    assert!(error.is_some());
-}
-
-#[tokio::test]
-async fn startup_reconcile_continues_after_a_failing_repository() {
-    let (_tmp, state) = bare_state().await;
-    // The failing repositories come first, so an early return would skip the others.
-    let enqueue_fails = insert_repo(&state, 1, "connected").await;
-    let purge_fails = insert_repo(&state, 2, "deleting").await;
-    let first = insert_repo(&state, 3, "connected").await;
-    let purged = insert_repo(&state, 4, "deleting").await;
-    let second = insert_repo(&state, 5, "connected").await;
-    state
-        .db
-        .write(move |conn| {
-            conn.execute_batch(&format!(
-                "CREATE TRIGGER test_fail_enqueue BEFORE INSERT ON jobs WHEN NEW.repo_id = {enqueue_fails}
-                 BEGIN SELECT RAISE(ABORT, 'simulated enqueue failure'); END;
-                 CREATE TRIGGER test_fail_purge BEFORE DELETE ON repositories WHEN OLD.id = {purge_fails}
-                 BEGIN SELECT RAISE(ABORT, 'simulated purge failure'); END;"
-            ))
-        })
-        .await
-        .unwrap();
-
-    jobs::recover_and_reconcile(&state).await.unwrap();
-
-    let queued: Vec<(i64, String)> = state
-        .db
-        .read(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT repo_id, trigger FROM jobs WHERE status = 'queued' ORDER BY repo_id",
-            )?;
-            let rows = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok::<_, rusqlite::Error>(rows)
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        queued,
-        vec![(first, "startup".into()), (second, "startup".into())]
-    );
-
-    // Purges run in the background.
-    let mut remaining = Vec::new();
-    for _ in 0..400 {
-        remaining = state
-            .db
-            .read(|conn| {
-                let mut stmt = conn
-                    .prepare("SELECT id FROM repositories WHERE state = 'deleting' ORDER BY id")?;
-                let rows = stmt
-                    .query_map([], |row| row.get::<_, i64>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok::<_, rusqlite::Error>(rows)
-            })
-            .await
-            .unwrap();
-        if !remaining.contains(&purged) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    assert_eq!(remaining, vec![purge_fails]);
 }

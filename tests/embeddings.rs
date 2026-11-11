@@ -1,32 +1,29 @@
+mod common;
+
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use common::{
+    api, functions_source, index_files, index_sample, insert_repo_async, member_session, new_state,
+    owner_session, scalar, serve,
+};
 use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
-use sourcelens::config::Config;
-use sourcelens::crypto::git_blob_sha1;
-use sourcelens::github::app::AppCredentials;
-use sourcelens::github::oauth::GhToken;
-use sourcelens::http::session::{create_session, SESSION_COOKIE};
 use sourcelens::index::embed::{self, EmbeddingConfig, EmbeddingSettingsInput};
 use sourcelens::index::embedder::{EmbedError, Embedder};
-use sourcelens::index::store;
 use sourcelens::repositories::{self, Target};
 use sourcelens::search::{self, Filter, SearchRequest};
 use sourcelens::state::AppState;
 use tempfile::TempDir;
-use tower::ServiceExt;
 
 const CONNECTION_TEST_INPUT: &str = "sourcelens connection test";
-const ORIGIN: &str = "http://localhost:3000";
 
 // ── fake embedding provider ─────────────────────────────────────────────────
 
@@ -96,12 +93,10 @@ impl Fake {
         let app = Router::new()
             .route("/v1/embeddings", post(fake_embeddings))
             .with_state(state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = serve(app).await;
         Self {
             state,
-            base_url: format!("http://{addr}/v1"),
+            base_url: format!("{base}/v1"),
         }
     }
 
@@ -250,10 +245,6 @@ async fn fake_embeddings(
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-fn new_state(tmp: &TempDir) -> AppState {
-    AppState::new(Config::new("http://localhost:3000", tmp.path())).unwrap()
-}
-
 fn settings_input(fake: &Fake) -> EmbeddingSettingsInput {
     EmbeddingSettingsInput {
         config: EmbeddingConfig {
@@ -300,67 +291,6 @@ fn norm(v: &[f32]) -> f32 {
     v.iter().map(|x| x * x).sum::<f32>().sqrt()
 }
 
-async fn insert_repo(state: &AppState, name: &str, repo_state: &str) -> i64 {
-    let name = name.to_string();
-    let repo_state = repo_state.to_string();
-    state
-        .db
-        .write(move |c| {
-            let github_id: i64 = c.query_row("SELECT count(*) + 100 FROM repositories", [], |r| r.get(0))?;
-            c.query_row(
-                "INSERT INTO repositories (github_id, installation_id, full_name, private, default_branch, state, created_at)
-                 VALUES (?1, 1, ?2, 0, 'main', ?3, 0) RETURNING id",
-                rusqlite::params![github_id, name, repo_state],
-                |r| r.get(0),
-            )
-        })
-        .await
-        .unwrap()
-}
-
-async fn index_files(state: &AppState, repo_id: i64, files: &[(&str, String)]) {
-    let prepared: Vec<store::PreparedFile> = files
-        .iter()
-        .map(|(path, content)| {
-            store::prepare_file(path, &git_blob_sha1(content.as_bytes()), content.as_bytes())
-        })
-        .collect();
-    state
-        .db
-        .write(move |c| store::apply_files(c, repo_id, &prepared))
-        .await
-        .unwrap();
-}
-
-/// A Rust file with `n` functions, each large enough to be its own chunk.
-fn functions_source(prefix: &str, n: usize) -> String {
-    (0..n)
-        .map(|i| {
-            let body: String = (0..12)
-                .map(|j| {
-                    format!("    let value_{j} = compute_{prefix}_{i}(input, {j}) * factor_{j};\n")
-                })
-                .collect();
-            format!("pub fn {prefix}_{i}(input: u64) -> u64 {{\n{body}    input\n}}\n\n")
-        })
-        .collect()
-}
-
-async fn index_sample(state: &AppState, repo_id: i64) {
-    index_files(
-        state,
-        repo_id,
-        &[
-            ("src/lib.rs", functions_source("alpha", 4)),
-            (
-                "lib/special.py",
-                "def frobnicate(widget):\n    return widget.spin() + 1\n".to_string(),
-            ),
-        ],
-    )
-    .await;
-}
-
 /// Starts a job the way a worker claims one: the repository's queued job becomes running; without
 /// one, a running job is inserted.
 async fn start_job(state: &AppState, repo_id: i64) -> i64 {
@@ -383,14 +313,6 @@ async fn start_job(state: &AppState, repo_id: i64) -> i64 {
                 ),
             }
         })
-        .await
-        .unwrap()
-}
-
-async fn scalar(state: &AppState, sql: &'static str) -> i64 {
-    state
-        .db
-        .read(move |c| c.query_row(sql, [], |r| r.get(0)))
         .await
         .unwrap()
 }
@@ -426,63 +348,6 @@ async fn stored_vectors(state: &AppState) -> Vec<Vec<f32>> {
         })
         .await
         .unwrap()
-}
-
-async fn session_for(state: &AppState, login: &str, role: &str) -> String {
-    let login_owned = login.to_string();
-    let role = role.to_string();
-    let user_id: i64 = state
-        .db
-        .write(move |c| {
-            let github_id: i64 = c.query_row("SELECT count(*) + 1000 FROM users", [], |r| r.get(0))?;
-            c.query_row(
-                "INSERT INTO users (github_id, login, role, created_at) VALUES (?1, ?2, ?3, 0) RETURNING id",
-                rusqlite::params![github_id, login_owned, role],
-                |r| r.get(0),
-            )
-        })
-        .await
-        .unwrap();
-    let token = GhToken {
-        access_token: "gho_test".into(),
-        refresh_token: None,
-        expires_at: i64::MAX,
-    };
-    let cookie = create_session(state, user_id, &token).await.unwrap();
-    format!("{SESSION_COOKIE}={cookie}")
-}
-
-async fn call(
-    app: &Router,
-    method: &str,
-    path: &str,
-    cookie: &str,
-    body: Option<Value>,
-) -> (StatusCode, Value, String) {
-    let mut builder = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("cookie", cookie)
-        .header("origin", ORIGIN);
-    let body = match body {
-        Some(value) => {
-            builder = builder.header("content-type", "application/json");
-            Body::from(value.to_string())
-        }
-        None => Body::empty(),
-    };
-    let response = app
-        .clone()
-        .oneshot(builder.body(body).unwrap())
-        .await
-        .unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    let value = serde_json::from_str(&text).unwrap_or(Value::Null);
-    (status, value, text)
 }
 
 // ── Embedder against the fake provider ─────────────────────────────────────
@@ -591,9 +456,9 @@ async fn embedder_reports_a_rejected_single_input() {
 #[tokio::test]
 async fn disabled_embeddings_leave_the_job_untouched() {
     let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
+    let state = new_state(&tmp, |_| {});
     let fake = Fake::start().await;
-    let repo = insert_repo(&state, "acme/api", "connected").await;
+    let repo = insert_repo_async(&state, 1, "acme/api", "connected").await;
     let job = start_job(&state, repo).await;
 
     assert_eq!(embed::embed_pending(&state, repo, job).await.unwrap(), 0);
@@ -612,9 +477,9 @@ async fn disabled_embeddings_leave_the_job_untouched() {
 #[tokio::test]
 async fn embed_pending_embeds_every_chunk_in_batches() {
     let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
+    let state = new_state(&tmp, |_| {});
     let fake = Fake::start().await;
-    let repo = insert_repo(&state, "acme/api", "connected").await;
+    let repo = insert_repo_async(&state, 1, "acme/api", "connected").await;
     index_sample(&state, repo).await;
     embed::apply_settings(&state, settings_input(&fake))
         .await
@@ -680,9 +545,9 @@ async fn embed_pending_embeds_every_chunk_in_batches() {
 #[tokio::test]
 async fn embed_pending_requests_dimensions_when_configured() {
     let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
+    let state = new_state(&tmp, |_| {});
     let fake = Fake::start().await;
-    let repo = insert_repo(&state, "acme/api", "connected").await;
+    let repo = insert_repo_async(&state, 1, "acme/api", "connected").await;
     index_sample(&state, repo).await;
     let mut input = settings_input(&fake);
     input.config.request_dimensions = Some(3);
@@ -703,9 +568,9 @@ async fn embed_pending_requests_dimensions_when_configured() {
 #[tokio::test]
 async fn embed_pending_survives_rate_limits_and_splits_batches() {
     let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
+    let state = new_state(&tmp, |_| {});
     let fake = Fake::start().await;
-    let repo = insert_repo(&state, "acme/api", "connected").await;
+    let repo = insert_repo_async(&state, 1, "acme/api", "connected").await;
     index_sample(&state, repo).await;
     embed::apply_settings(&state, settings_input(&fake))
         .await
@@ -734,9 +599,9 @@ async fn embed_pending_survives_rate_limits_and_splits_batches() {
 #[tokio::test]
 async fn rejected_chunk_is_marked_failed_and_the_rest_continues() {
     let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
+    let state = new_state(&tmp, |_| {});
     let fake = Fake::start().await;
-    let repo = insert_repo(&state, "acme/api", "connected").await;
+    let repo = insert_repo_async(&state, 1, "acme/api", "connected").await;
     index_sample(&state, repo).await;
     index_files(
         &state,
@@ -781,9 +646,9 @@ async fn rejected_chunk_is_marked_failed_and_the_rest_continues() {
 #[tokio::test]
 async fn provider_failure_fails_the_job_and_keeps_chunks_pending() {
     let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
+    let state = new_state(&tmp, |_| {});
     let fake = Fake::start().await;
-    let repo = insert_repo(&state, "acme/api", "connected").await;
+    let repo = insert_repo_async(&state, 1, "acme/api", "connected").await;
     index_sample(&state, repo).await;
     embed::apply_settings(&state, settings_input(&fake))
         .await
@@ -818,10 +683,10 @@ async fn provider_failure_fails_the_job_and_keeps_chunks_pending() {
 #[tokio::test]
 async fn identical_settings_keep_vectors_and_changes_reset_them() {
     let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
+    let state = new_state(&tmp, |_| {});
     let fake = Fake::start().await;
-    let r1 = insert_repo(&state, "acme/api", "connected").await;
-    let _r2 = insert_repo(&state, "acme/web", "connected").await;
+    let r1 = insert_repo_async(&state, 1, "acme/api", "connected").await;
+    let _r2 = insert_repo_async(&state, 2, "acme/web", "connected").await;
     index_sample(&state, r1).await;
     let (_, queued) = embed::apply_settings(&state, settings_input(&fake))
         .await
@@ -886,9 +751,9 @@ async fn identical_settings_keep_vectors_and_changes_reset_them() {
 #[tokio::test]
 async fn vectors_make_search_hybrid_with_semantic_only_hits() {
     let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
+    let state = new_state(&tmp, |_| {});
     let fake = Fake::start().await;
-    let repo = insert_repo(&state, "acme/api", "connected").await;
+    let repo = insert_repo_async(&state, 1, "acme/api", "connected").await;
     index_sample(&state, repo).await;
     embed::apply_settings(&state, settings_input(&fake))
         .await
@@ -923,12 +788,12 @@ async fn vectors_make_search_hybrid_with_semantic_only_hits() {
 #[tokio::test]
 async fn test_endpoint_reports_without_storing() {
     let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
+    let state = new_state(&tmp, |_| {});
     let fake = Fake::start().await;
     let app = sourcelens::http::router(state.clone());
-    let owner = session_for(&state, "alex", "owner").await;
+    let owner = owner_session(&state, "alex").await;
 
-    let (status, body, _) = call(
+    let (status, body, _) = api(
         &app,
         "POST",
         "/api/settings/embeddings/test",
@@ -942,7 +807,7 @@ async fn test_endpoint_reports_without_storing() {
     assert!(body["latencyMs"].is_u64());
 
     fake.script(&[(401, None)]);
-    let (status, body, _) = call(
+    let (status, body, _) = api(
         &app,
         "POST",
         "/api/settings/embeddings/test",
@@ -955,21 +820,21 @@ async fn test_endpoint_reports_without_storing() {
     assert!(body["error"].as_str().is_some_and(|e| !e.is_empty()));
 
     assert_eq!(scalar(&state, "SELECT count(*) FROM settings").await, 0);
-    let (_, body, _) = call(&app, "GET", "/api/settings/embeddings", &owner, None).await;
+    let (_, body, _) = api(&app, "GET", "/api/settings/embeddings", &owner, None).await;
     assert_eq!(body["enabled"], false);
 }
 
 #[tokio::test]
 async fn put_enables_embeddings_and_queues_reembedding() {
     let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
+    let state = new_state(&tmp, |_| {});
     let fake = Fake::start().await;
     let app = sourcelens::http::router(state.clone());
-    let owner = session_for(&state, "alex", "owner").await;
-    let member = session_for(&state, "sam", "member").await;
-    let r1 = insert_repo(&state, "acme/api", "connected").await;
-    let r2 = insert_repo(&state, "acme/web", "connected").await;
-    let _r3 = insert_repo(&state, "acme/old", "disconnected").await;
+    let owner = owner_session(&state, "alex").await;
+    let member = member_session(&state, "sam").await;
+    let r1 = insert_repo_async(&state, 1, "acme/api", "connected").await;
+    let r2 = insert_repo_async(&state, 2, "acme/web", "connected").await;
+    let _r3 = insert_repo_async(&state, 3, "acme/old", "disconnected").await;
     index_sample(&state, r1).await;
     index_files(
         &state,
@@ -986,7 +851,7 @@ async fn put_enables_embeddings_and_queues_reembedding() {
     let mut body = settings_body(&fake);
     body["apiKey"] = json!("sk-secret-123");
     let (status, saved, text) =
-        call(&app, "PUT", "/api/settings/embeddings", &owner, Some(body)).await;
+        api(&app, "PUT", "/api/settings/embeddings", &owner, Some(body)).await;
     assert_eq!(status, StatusCode::OK, "{text}");
     assert_eq!(saved["enabled"], true);
     assert_eq!(saved["dimensions"], 4);
@@ -1024,7 +889,7 @@ async fn put_enables_embeddings_and_queues_reembedding() {
         .unwrap();
     assert_eq!(queued, vec![r1, r2]);
 
-    let (status, got, text) = call(&app, "GET", "/api/settings/embeddings", &member, None).await;
+    let (status, got, text) = api(&app, "GET", "/api/settings/embeddings", &member, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(got["apiKeySet"], true);
     assert!(!text.contains("sk-secret-123"));
@@ -1033,7 +898,7 @@ async fn put_enables_embeddings_and_queues_reembedding() {
     assert_eq!(got["failedChunks"], 0);
 
     // Saved key is reused when the body has no apiKey.
-    let (status, _, _) = call(
+    let (status, _, _) = api(
         &app,
         "PUT",
         "/api/settings/embeddings",
@@ -1050,8 +915,7 @@ async fn put_enables_embeddings_and_queues_reembedding() {
     // clearApiKey removes it; no Authorization header afterwards.
     let mut body = settings_body(&fake);
     body["clearApiKey"] = json!(true);
-    let (status, saved, _) =
-        call(&app, "PUT", "/api/settings/embeddings", &owner, Some(body)).await;
+    let (status, saved, _) = api(&app, "PUT", "/api/settings/embeddings", &owner, Some(body)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(saved["apiKeySet"], false);
     assert_eq!(fake.requests().last().unwrap().authorization, None);
@@ -1068,13 +932,13 @@ async fn put_enables_embeddings_and_queues_reembedding() {
 #[tokio::test]
 async fn put_rejects_members_invalid_settings_and_failing_providers() {
     let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
+    let state = new_state(&tmp, |_| {});
     let fake = Fake::start().await;
     let app = sourcelens::http::router(state.clone());
-    let owner = session_for(&state, "alex", "owner").await;
-    let member = session_for(&state, "sam", "member").await;
+    let owner = owner_session(&state, "alex").await;
+    let member = member_session(&state, "sam").await;
 
-    let (status, body, _) = call(
+    let (status, body, _) = api(
         &app,
         "PUT",
         "/api/settings/embeddings",
@@ -1087,7 +951,7 @@ async fn put_rejects_members_invalid_settings_and_failing_providers() {
 
     let mut bad_url = settings_body(&fake);
     bad_url["baseUrl"] = json!("ftp://models.example");
-    let (status, body, _) = call(
+    let (status, body, _) = api(
         &app,
         "PUT",
         "/api/settings/embeddings",
@@ -1100,7 +964,7 @@ async fn put_rejects_members_invalid_settings_and_failing_providers() {
 
     let mut no_model = settings_body(&fake);
     no_model["model"] = json!("  ");
-    let (status, body, _) = call(
+    let (status, body, _) = api(
         &app,
         "PUT",
         "/api/settings/embeddings",
@@ -1112,7 +976,7 @@ async fn put_rejects_members_invalid_settings_and_failing_providers() {
     assert_eq!(body["error"]["code"], "invalid_embedding_settings");
 
     fake.script(&[(401, None)]);
-    let (status, body, _) = call(
+    let (status, body, _) = api(
         &app,
         "PUT",
         "/api/settings/embeddings",
@@ -1125,117 +989,6 @@ async fn put_rejects_members_invalid_settings_and_failing_providers() {
     assert!(body["error"]["message"].as_str().unwrap().contains("401"));
 
     assert_eq!(scalar(&state, "SELECT count(*) FROM settings").await, 0);
-}
-
-// ── HTTP: /api/settings/github ─────────────────────────────────────────────
-
-#[tokio::test]
-async fn github_settings_need_credentials() {
-    let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
-    let app = sourcelens::http::router(state.clone());
-    let owner = session_for(&state, "alex", "owner").await;
-    let (status, body, _) = call(&app, "GET", "/api/settings/github", &owner, None).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(body["error"]["code"], "app_not_configured");
-}
-
-#[tokio::test]
-async fn github_settings_with_env_credentials() {
-    let tmp = TempDir::new().unwrap();
-    let mut cfg = Config::new("http://localhost:3000", tmp.path());
-    cfg.github = Some(AppCredentials {
-        app_id: 42,
-        slug: "sourcelens-test".into(),
-        client_id: "Iv1.test".into(),
-        client_secret: "secret".into(),
-        webhook_secret: Some("whsec".into()),
-        private_key_pem: include_str!("fixtures/test_only_app_key.pem").into(),
-        html_url: "https://github.com/apps/sourcelens-test".into(),
-        source: "env",
-    });
-    let state = AppState::new(cfg).unwrap();
-    let app = sourcelens::http::router(state.clone());
-    let member = session_for(&state, "sam", "member").await;
-
-    let (status, body, _) = call(&app, "GET", "/api/settings/github", &member, None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["source"], "env");
-    assert_eq!(body["slug"], "sourcelens-test");
-    assert_eq!(body["appUrl"], "https://github.com/apps/sourcelens-test");
-    assert_eq!(
-        body["installUrl"],
-        "https://github.com/apps/sourcelens-test/installations/new"
-    );
-    assert_eq!(body["webhookUrl"], "http://localhost:3000/webhooks/github");
-    assert_eq!(body["webhookActive"], false);
-    assert_eq!(body["lastDeliveryAt"], Value::Null);
-    assert_eq!(body["lastDeliveryEvent"], Value::Null);
-
-    state
-        .db
-        .write(|c| {
-            c.execute_batch(
-                "INSERT INTO webhook_deliveries (delivery_id, event, received_at) VALUES ('a', 'push', 100), ('b', 'repository', 200)",
-            )
-        })
-        .await
-        .unwrap();
-    let (_, body, _) = call(&app, "GET", "/api/settings/github", &member, None).await;
-    assert_eq!(body["lastDeliveryAt"], 200);
-    assert_eq!(body["lastDeliveryEvent"], "repository");
-}
-
-// ── HTTP: /api/search ──────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn search_endpoint_scopes_to_connected_repositories() {
-    let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
-    let app = sourcelens::http::router(state.clone());
-    let member = session_for(&state, "sam", "member").await;
-    let r1 = insert_repo(&state, "acme/api", "connected").await;
-    let r2 = insert_repo(&state, "acme/old", "disconnected").await;
-    index_sample(&state, r1).await;
-    index_sample(&state, r2).await;
-
-    let (status, body, text) = call(
-        &app,
-        "POST",
-        "/api/search",
-        &member,
-        Some(json!({ "query": "frobnicate" })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{text}");
-    assert_eq!(body["mode"], "lexical");
-    let results = body["results"].as_array().unwrap();
-    assert!(!results.is_empty());
-    assert!(results.iter().all(|r| r["repository"] == "acme/api"));
-    assert_eq!(results[0]["path"], "lib/special.py");
-    assert!(results[0]["startLine"].is_u64());
-    assert!(results[0]["matchedBy"].is_array());
-
-    let (_, body, _) = call(
-        &app,
-        "POST",
-        "/api/search",
-        &member,
-        Some(json!({ "query": "frobnicate", "repositoryIds": [r2] })),
-    )
-    .await;
-    assert_eq!(body["results"].as_array().unwrap().len(), 0);
-
-    let (status, body, _) = call(
-        &app,
-        "POST",
-        "/api/search",
-        &member,
-        Some(json!({ "query": "  " })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"]["code"], "empty_query");
 }
 
 // ── embed phase: stop conditions and concurrency ───────────────────────────
@@ -1291,9 +1044,9 @@ const IN_FLIGHT: usize = 4;
 #[tokio::test]
 async fn settings_saved_during_embedding_stop_the_running_job() {
     let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
+    let state = new_state(&tmp, |_| {});
     let fake = Fake::start().await;
-    let repo = insert_repo(&state, "acme/api", "connected").await;
+    let repo = insert_repo_async(&state, 1, "acme/api", "connected").await;
     let total = index_many(&state, repo).await;
     embed::apply_settings(&state, settings_input(&fake))
         .await
@@ -1354,9 +1107,9 @@ async fn settings_saved_during_embedding_stop_the_running_job() {
 #[tokio::test]
 async fn disconnect_during_embedding_fails_the_job_and_stops_requests() {
     let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
+    let state = new_state(&tmp, |_| {});
     let fake = Fake::start().await;
-    let repo = insert_repo(&state, "acme/api", "connected").await;
+    let repo = insert_repo_async(&state, 1, "acme/api", "connected").await;
     let total = index_many(&state, repo).await;
     embed::apply_settings(&state, settings_input(&fake))
         .await
@@ -1394,9 +1147,9 @@ async fn disconnect_during_embedding_fails_the_job_and_stops_requests() {
 #[tokio::test]
 async fn queued_job_makes_the_embed_phase_hand_over() {
     let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
+    let state = new_state(&tmp, |_| {});
     let fake = Fake::start().await;
-    let repo = insert_repo(&state, "acme/api", "connected").await;
+    let repo = insert_repo_async(&state, 1, "acme/api", "connected").await;
     let total = index_many(&state, repo).await;
     embed::apply_settings(&state, settings_input(&fake))
         .await
@@ -1434,9 +1187,9 @@ async fn queued_job_makes_the_embed_phase_hand_over() {
 #[tokio::test]
 async fn batches_run_concurrently_and_each_chunk_is_embedded_once() {
     let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
+    let state = new_state(&tmp, |_| {});
     let fake = Fake::start().await;
-    let repo = insert_repo(&state, "acme/api", "connected").await;
+    let repo = insert_repo_async(&state, 1, "acme/api", "connected").await;
     let total = index_many(&state, repo).await;
     embed::apply_settings(&state, settings_input(&fake))
         .await
@@ -1470,21 +1223,21 @@ async fn batches_run_concurrently_and_each_chunk_is_embedded_once() {
 #[tokio::test]
 async fn saved_api_key_is_only_sent_to_its_base_url() {
     let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
+    let state = new_state(&tmp, |_| {});
     let saved_provider = Fake::start().await;
     let other_provider = Fake::start().await;
     let app = sourcelens::http::router(state.clone());
-    let owner = session_for(&state, "alex", "owner").await;
+    let owner = owner_session(&state, "alex").await;
 
     let mut body = settings_body(&saved_provider);
     body["apiKey"] = json!("sk-secret-123");
-    let (status, _, text) = call(&app, "PUT", "/api/settings/embeddings", &owner, Some(body)).await;
+    let (status, _, text) = api(&app, "PUT", "/api/settings/embeddings", &owner, Some(body)).await;
     assert_eq!(status, StatusCode::OK, "{text}");
 
     // The saved base URL (a trailing slash does not matter) keeps using the saved key.
     let mut same = settings_body(&saved_provider);
     same["baseUrl"] = json!(format!("{}/", saved_provider.base_url));
-    let (status, body, _) = call(
+    let (status, body, _) = api(
         &app,
         "POST",
         "/api/settings/embeddings/test",
@@ -1509,7 +1262,7 @@ async fn saved_api_key_is_only_sent_to_its_base_url() {
         ("POST", "/api/settings/embeddings/test"),
         ("PUT", "/api/settings/embeddings"),
     ] {
-        let (status, body, _) = call(
+        let (status, body, _) = api(
             &app,
             method,
             path,
@@ -1525,7 +1278,7 @@ async fn saved_api_key_is_only_sent_to_its_base_url() {
     // With its own key the new base URL is accepted.
     let mut with_key = settings_body(&other_provider);
     with_key["apiKey"] = json!("sk-other");
-    let (status, _, text) = call(
+    let (status, _, text) = api(
         &app,
         "PUT",
         "/api/settings/embeddings",
@@ -1548,13 +1301,13 @@ async fn saved_api_key_is_only_sent_to_its_base_url() {
 #[tokio::test]
 async fn provider_error_bodies_are_not_echoed() {
     let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
+    let state = new_state(&tmp, |_| {});
     let fake = Fake::start().await;
     let app = sourcelens::http::router(state.clone());
-    let owner = session_for(&state, "alex", "owner").await;
+    let owner = owner_session(&state, "alex").await;
 
     fake.script_raw(404, "<html>admin console of 10.0.0.7</html>");
-    let (_, body, _) = call(
+    let (_, body, _) = api(
         &app,
         "POST",
         "/api/settings/embeddings/test",
@@ -1571,7 +1324,7 @@ async fn provider_error_bodies_are_not_echoed() {
         401,
         r#"{"error":{"message":"invalid api key"},"detail":"trace id 98765"}"#,
     );
-    let (_, body, _) = call(
+    let (_, body, _) = api(
         &app,
         "POST",
         "/api/settings/embeddings/test",
@@ -1586,68 +1339,4 @@ async fn provider_error_bodies_are_not_echoed() {
         "{error}"
     );
     assert!(!error.contains("98765"), "{error}");
-}
-
-// ── HTTP: /api/search/languages and the search rate limit ──────────────────
-
-#[tokio::test]
-async fn languages_endpoint_lists_connected_repositories_only() {
-    let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
-    let app = sourcelens::http::router(state.clone());
-    let member = session_for(&state, "sam", "member").await;
-    let r1 = insert_repo(&state, "acme/api", "connected").await;
-    let r2 = insert_repo(&state, "acme/old", "disconnected").await;
-    index_sample(&state, r1).await;
-    index_files(
-        &state,
-        r2,
-        &[("main.go", "package main\n\nfunc main() {}\n".to_string())],
-    )
-    .await;
-
-    let (status, body, text) = call(&app, "GET", "/api/search/languages", &member, None).await;
-    assert_eq!(status, StatusCode::OK, "{text}");
-    assert_eq!(body, json!({ "languages": ["python", "rust"] }));
-}
-
-#[tokio::test]
-async fn search_is_rate_limited_per_user() {
-    let tmp = TempDir::new().unwrap();
-    let state = new_state(&tmp);
-    let app = sourcelens::http::router(state.clone());
-    let member = session_for(&state, "sam", "member").await;
-
-    let mut accepted = 0;
-    let mut limited = None;
-    for _ in 0..200 {
-        let request = Request::builder()
-            .method("POST")
-            .uri("/api/search")
-            .header("cookie", &member)
-            .header("origin", ORIGIN)
-            .header("content-type", "application/json")
-            .body(Body::from(json!({ "query": "frobnicate" }).to_string()))
-            .unwrap();
-        let response = app.clone().oneshot(request).await.unwrap();
-        if response.status() == StatusCode::TOO_MANY_REQUESTS {
-            limited = Some(response);
-            break;
-        }
-        assert_eq!(response.status(), StatusCode::OK);
-        accepted += 1;
-    }
-    let response = limited.expect("searches were never rate limited");
-    assert!(accepted >= 20, "limited after {accepted} searches");
-    let retry_after: u64 = response.headers()["retry-after"]
-        .to_str()
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert!(retry_after >= 1);
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(body["error"]["code"], "rate_limited");
 }

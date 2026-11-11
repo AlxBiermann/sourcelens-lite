@@ -1,3 +1,5 @@
+mod common;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -7,17 +9,15 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use common::{credentials, insert_repo_async, new_state, serve, INSTALLATION_ID};
 use serde_json::json;
 use sourcelens::config::Config;
 use sourcelens::crypto::git_blob_sha1;
-use sourcelens::github::app::AppCredentials;
 use sourcelens::index::jobs;
 use sourcelens::index::pipeline::{archive_threads_running, TARBALL_THRESHOLD};
 use sourcelens::model::Trigger;
-use sourcelens::state::{now, AppState};
+use sourcelens::state::AppState;
 use tempfile::TempDir;
-
-const INSTALLATION_ID: i64 = 42;
 
 /// Held by every test that runs an archive pipeline, so `archive_threads_running` only sees the
 /// current test's threads.
@@ -234,10 +234,7 @@ async fn start_fake(fake: Shared) -> String {
         .route("/repos/{o}/{r}/git/blobs/{sha}", get(blob))
         .route("/repos/{o}/{r}/tarball/{sha}", get(tarball))
         .with_state(fake);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    format!("http://{addr}")
+    serve(app).await
 }
 
 // ── Test environment ─────────────────────────────────────────────────────────
@@ -249,24 +246,6 @@ struct Env {
     repo_id: i64,
 }
 
-fn credentials() -> AppCredentials {
-    let pem = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/test_only_app_key.pem"
-    ))
-    .unwrap();
-    AppCredentials {
-        app_id: 4242,
-        slug: "sourcelens-test".into(),
-        client_id: "Iv1.test".into(),
-        client_secret: "client-secret".into(),
-        webhook_secret: Some("hook-secret".into()),
-        private_key_pem: pem,
-        html_url: "https://github.com/apps/sourcelens-test".into(),
-        source: "env",
-    }
-}
-
 async fn setup() -> Env {
     setup_with(|_| {}).await
 }
@@ -275,23 +254,12 @@ async fn setup_with(configure: impl FnOnce(&mut Config)) -> Env {
     let tmp = tempfile::tempdir().unwrap();
     let fake: Shared = Arc::default();
     let base = start_fake(fake.clone()).await;
-    let mut cfg = Config::new("http://localhost:3000", tmp.path());
-    cfg.github = Some(credentials());
-    cfg.github_api_url = base;
-    configure(&mut cfg);
-    let state = AppState::new(cfg).unwrap();
-    let repo_id = state
-        .db
-        .write(|conn| {
-            conn.query_row(
-                "INSERT INTO repositories (github_id, installation_id, full_name, private, default_branch, created_at)
-                 VALUES (1001, ?1, 'acme/api', 0, 'main', ?2) RETURNING id",
-                rusqlite::params![INSTALLATION_ID, now()],
-                |row| row.get(0),
-            )
-        })
-        .await
-        .unwrap();
+    let state = new_state(&tmp, |cfg| {
+        cfg.github = Some(credentials());
+        cfg.github_api_url = base;
+        configure(cfg);
+    });
+    let repo_id = insert_repo_async(&state, 1001, "acme/api", "connected").await;
     Env {
         tmp,
         state,
@@ -656,12 +624,19 @@ async fn lost_app_access_disconnects_the_repository() {
 }
 
 #[tokio::test]
-async fn idle_startup_job_is_discarded_and_failures_keep_the_message() {
+async fn idle_startup_job_is_discarded() {
     let env = setup().await;
     first_commit(&mut env.fake());
     env.run("connect", false).await.unwrap();
 
     assert!(env.run("startup", false).await.is_none());
+}
+
+#[tokio::test]
+async fn failed_job_keeps_the_error_message() {
+    let env = setup().await;
+    first_commit(&mut env.fake());
+    env.run("connect", false).await.unwrap();
 
     let repo_id = env.repo_id;
     env.state
@@ -828,6 +803,121 @@ async fn recovery_purges_repositories_being_deleted() {
     assert_eq!((repos, files), (0, 0));
     let fts: i64 = env.fts_hits("quokkaword").await;
     assert_eq!(fts, 0);
+}
+
+/// A state without GitHub credentials: every job fails at once with `app_not_configured`.
+fn bare_state() -> (TempDir, AppState) {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = new_state(&tmp, |_| {});
+    (tmp, state)
+}
+
+#[tokio::test]
+async fn failed_result_write_is_retried_and_the_job_does_not_stay_running() {
+    let (_tmp, state) = bare_state();
+    let repo_id = insert_repo_async(&state, 1, "acme/repo-1", "connected").await;
+    // The first two attempts at writing a final status fail, as on a full disk.
+    state
+        .db
+        .write(|conn| {
+            conn.execute_batch(
+                "CREATE TABLE test_result_failures (remaining INTEGER NOT NULL);
+                 INSERT INTO test_result_failures VALUES (2);
+                 CREATE TRIGGER test_fail_result BEFORE UPDATE OF status ON jobs
+                 WHEN NEW.status IN ('succeeded', 'failed')
+                   AND (SELECT remaining FROM test_result_failures) > 0
+                 BEGIN
+                   UPDATE test_result_failures SET remaining = remaining - 1;
+                   SELECT RAISE(FAIL, 'simulated full disk');
+                 END;",
+            )
+        })
+        .await
+        .unwrap();
+    jobs::enqueue(&state, repo_id, Trigger::Manual, None, false)
+        .await
+        .unwrap();
+
+    assert!(jobs::run_next(&state).await.unwrap());
+    let (status, error, remaining): (String, Option<String>, i64) = state
+        .db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT status, error, (SELECT remaining FROM test_result_failures)
+                 FROM jobs WHERE repo_id = ?1",
+                [repo_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!((status.as_str(), remaining), ("failed", 0));
+    assert!(error.is_some());
+}
+
+#[tokio::test]
+async fn startup_reconcile_continues_after_a_failing_repository() {
+    let (_tmp, state) = bare_state();
+    // The failing repositories come first, so an early return would skip the others.
+    let enqueue_fails = insert_repo_async(&state, 1, "acme/repo-1", "connected").await;
+    let purge_fails = insert_repo_async(&state, 2, "acme/repo-2", "deleting").await;
+    let first = insert_repo_async(&state, 3, "acme/repo-3", "connected").await;
+    let purged = insert_repo_async(&state, 4, "acme/repo-4", "deleting").await;
+    let second = insert_repo_async(&state, 5, "acme/repo-5", "connected").await;
+    state
+        .db
+        .write(move |conn| {
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER test_fail_enqueue BEFORE INSERT ON jobs WHEN NEW.repo_id = {enqueue_fails}
+                 BEGIN SELECT RAISE(ABORT, 'simulated enqueue failure'); END;
+                 CREATE TRIGGER test_fail_purge BEFORE DELETE ON repositories WHEN OLD.id = {purge_fails}
+                 BEGIN SELECT RAISE(ABORT, 'simulated purge failure'); END;"
+            ))
+        })
+        .await
+        .unwrap();
+
+    jobs::recover_and_reconcile(&state).await.unwrap();
+
+    let queued: Vec<(i64, String)> = state
+        .db
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT repo_id, trigger FROM jobs WHERE status = 'queued' ORDER BY repo_id",
+            )?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok::<_, rusqlite::Error>(rows)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        queued,
+        vec![(first, "startup".into()), (second, "startup".into())]
+    );
+
+    // Purges run in the background.
+    let mut remaining = Vec::new();
+    for _ in 0..400 {
+        remaining = state
+            .db
+            .read(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT id FROM repositories WHERE state = 'deleting' ORDER BY id")?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, i64>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok::<_, rusqlite::Error>(rows)
+            })
+            .await
+            .unwrap();
+        if !remaining.contains(&purged) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(remaining, vec![purge_fails]);
 }
 
 // ── Fixes: push target, app auth, archive limits and the archive pipeline ────

@@ -1,11 +1,20 @@
+mod common;
+
+use axum::http::StatusCode;
+use common::{
+    api, call, error_code, index_files, index_sample, insert_repo_async, insert_user,
+    member_session, new_state, request, session_for,
+};
 use rusqlite::params;
-use sourcelens::config::Config;
+use serde_json::{json, Value};
 use sourcelens::index::store::{self, camel_parts, to_blob};
 use sourcelens::search::fuse::fuse;
 use sourcelens::search::lexical::group_expression;
 use sourcelens::search::query::{plan, MAX_GROUPS};
 use sourcelens::search::{self, symbols, vector, Filter, SearchRequest, SearchResponse};
 use sourcelens::state::AppState;
+use tempfile::TempDir;
+use tower::ServiceExt;
 
 /// Contains `retry` but never the inflected `retries`.
 const BACKOFF_RS: &str = r#"/// Calls `attempt` until it succeeds, waiting twice as long after each failure.
@@ -36,7 +45,7 @@ const USERS_TS: &str = include_str!("fixtures/users.ts");
 const ORDERS_PY: &str = include_str!("fixtures/orders.py");
 
 struct Fixture {
-    _tmp: tempfile::TempDir,
+    _tmp: TempDir,
     state: AppState,
     repo_id: i64,
     /// Line of `export function getUserById`.
@@ -45,25 +54,14 @@ struct Fixture {
 
 async fn fixture() -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
-    let state = AppState::new(Config::new("http://localhost:3000", tmp.path())).unwrap();
-    let repo_id = state
-        .db
-        .write(|conn| {
-            let repo_id: i64 = conn.query_row(
-                "INSERT INTO repositories (github_id, installation_id, full_name, private, default_branch, created_at)
-                 VALUES (1, 1, 'acme/shop', 0, 'main', 0) RETURNING id",
-                [],
-                |row| row.get(0),
-            )?;
-            let files = [
-                store::prepare_file("src/users.ts", "u1", USERS_TS.as_bytes()),
-                store::prepare_file("app/orders.py", "o1", ORDERS_PY.as_bytes()),
-            ];
-            store::apply_files(conn, repo_id, &files)?;
-            Ok::<_, rusqlite::Error>(repo_id)
-        })
-        .await
-        .unwrap();
+    let state = new_state(&tmp, |_| {});
+    let repo_id = insert_repo_async(&state, 1, "acme/shop", "connected").await;
+    index_files(
+        &state,
+        repo_id,
+        &[("src/users.ts", USERS_TS), ("app/orders.py", ORDERS_PY)],
+    )
+    .await;
     let definition_line = USERS_TS
         .lines()
         .position(|line| line.starts_with("export function getUserById"))
@@ -100,18 +98,7 @@ impl Fixture {
 
     /// Indexes more files into the fixture repository, in order.
     async fn index(&self, files: &[(&str, &str)]) {
-        let repo = self.repo_id;
-        let prepared: Vec<_> = files
-            .iter()
-            .map(|(path, content)| {
-                store::prepare_file(path, &format!("sha-{path}"), content.as_bytes())
-            })
-            .collect();
-        self.state
-            .db
-            .write(move |conn| store::apply_files(conn, repo, &prepared))
-            .await
-            .unwrap();
+        index_files(&self.state, self.repo_id, files).await;
     }
 }
 
@@ -583,7 +570,7 @@ async fn a_block_hit_carries_the_names_it_contains() {
 }
 
 #[tokio::test]
-async fn exact_lookup_prefers_functions_and_types_over_values_and_honours_qualifiers() {
+async fn exact_lookup_prefers_functions_and_types_over_values() {
     let fx = fixture().await;
     fx.index(&[
         (
@@ -594,29 +581,191 @@ async fn exact_lookup_prefers_functions_and_types_over_values_and_honours_qualif
             "src/settings.ts",
             "export class Settings {\n  load(): void {}\n}\n",
         ),
-        (
-            "store/store.go",
-            "package store\n\ntype Memory struct{}\n\nfunc (m *Memory) Get(k string) string {\n\treturn k\n}\n\n\
-             type Disk struct{}\n\nfunc (d *Disk) Get(k string) string {\n\treturn k\n}\n",
-        ),
     ])
     .await;
     let scope = fx.scope();
-    let (settings, disk, memory) = fx
+    let settings = fx
+        .state
+        .db
+        .read(move |conn| symbols::lookup(conn, &scope, "Settings", None, 10))
+        .await
+        .unwrap();
+    let kinds: Vec<&str> = settings.iter().map(|s| s.kind.as_str()).collect();
+    assert_eq!(kinds, ["class", "constant"]);
+}
+
+#[tokio::test]
+async fn exact_lookup_honours_qualifiers() {
+    let fx = fixture().await;
+    fx.index(&[(
+        "store/store.go",
+        "package store\n\ntype Memory struct{}\n\nfunc (m *Memory) Get(k string) string {\n\treturn k\n}\n\n\
+         type Disk struct{}\n\nfunc (d *Disk) Get(k string) string {\n\treturn k\n}\n",
+    )])
+    .await;
+    let scope = fx.scope();
+    let (disk, memory) = fx
         .state
         .db
         .read(move |conn| {
             Ok::<_, rusqlite::Error>((
-                symbols::lookup(conn, &scope, "Settings", None, 10)?,
                 symbols::lookup(conn, &scope, "Disk.Get", None, 10)?,
                 symbols::lookup(conn, &scope, "Memory.Get", None, 10)?,
             ))
         })
         .await
         .unwrap();
-    let kinds: Vec<&str> = settings.iter().map(|s| s.kind.as_str()).collect();
-    assert_eq!(kinds, ["class", "constant"]);
     assert_eq!(disk[0].qualified_name, "store.Disk.Get");
     assert_eq!(disk[0].kind, "method");
     assert_eq!(memory[0].qualified_name, "store.Memory.Get");
+}
+
+// ── HTTP: /api/search ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn search_endpoint_scopes_to_connected_repositories() {
+    let tmp = TempDir::new().unwrap();
+    let state = new_state(&tmp, |_| {});
+    let app = sourcelens::http::router(state.clone());
+    let member = member_session(&state, "sam").await;
+    let r1 = insert_repo_async(&state, 1, "acme/api", "connected").await;
+    let r2 = insert_repo_async(&state, 2, "acme/old", "disconnected").await;
+    index_sample(&state, r1).await;
+    index_sample(&state, r2).await;
+
+    let (status, body, text) = api(
+        &app,
+        "POST",
+        "/api/search",
+        &member,
+        Some(json!({ "query": "frobnicate" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(body["mode"], "lexical");
+    let results = body["results"].as_array().unwrap();
+    assert!(!results.is_empty());
+    assert!(results.iter().all(|r| r["repository"] == "acme/api"));
+    assert_eq!(results[0]["path"], "lib/special.py");
+    assert!(results[0]["startLine"].is_u64());
+    assert!(results[0]["matchedBy"].is_array());
+
+    let (_, body, _) = api(
+        &app,
+        "POST",
+        "/api/search",
+        &member,
+        Some(json!({ "query": "frobnicate", "repositoryIds": [r2] })),
+    )
+    .await;
+    assert_eq!(body["results"].as_array().unwrap().len(), 0);
+
+    let (status, body, _) = api(
+        &app,
+        "POST",
+        "/api/search",
+        &member,
+        Some(json!({ "query": "  " })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "empty_query");
+}
+
+#[tokio::test]
+async fn search_rejects_unknown_languages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = new_state(&tmp, |_| {});
+    let owner = insert_user(&state, "octocat", "owner", Some(1)).await;
+    let cookie = session_for(&state, owner).await;
+
+    let (status, _, body) = call(
+        &state,
+        request(
+            "POST",
+            "/api/search",
+            Some(&cookie),
+            Some(json!({ "query": "parser", "languages": ["klingon"] })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_code(&body), "unknown_language");
+    let message = body["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("klingon") && message.contains("rust"),
+        "{message}"
+    );
+
+    let (status, _, body) = call(
+        &state,
+        request(
+            "POST",
+            "/api/search",
+            Some(&cookie),
+            Some(json!({ "query": "parser", "languages": ["Rust", "golang"] })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn languages_endpoint_lists_connected_repositories_only() {
+    let tmp = TempDir::new().unwrap();
+    let state = new_state(&tmp, |_| {});
+    let app = sourcelens::http::router(state.clone());
+    let member = member_session(&state, "sam").await;
+    let r1 = insert_repo_async(&state, 1, "acme/api", "connected").await;
+    let r2 = insert_repo_async(&state, 2, "acme/old", "disconnected").await;
+    index_sample(&state, r1).await;
+    index_files(
+        &state,
+        r2,
+        &[("main.go", "package main\n\nfunc main() {}\n".to_string())],
+    )
+    .await;
+
+    let (status, body, text) = api(&app, "GET", "/api/search/languages", &member, None).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(body, json!({ "languages": ["python", "rust"] }));
+}
+
+#[tokio::test]
+async fn search_is_rate_limited_per_user() {
+    let tmp = TempDir::new().unwrap();
+    let state = new_state(&tmp, |_| {});
+    let app = sourcelens::http::router(state.clone());
+    let member = member_session(&state, "sam").await;
+
+    let mut accepted = 0;
+    let mut limited = None;
+    for _ in 0..200 {
+        let request = request(
+            "POST",
+            "/api/search",
+            Some(&member),
+            Some(json!({ "query": "frobnicate" })),
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            limited = Some(response);
+            break;
+        }
+        assert_eq!(response.status(), StatusCode::OK);
+        accepted += 1;
+    }
+    let response = limited.expect("searches were never rate limited");
+    assert!(accepted >= 20, "limited after {accepted} searches");
+    let retry_after: u64 = response.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(retry_after >= 1);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["code"], "rate_limited");
 }

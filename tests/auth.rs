@@ -1,3 +1,5 @@
+mod common;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,103 +12,25 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use common::{
+    call, credentials, error_code, insert_user, mcp_request, new_state, request, scalar, serve,
+    session_for, PUBLIC_URL,
+};
 use serde_json::{json, Value};
 use sourcelens::config::Config;
 use sourcelens::crypto::{random_hex, sha256_hex};
 use sourcelens::error::{ApiError, GitHubFailure};
-use sourcelens::github::app::{AppCredentials, GitHub};
+use sourcelens::github::app::GitHub;
 use sourcelens::github::oauth::{resolve_user, GhToken, GhUser, Resolution, TokenError};
-use sourcelens::http;
 use sourcelens::http::session::{create_session, user_token_with, AuthUser};
 use sourcelens::model::Role;
 use sourcelens::state::{now, AppState};
-use tempfile::TempDir;
-use tower::ServiceExt;
 
-const PUBLIC_URL: &str = "http://localhost:3000";
 const HTTPS_PUBLIC_URL: &str = "https://sourcelens.example.com";
 /// Account id the fake GitHub reports for the login `hubot`.
 const HUBOT_GITHUB_ID: i64 = 5001;
 /// App id in the fake manifest conversion.
 const CONVERTED_APP_ID: u64 = 777;
-
-fn test_credentials() -> AppCredentials {
-    let pem = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/test_only_app_key.pem"
-    ))
-    .unwrap();
-    AppCredentials {
-        app_id: 4242,
-        slug: "sourcelens-test".into(),
-        client_id: "Iv1.test".into(),
-        client_secret: "client-secret".into(),
-        webhook_secret: Some("hook-secret".into()),
-        private_key_pem: pem,
-        html_url: "https://github.com/apps/sourcelens-test".into(),
-        source: "env",
-    }
-}
-
-fn new_state(tmp: &TempDir, configure: impl FnOnce(&mut Config)) -> AppState {
-    let mut cfg = Config::new(PUBLIC_URL, tmp.path());
-    configure(&mut cfg);
-    AppState::new(cfg).unwrap()
-}
-
-fn request(method: &str, uri: &str, cookie: Option<&str>, body: Option<Value>) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if method != "GET" {
-        builder = builder.header(header::ORIGIN, PUBLIC_URL);
-    }
-    if let Some(cookie) = cookie {
-        builder = builder.header(header::COOKIE, format!("sl_session={cookie}"));
-    }
-    match body {
-        Some(body) => builder
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap(),
-        None => builder.body(Body::empty()).unwrap(),
-    }
-}
-
-async fn call(state: &AppState, req: Request<Body>) -> (StatusCode, HeaderMap, Value) {
-    let response = http::router(state.clone()).oneshot(req).await.unwrap();
-    let status = response.status();
-    let headers = response.headers().clone();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    (status, headers, body)
-}
-
-fn error_code(body: &Value) -> &str {
-    body["error"]["code"].as_str().unwrap_or("")
-}
-
-/// A user who has signed in before.
-async fn insert_user(state: &AppState, login: &str, role: &str, github_id: Option<i64>) -> i64 {
-    let login = login.to_string();
-    let role = role.to_string();
-    state
-        .db
-        .write(move |c| {
-            c.execute(
-                "INSERT INTO users (github_id, login, role, created_at, last_login_at)
-                 VALUES (?1, ?2, ?3, ?4, ?4)",
-                rusqlite::params![github_id, login, role, now()],
-            )?;
-            Ok::<_, rusqlite::Error>(c.last_insert_rowid())
-        })
-        .await
-        .unwrap()
-}
 
 /// An invited member who has not signed in yet.
 async fn insert_invitation(state: &AppState, login: &str, github_id: i64) -> i64 {
@@ -120,23 +44,6 @@ async fn insert_invitation(state: &AppState, login: &str, github_id: i64) -> i64
             )?;
             Ok::<_, rusqlite::Error>(c.last_insert_rowid())
         })
-        .await
-        .unwrap()
-}
-
-async fn session_for(state: &AppState, user_id: i64) -> String {
-    let token = GhToken {
-        access_token: "gho_test".into(),
-        refresh_token: None,
-        expires_at: i64::MAX,
-    };
-    create_session(state, user_id, &token).await.unwrap()
-}
-
-async fn count(state: &AppState, sql: &'static str) -> i64 {
-    state
-        .db
-        .read(move |c| c.query_row(sql, [], |r| r.get(0)))
         .await
         .unwrap()
 }
@@ -160,7 +67,7 @@ async fn state_of_fresh_instance() {
 #[tokio::test]
 async fn state_with_env_credentials() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = new_state(&tmp, |cfg| cfg.github = Some(test_credentials()));
+    let state = new_state(&tmp, |cfg| cfg.github = Some(credentials()));
     let (_, _, body) = call(&state, request("GET", "/api/state", None, None)).await;
     assert_eq!(body["setup"]["appConfigured"], true);
     assert_eq!(body["setup"]["appSlug"], "sourcelens-test");
@@ -279,7 +186,7 @@ async fn manifest_webhook_is_active_for_a_public_host() {
 #[tokio::test]
 async fn manifest_rejected_when_app_configured_or_owner_exists() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = new_state(&tmp, |cfg| cfg.github = Some(test_credentials()));
+    let state = new_state(&tmp, |cfg| cfg.github = Some(credentials()));
     let token = state.setup_token.to_string();
     let (status, _, body) = call(
         &state,
@@ -312,42 +219,6 @@ async fn manifest_rejected_when_app_configured_or_owner_exists() {
     assert_eq!(error_code(&body), "invalid_setup_token");
 }
 
-#[tokio::test]
-async fn app_created_with_unknown_state_redirects_to_setup() {
-    let tmp = tempfile::tempdir().unwrap();
-    let state = new_state(&tmp, |_| {});
-    let (status, headers, _) = call(
-        &state,
-        request(
-            "GET",
-            "/auth/github/app-created?code=abc&state=nope",
-            None,
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(headers[header::LOCATION], "/setup?error=state");
-}
-
-#[tokio::test]
-async fn manifest_credentials_round_trip_through_settings() {
-    let tmp = tempfile::tempdir().unwrap();
-    let state = new_state(&tmp, |_| {});
-    assert!(state.github.credentials().await.unwrap().is_none());
-    let mut creds = test_credentials();
-    creds.source = "manifest";
-    state
-        .github
-        .store_manifest_credentials(&creds)
-        .await
-        .unwrap();
-    let loaded = state.github.credentials().await.unwrap().unwrap();
-    assert_eq!(loaded.app_id, 4242);
-    assert_eq!(loaded.client_secret, "client-secret");
-    assert_eq!(loaded.source, "manifest");
-}
-
 // ── Sign-in ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -359,7 +230,7 @@ async fn login_redirects_to_setup_or_github() {
     assert_eq!(headers[header::LOCATION], "/setup");
 
     let tmp = tempfile::tempdir().unwrap();
-    let state = new_state(&tmp, |cfg| cfg.github = Some(test_credentials()));
+    let state = new_state(&tmp, |cfg| cfg.github = Some(credentials()));
     let (status, headers, _) = call(&state, request("GET", "/auth/github/login", None, None)).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let location = headers[header::LOCATION].to_str().unwrap();
@@ -373,7 +244,7 @@ async fn login_redirects_to_setup_or_github() {
 #[tokio::test]
 async fn callback_with_mismatched_state_is_rejected() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = new_state(&tmp, |cfg| cfg.github = Some(test_credentials()));
+    let state = new_state(&tmp, |cfg| cfg.github = Some(credentials()));
     let (_, headers, _) = call(&state, request("GET", "/auth/github/login", None, None)).await;
     let oauth_cookie = headers[header::SET_COOKIE]
         .to_str()
@@ -493,7 +364,7 @@ async fn user_resolution_rules() {
             .unwrap(),
         Resolution::NotInvited
     );
-    assert_eq!(count(&state, "SELECT count(*) FROM users").await, 2);
+    assert_eq!(scalar(&state, "SELECT count(*) FROM users").await, 2);
 }
 
 #[tokio::test]
@@ -576,7 +447,7 @@ async fn logout_invalidates_the_session() {
 
     let (status, _, _) = call(&state, request("GET", "/api/members", Some(&cookie), None)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(count(&state, "SELECT count(*) FROM sessions").await, 0);
+    assert_eq!(scalar(&state, "SELECT count(*) FROM sessions").await, 0);
 }
 
 #[tokio::test]
@@ -606,7 +477,7 @@ async fn origin_is_checked_for_state_changing_api_requests() {
     let (status, _, body) = call(&state, foreign).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(error_code(&body), "origin_not_allowed");
-    assert_eq!(count(&state, "SELECT count(*) FROM sessions").await, 1);
+    assert_eq!(scalar(&state, "SELECT count(*) FROM sessions").await, 1);
 
     let (status, _, _) = call(&state, request("POST", "/api/logout", Some(&cookie), None)).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
@@ -729,12 +600,11 @@ async fn owner_manages_members() {
 }
 
 #[tokio::test]
-async fn members_cannot_manage_members_and_removal_ends_sessions() {
+async fn members_cannot_manage_members() {
     let tmp = tempfile::tempdir().unwrap();
     let state = new_state(&tmp, |_| {});
     let owner = insert_user(&state, "octocat", "owner", Some(1)).await;
     let member = insert_user(&state, "hubot", "member", Some(2)).await;
-    let owner_cookie = session_for(&state, owner).await;
     let member_cookie = session_for(&state, member).await;
 
     let (status, _, body) = call(
@@ -768,6 +638,16 @@ async fn members_cannot_manage_members_and_removal_ends_sessions() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(error_code(&body), "owner_required");
+}
+
+#[tokio::test]
+async fn removing_a_member_ends_their_sessions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = new_state(&tmp, |_| {});
+    let owner = insert_user(&state, "octocat", "owner", Some(1)).await;
+    let member = insert_user(&state, "hubot", "member", Some(2)).await;
+    let owner_cookie = session_for(&state, owner).await;
+    let member_cookie = session_for(&state, member).await;
 
     let (status, _, _) = call(
         &state,
@@ -839,49 +719,11 @@ async fn malformed_bodies_and_path_ids_answer_in_the_api_error_format() {
     assert!(!body["error"]["message"].as_str().unwrap_or("").is_empty());
 }
 
-#[tokio::test]
-async fn search_rejects_unknown_languages() {
-    let tmp = tempfile::tempdir().unwrap();
-    let state = new_state(&tmp, |_| {});
-    let owner = insert_user(&state, "octocat", "owner", Some(1)).await;
-    let cookie = session_for(&state, owner).await;
-
-    let (status, _, body) = call(
-        &state,
-        request(
-            "POST",
-            "/api/search",
-            Some(&cookie),
-            Some(json!({ "query": "parser", "languages": ["klingon"] })),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(error_code(&body), "unknown_language");
-    let message = body["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        message.contains("klingon") && message.contains("rust"),
-        "{message}"
-    );
-
-    let (status, _, body) = call(
-        &state,
-        request(
-            "POST",
-            "/api/search",
-            Some(&cookie),
-            Some(json!({ "query": "parser", "languages": ["Rust", "golang"] })),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-}
-
 // ── App JWT ───────────────────────────────────────────────────────────────────
 
 #[test]
 fn app_jwt_is_rs256_with_string_issuer() {
-    let jwt = GitHub::app_jwt(&test_credentials()).unwrap();
+    let jwt = GitHub::app_jwt(&credentials()).unwrap();
     let segments: Vec<&str> = jwt.split('.').collect();
     assert_eq!(segments.len(), 3);
     let header: Value =
@@ -999,7 +841,7 @@ async fn spawn_fake_github() -> (String, Arc<Counters>) {
                         "client_id": "Iv1.converted",
                         "client_secret": "converted-secret",
                         "webhook_secret": "converted-hook",
-                        "pem": test_credentials().private_key_pem,
+                        "pem": credentials().private_key_pem,
                         "html_url": "https://github.com/apps/sourcelens-abcd",
                         "owner": { "login": "octocat" },
                     })),
@@ -1007,12 +849,7 @@ async fn spawn_fake_github() -> (String, Arc<Counters>) {
             }),
         )
         .with_state(counters.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    (format!("http://{addr}"), counters)
+    (serve(app).await, counters)
 }
 
 #[tokio::test]
@@ -1020,7 +857,7 @@ async fn installation_token_is_cached() {
     let (base, counters) = spawn_fake_github().await;
     let tmp = tempfile::tempdir().unwrap();
     let state = new_state(&tmp, |cfg| {
-        cfg.github = Some(test_credentials());
+        cfg.github = Some(credentials());
         cfg.github_api_url = base.clone();
     });
     let first = state.github.installation_token(7).await.unwrap();
@@ -1107,12 +944,7 @@ async fn insert_key(state: &AppState, created_by: i64) -> String {
 }
 
 async fn mcp_ping(state: &AppState, secret: &str) -> StatusCode {
-    let req = Request::builder()
-        .method("POST")
-        .uri("/mcp")
-        .header(header::AUTHORIZATION, format!("Bearer {secret}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::ACCEPT, "application/json, text/event-stream")
+    let req = mcp_request(Some(secret))
         .body(Body::from(
             json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }).to_string(),
         ))
@@ -1267,7 +1099,7 @@ async fn transient_refresh_failure_keeps_the_session() {
     .unwrap_err();
     assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(err.code, "github_unavailable");
-    assert_eq!(count(&state, "SELECT count(*) FROM sessions").await, 1);
+    assert_eq!(scalar(&state, "SELECT count(*) FROM sessions").await, 1);
 
     let err = user_token_with(&state, &user, |_| async {
         Err(TokenError::OAuth("bad_refresh_token".into()))
@@ -1275,7 +1107,7 @@ async fn transient_refresh_failure_keeps_the_session() {
     .await
     .unwrap_err();
     assert_eq!(err.code, "github_reauth_required");
-    assert_eq!(count(&state, "SELECT count(*) FROM sessions").await, 0);
+    assert_eq!(scalar(&state, "SELECT count(*) FROM sessions").await, 0);
 }
 
 // ── Security headers and cookies ──────────────────────────────────────────────
@@ -1293,7 +1125,12 @@ async fn security_headers_on_api_and_ui_responses() {
         assert!(csp.contains("frame-ancestors 'none'"), "{uri}: {csp}");
         assert!(csp.contains("default-src 'self'"), "{uri}: {csp}");
     }
+}
 
+#[tokio::test]
+async fn api_responses_are_gzip_compressed_on_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = new_state(&tmp, |_| {});
     let gzip = Request::builder()
         .uri("/api/state")
         .header(header::ACCEPT_ENCODING, "gzip")
@@ -1308,7 +1145,7 @@ async fn security_headers_on_api_and_ui_responses() {
 async fn https_instance_uses_host_locked_cookies() {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = Config::new(HTTPS_PUBLIC_URL, tmp.path());
-    cfg.github = Some(test_credentials());
+    cfg.github = Some(credentials());
     let state = AppState::new(cfg).unwrap();
 
     let (_, headers, _) = call(&state, request("GET", "/auth/github/login", None, None)).await;
@@ -1344,5 +1181,5 @@ async fn https_instance_uses_host_locked_cookies() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     let cleared = headers[header::SET_COOKIE].to_str().unwrap();
     assert!(cleared.starts_with("__Host-sl_session=;"), "{cleared}");
-    assert_eq!(count(&state, "SELECT count(*) FROM sessions").await, 0);
+    assert_eq!(scalar(&state, "SELECT count(*) FROM sessions").await, 0);
 }

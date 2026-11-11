@@ -1,25 +1,20 @@
+mod common;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use common::{temp_db, PUBLIC_URL};
 use ring::hmac;
 use sourcelens::config::Config;
 use sourcelens::crypto::{self, SecretKey};
 use sourcelens::db::Db;
-use sourcelens::http;
 use sourcelens::state::AppState;
-use tower::ServiceExt;
-
-fn f32_blob(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|v| v.to_le_bytes()).collect()
-}
 
 #[tokio::test]
 async fn migration_applies_and_sqlite_vec_is_loaded() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = Db::open(&tmp.path().join("test.db")).unwrap();
+    let db = temp_db(&tmp);
 
     let (version, vec_version, tables) = db
         .read(|conn| {
@@ -43,76 +38,12 @@ async fn migration_applies_and_sqlite_vec_is_loaded() {
 
     // Reopening an existing database does not re-run the migration.
     drop(db);
-    let db = Db::open(&tmp.path().join("test.db")).unwrap();
+    let db = temp_db(&tmp);
     let foreign_keys: i64 = db
         .read(|c| c.query_row("PRAGMA foreign_keys", [], |r| r.get(0)))
         .await
         .unwrap();
     assert_eq!(foreign_keys, 1);
-}
-
-#[tokio::test]
-async fn vec0_partitioned_knn_orders_by_distance() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = Db::open(&tmp.path().join("test.db")).unwrap();
-
-    let rows = db
-        .write(|conn| {
-            conn.execute_batch(
-                "CREATE VIRTUAL TABLE vec_chunks USING vec0(chunk_id INTEGER PRIMARY KEY, repo_id INTEGER PARTITION KEY, embedding float[4])",
-            )?;
-            let vectors: [(i64, i64, [f32; 4]); 4] = [
-                (1, 1, [1.0, 0.0, 0.0, 0.0]),
-                (2, 1, [0.0, 1.0, 0.0, 0.0]),
-                (3, 1, [0.8, 0.6, 0.0, 0.0]),
-                (4, 2, [1.0, 0.0, 0.0, 0.0]),
-            ];
-            for (chunk_id, repo_id, v) in vectors {
-                conn.execute(
-                    "INSERT INTO vec_chunks (chunk_id, repo_id, embedding) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![chunk_id, repo_id, f32_blob(&v)],
-                )?;
-            }
-            let mut stmt = conn.prepare(
-                "SELECT chunk_id, distance FROM vec_chunks WHERE embedding MATCH ?1 AND k = 2 AND repo_id = ?2 ORDER BY distance",
-            )?;
-            let rows = stmt
-                .query_map(rusqlite::params![f32_blob(&[1.0, 0.0, 0.0, 0.0]), 1_i64], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok::<_, rusqlite::Error>(rows)
-        })
-        .await
-        .unwrap();
-
-    let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
-    assert_eq!(ids, vec![1, 3]);
-    assert!(rows[0].1 < rows[1].1);
-}
-
-#[tokio::test]
-async fn contentless_fts_supports_delete_by_rowid() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = Db::open(&tmp.path().join("test.db")).unwrap();
-
-    let (before, after, other) = db
-        .write(|conn| {
-            let insert = "INSERT INTO chunks_fts (rowid, names, path, body, idents) VALUES (?1, ?2, ?3, ?4, ?5)";
-            conn.execute(insert, rusqlite::params![10_i64, "getUserById", "src/users.ts", "export function getUserById", "get user by id"])?;
-            conn.execute(insert, rusqlite::params![11_i64, "listOrders", "src/orders.py", "def list_orders", "list orders"])?;
-            let count = |conn: &rusqlite::Connection, query: &str| -> rusqlite::Result<i64> {
-                conn.query_row("SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?1", [query], |r| r.get(0))
-            };
-            let before = count(conn, "getuserbyid")?;
-            conn.execute("DELETE FROM chunks_fts WHERE rowid = ?1", [10_i64])?;
-            let after = count(conn, "getuserbyid")?;
-            let other = count(conn, "orders")?;
-            Ok::<_, rusqlite::Error>((before, after, other))
-        })
-        .await
-        .unwrap();
-    assert_eq!((before, after, other), (1, 0, 1));
 }
 
 #[test]
@@ -162,63 +93,11 @@ fn crypto_primitives() {
 #[test]
 fn secret_key_file_is_created_and_reused() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = Config::new("http://localhost:3000", tmp.path());
+    let cfg = Config::new(PUBLIC_URL, tmp.path());
     let first = SecretKey::load(&cfg).unwrap();
     let sealed = first.seal(b"value");
     let second = SecretKey::load(&cfg).unwrap();
     assert_eq!(second.open(&sealed).as_deref(), Some(&b"value"[..]));
-}
-
-#[tokio::test]
-async fn healthz_answers_ok() {
-    let tmp = tempfile::tempdir().unwrap();
-    let state = AppState::new(Config::new("http://localhost:3000", tmp.path())).unwrap();
-    let app = http::router(state);
-
-    let response = app
-        .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), 1024)
-        .await
-        .unwrap();
-    assert_eq!(&body[..], b"ok");
-}
-
-#[tokio::test]
-async fn api_writes_from_foreign_origins_are_rejected() {
-    let tmp = tempfile::tempdir().unwrap();
-    let state = AppState::new(Config::new("http://localhost:3000", tmp.path())).unwrap();
-    let app = http::router(state);
-
-    for origin in [None, Some("https://evil.example")] {
-        let mut request = Request::post("/api/logout");
-        if let Some(origin) = origin {
-            request = request.header("origin", origin);
-        }
-        let response = app
-            .clone()
-            .oneshot(request.body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::FORBIDDEN,
-            "origin {origin:?}"
-        );
-    }
-
-    let response = app
-        .oneshot(
-            Request::post("/api/logout")
-                .header("origin", "http://localhost:3000")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_ne!(response.status(), StatusCode::FORBIDDEN);
 }
 
 #[test]
@@ -313,7 +192,7 @@ fn data_dir_is_private_and_tmp_is_emptied_at_start() {
     let mode =
         |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
 
-    let state = AppState::new(Config::new("http://localhost:3000", &data)).unwrap();
+    let state = AppState::new(Config::new(PUBLIC_URL, &data)).unwrap();
     assert_eq!(mode(&data), 0o700);
     assert_eq!(mode(&data.join("tmp")), 0o700);
     drop(state);
@@ -321,7 +200,7 @@ fn data_dir_is_private_and_tmp_is_emptied_at_start() {
     std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
     let leftover = data.join("tmp").join("job-1.tar.gz");
     std::fs::write(&leftover, b"partial archive").unwrap();
-    AppState::new(Config::new("http://localhost:3000", &data)).unwrap();
+    AppState::new(Config::new(PUBLIC_URL, &data)).unwrap();
     assert_eq!(mode(&data), 0o700);
     assert!(!leftover.exists());
     assert!(data.join("tmp").is_dir());
@@ -330,7 +209,7 @@ fn data_dir_is_private_and_tmp_is_emptied_at_start() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn more_reads_than_reader_connections_complete() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = Db::open(&tmp.path().join("test.db")).unwrap();
+    let db = temp_db(&tmp);
     let running = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
 
