@@ -1,0 +1,55 @@
+/* Design tokens. "Marker": yellow is a highlighter mark, black is structure, white is the page. */
+:root {
+  color-scheme: light;
+
+  --yellow: #ffd60a;
+  --yellow-press: #e6bf00;
+  --bg: #ffffff;
+  --fg: #000000;
+  --surface: #f4f4f4;
+  --rule: #e6e6e6;
+  --muted: #767676;
+  --red: #d7261e;
+  --on-red: #ffffff;
+  --blue: #2440e6;
+  --rail-bg: #000000;
+  --rail-fg: #ffffff;
+  --rail-border: transparent;
+  --focus: #000000;
+  --focus-on-ink: #ffffff;
+  --scrim: rgb(255 255 255 / 0.6);
+
+  --font-ui: 'Archivo Variable', 'Archivo', system-ui, sans-serif;
+  --font-code: 'Commit Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 72px;
+
+  --radius-control: 6px;
+  --control-height: 44px;
+  --rail-width: 224px;
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --bg: #000000;
+  --fg: #ffffff;
+  --surface: #1a1a1a;
+  --rule: #2e2e2e;
+  --muted: #a3a3a3;
+  --red: #ff6b60;
+  /* White on #FF6B60 is below 3:1, so text on red fills turns black in the dark theme. */
+  --on-red: #000000;
+  --blue: #8fa2ff;
+  --rail-border: #2e2e2e;
+  --focus: #ffd60a;
+  --focus-on-ink: #ffd60a;
+  --scrim: rgb(0 0 0 / 0.6);
+}
