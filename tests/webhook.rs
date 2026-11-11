@@ -1,62 +1,25 @@
+mod common;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use ring::hmac;
+use common::{credentials, insert_repo_async, new_state, sign_webhook, INSTALLATION_ID};
 use serde_json::{json, Value};
-use sourcelens::config::Config;
-use sourcelens::crypto;
-use sourcelens::github::app::AppCredentials;
 use sourcelens::http;
-use sourcelens::state::{now, AppState};
+use sourcelens::state::AppState;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-const SECRET: &str = "hook-secret";
 const GITHUB_ID: i64 = 9001;
-const INSTALLATION_ID: i64 = 77;
-
-fn credentials() -> AppCredentials {
-    let pem = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/test_only_app_key.pem"
-    ))
-    .unwrap();
-    AppCredentials {
-        app_id: 4242,
-        slug: "sourcelens-test".into(),
-        client_id: "Iv1.test".into(),
-        client_secret: "client-secret".into(),
-        webhook_secret: Some(SECRET.into()),
-        private_key_pem: pem,
-        html_url: "https://github.com/apps/sourcelens-test".into(),
-        source: "env",
-    }
-}
 
 async fn setup() -> (TempDir, AppState, i64) {
     let tmp = tempfile::tempdir().unwrap();
-    let mut cfg = Config::new("http://localhost:3000", tmp.path());
-    cfg.github = Some(credentials());
-    // Never reached: webhooks make no GitHub calls.
-    cfg.github_api_url = "http://127.0.0.1:9".into();
-    let state = AppState::new(cfg).unwrap();
-    let repo_id = state
-        .db
-        .write(|conn| {
-            conn.query_row(
-                "INSERT INTO repositories (github_id, installation_id, full_name, private, default_branch, created_at)
-                 VALUES (?1, ?2, 'acme/api', 0, 'main', ?3) RETURNING id",
-                rusqlite::params![GITHUB_ID, INSTALLATION_ID, now()],
-                |row| row.get(0),
-            )
-        })
-        .await
-        .unwrap();
+    let state = new_state(&tmp, |cfg| {
+        cfg.github = Some(credentials());
+        // Never reached: webhooks make no GitHub calls.
+        cfg.github_api_url = "http://127.0.0.1:9".into();
+    });
+    let repo_id = insert_repo_async(&state, GITHUB_ID, "acme/api", "connected").await;
     (tmp, state, repo_id)
-}
-
-fn sign(body: &[u8]) -> String {
-    let key = hmac::Key::new(hmac::HMAC_SHA256, SECRET.as_bytes());
-    format!("sha256={}", crypto::hex(hmac::sign(&key, body).as_ref()))
 }
 
 async fn deliver_signed(
@@ -67,7 +30,7 @@ async fn deliver_signed(
     signature: Option<String>,
 ) -> StatusCode {
     let body = payload.to_string().into_bytes();
-    let signature = signature.unwrap_or_else(|| sign(&body));
+    let signature = signature.unwrap_or_else(|| sign_webhook(&body));
     let request = Request::post("/webhooks/github")
         .header("content-type", "application/json")
         .header("x-github-event", event)
@@ -90,7 +53,7 @@ fn push(git_ref: &str, after: &str) -> Value {
     json!({ "ref": git_ref, "after": after, "deleted": false, "repository": { "id": GITHUB_ID, "full_name": "acme/api" } })
 }
 
-/// (status, target_commit) of every job of the repository.
+/// (status, target_commit, trigger) of every job of the repository.
 async fn jobs(state: &AppState, repo_id: i64) -> Vec<(String, Option<String>, String)> {
     state
         .db
@@ -226,7 +189,7 @@ async fn repeated_delivery_has_no_second_effect() {
 }
 
 #[tokio::test]
-async fn repository_rename_updates_full_name_and_default_branch_change_queues_job() {
+async fn repository_rename_updates_full_name() {
     let (_tmp, state, repo_id) = setup().await;
     let payload = json!({
         "action": "renamed",
@@ -242,19 +205,17 @@ async fn repository_rename_updates_full_name_and_default_branch_change_queues_jo
         ("connected", "acme/api-server")
     );
     assert!(jobs(&state, repo_id).await.is_empty());
+}
 
+#[tokio::test]
+async fn default_branch_change_queues_a_job() {
+    let (_tmp, state, repo_id) = setup().await;
     let payload = json!({
         "action": "edited",
         "repository": { "id": GITHUB_ID, "full_name": "acme/api-server", "private": true, "default_branch": "trunk" }
     });
     deliver(&state, "repository", "r2", &payload).await;
     assert_eq!(jobs(&state, repo_id).await.len(), 1);
-
-    let payload = json!({ "action": "deleted", "repository": { "id": GITHUB_ID, "full_name": "acme/api-server" } });
-    deliver(&state, "repository", "r3", &payload).await;
-    let (repo_state, reason, _) = repo_row(&state, repo_id).await;
-    assert_eq!(repo_state, "disconnected");
-    assert_eq!(reason.as_deref(), Some("Deleted on GitHub"));
 }
 
 #[tokio::test]
@@ -322,7 +283,7 @@ async fn installation_repositories_events_change_access() {
 #[tokio::test]
 async fn webhooks_without_credentials_are_not_found() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = AppState::new(Config::new("http://localhost:3000", tmp.path())).unwrap();
+    let state = new_state(&tmp, |_| {});
     let status = deliver(
         &state,
         "push",

@@ -1,19 +1,11 @@
+mod common;
+
+use common::{insert_repo, temp_db};
 use rusqlite::{params, Connection};
-use sourcelens::db::Db;
 use sourcelens::index::store::{
     apply_files, create_vec_table, delete_paths, knn, prepare_file, purge_batch, to_blob,
     vec_table_exists, DELETE_VECTOR_SQL, SELECT_VECTOR_SQL,
 };
-
-fn insert_repo(conn: &Connection, github_id: i64) -> i64 {
-    conn.query_row(
-        "INSERT INTO repositories (github_id, installation_id, full_name, private, default_branch, created_at)
-         VALUES (?1, 1, ?2, 0, 'main', 0) RETURNING id",
-        params![github_id, format!("acme/r{github_id}")],
-        |row| row.get(0),
-    )
-    .unwrap()
-}
 
 fn insert_vector(conn: &Connection, chunk_id: i64, repo_id: i64, vector: &[f32]) {
     conn.execute(
@@ -31,13 +23,13 @@ fn to_blob_is_little_endian_f32() {
 #[tokio::test]
 async fn knn_orders_by_distance_and_respects_scope_and_k() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = Db::open(&tmp.path().join("test.db")).unwrap();
+    let db = temp_db(&tmp);
     let (exists_before, all, only_a, only_b, top_one) = db
         .write(|conn| {
             let exists_before = vec_table_exists(conn)?;
             create_vec_table(conn, 4)?;
-            let a = insert_repo(conn, 1);
-            let b = insert_repo(conn, 2);
+            let a = insert_repo(conn, 1, "acme/r1", "connected");
+            let b = insert_repo(conn, 2, "acme/r2", "connected");
             insert_vector(conn, 1, a, &[1.0, 0.0, 0.0, 0.0]);
             insert_vector(conn, 2, a, &[0.0, 1.0, 0.0, 0.0]);
             insert_vector(conn, 3, b, &[0.8, 0.6, 0.0, 0.0]);
@@ -65,11 +57,11 @@ async fn knn_orders_by_distance_and_respects_scope_and_k() {
 #[tokio::test]
 async fn create_vec_table_replaces_an_existing_table() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = Db::open(&tmp.path().join("test.db")).unwrap();
+    let db = temp_db(&tmp);
     let rows = db
         .write(|conn| {
             create_vec_table(conn, 4)?;
-            let repo = insert_repo(conn, 1);
+            let repo = insert_repo(conn, 1, "acme/r1", "connected");
             insert_vector(conn, 1, repo, &[1.0, 0.0, 0.0, 0.0]);
             create_vec_table(conn, 8)?;
             insert_vector(conn, 1, repo, &[0.0; 8]);
@@ -96,13 +88,13 @@ fn function(name: &str, marker: &str) -> String {
 #[tokio::test]
 async fn unchanged_chunks_keep_their_vectors_when_a_file_is_reapplied() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = Db::open(&tmp.path().join("test.db")).unwrap();
+    let db = temp_db(&tmp);
     let v1 = format!("{}\n{}", function("alpha", "same"), function("beta", "old"));
     let v2 = format!("{}\n{}", function("alpha", "same"), function("beta", "new"));
 
     let rows = db
         .write(move |conn| {
-            let repo = insert_repo(conn, 1);
+            let repo = insert_repo(conn, 1, "acme/r1", "connected");
             apply_files(
                 conn,
                 repo,
@@ -179,7 +171,7 @@ fn vec0_plan(conn: &Connection, sql: &str) -> char {
 #[tokio::test]
 async fn vector_reads_and_deletes_by_chunk_id_are_point_lookups() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = Db::open(&tmp.path().join("test.db")).unwrap();
+    let db = temp_db(&tmp);
     let plans = db
         .write(|conn| {
             create_vec_table(conn, 4)?;
@@ -202,14 +194,14 @@ async fn vector_reads_and_deletes_by_chunk_id_are_point_lookups() {
 #[tokio::test]
 async fn reapply_and_delete_leave_no_orphan_vectors() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = Db::open(&tmp.path().join("test.db")).unwrap();
+    let db = temp_db(&tmp);
     let v1 = format!("{}\n{}", function("alpha", "same"), function("beta", "old"));
     let v2 = format!("{}\n{}", function("alpha", "same"), function("beta", "new"));
     let other = function("gamma", "kept");
 
     let counts = db
         .write(move |conn| {
-            let repo = insert_repo(conn, 1);
+            let repo = insert_repo(conn, 1, "acme/r1", "connected");
             apply_files(
                 conn,
                 repo,

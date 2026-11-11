@@ -1,31 +1,15 @@
+mod common;
+
 use std::collections::HashMap;
 
-use rusqlite::{params, Connection};
-use sourcelens::db::Db;
+use common::{count, insert_repo, temp_db};
+use rusqlite::Connection;
 use sourcelens::index::select::{content_skip_reason, path_allowed};
 use sourcelens::index::store::{
     apply_files, delete_paths, existing_files, plan_diff, prepare_file, purge_batch, skipped,
     FileOutcome, TreeEntry, DELETE_BATCH_FILES, DELETE_FILE_ROWS_SQL,
 };
 use sourcelens::model::SkipReason;
-
-fn open_db(tmp: &tempfile::TempDir) -> Db {
-    Db::open(&tmp.path().join("test.db")).unwrap()
-}
-
-fn insert_repo(conn: &Connection, github_id: i64, full_name: &str) -> i64 {
-    conn.query_row(
-        "INSERT INTO repositories (github_id, installation_id, full_name, private, default_branch, created_at)
-         VALUES (?1, 1, ?2, 0, 'main', 0) RETURNING id",
-        params![github_id, full_name],
-        |row| row.get(0),
-    )
-    .unwrap()
-}
-
-fn count(conn: &Connection, sql: &str) -> i64 {
-    conn.query_row(sql, [], |row| row.get(0)).unwrap()
-}
 
 fn fts_hits(conn: &Connection, table: &str, query: &str) -> i64 {
     conn.query_row(
@@ -161,7 +145,7 @@ fn prepare_file_classifies_and_normalises() {
 #[tokio::test]
 async fn apply_twice_keeps_only_the_second_version() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = open_db(&tmp);
+    let db = temp_db(&tmp);
     let FileOutcome::Indexed {
         chunks: v2_chunks, ..
     } = prepare_file("src/handler.rs", "v2", V2.as_bytes()).outcome
@@ -170,7 +154,7 @@ async fn apply_twice_keeps_only_the_second_version() {
     };
     let (stats, rows) = db
         .write(|conn| {
-            let repo = insert_repo(conn, 1, "acme/api");
+            let repo = insert_repo(conn, 1, "acme/api", "connected");
             apply_files(
                 conn,
                 repo,
@@ -221,10 +205,10 @@ async fn apply_twice_keeps_only_the_second_version() {
 #[tokio::test]
 async fn skipped_files_are_recorded_without_content() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = open_db(&tmp);
+    let db = temp_db(&tmp);
     let (stats, reason, content_null, chunks) = db
         .write(|conn| {
-            let repo = insert_repo(conn, 1, "acme/api");
+            let repo = insert_repo(conn, 1, "acme/api", "connected");
             let stats = apply_files(
                 conn,
                 repo,
@@ -257,10 +241,10 @@ async fn skipped_files_are_recorded_without_content() {
 #[tokio::test]
 async fn delete_paths_removes_every_row_of_the_file() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = open_db(&tmp);
+    let db = temp_db(&tmp);
     let after = db
         .write(|conn| {
-            let repo = insert_repo(conn, 1, "acme/api");
+            let repo = insert_repo(conn, 1, "acme/api", "connected");
             apply_files(
                 conn,
                 repo,
@@ -297,11 +281,11 @@ async fn delete_paths_removes_every_row_of_the_file() {
 #[tokio::test]
 async fn purge_repository_removes_the_repository_and_its_rows() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = open_db(&tmp);
+    let db = temp_db(&tmp);
     let after = db
         .write(|conn| {
-            let repo = insert_repo(conn, 1, "acme/api");
-            let other = insert_repo(conn, 2, "acme/web");
+            let repo = insert_repo(conn, 1, "acme/api", "connected");
+            let other = insert_repo(conn, 2, "acme/web", "connected");
             let files: Vec<_> = (0..250)
                 .map(|i| prepare_file(&format!("src/f{i}.rs"), "s", V2.as_bytes()))
                 .collect();
@@ -331,10 +315,10 @@ async fn purge_repository_removes_the_repository_and_its_rows() {
 #[tokio::test]
 async fn purge_batch_deletes_one_bounded_batch_per_writer_turn() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = open_db(&tmp);
+    let db = temp_db(&tmp);
     let repo = db
         .write(|conn| {
-            let repo = insert_repo(conn, 1, "acme/api");
+            let repo = insert_repo(conn, 1, "acme/api", "connected");
             let files: Vec<_> = (0..450)
                 .map(|i| prepare_file(&format!("src/f{i}.rs"), "s", V2.as_bytes()))
                 .collect();
@@ -387,7 +371,7 @@ async fn purge_batch_deletes_one_bounded_batch_per_writer_turn() {
 #[tokio::test]
 async fn file_row_deletes_use_indexes_and_rowid_lookups() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = open_db(&tmp);
+    let db = temp_db(&tmp);
     let plans: Vec<Vec<String>> = db
         .read(|conn| {
             DELETE_FILE_ROWS_SQL
@@ -415,10 +399,10 @@ async fn file_row_deletes_use_indexes_and_rowid_lookups() {
 #[tokio::test]
 async fn delete_paths_in_slices_lets_other_writes_interleave() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = open_db(&tmp);
+    let db = temp_db(&tmp);
     let repo = db
         .write(|conn| {
-            let repo = insert_repo(conn, 1, "acme/api");
+            let repo = insert_repo(conn, 1, "acme/api", "connected");
             let files: Vec<_> = (0..450)
                 .map(|i| prepare_file(&format!("src/f{i}.rs"), "s", V2.as_bytes()))
                 .collect();

@@ -12,11 +12,10 @@ use crate::error::{ApiError, ApiResult};
 use crate::http::session::AuthUser;
 use crate::http::{Body, PathId};
 use crate::repositories::{self, LISTED_IDS};
-use crate::state::{lock, now, AppState};
+use crate::state::{lock, now, AppState, SECS_PER_DAY};
 
 pub const KEY_PREFIX: &str = "sl_";
 const ALLOWED_EXPIRY_DAYS: [i64; 3] = [30, 90, 365];
-pub(crate) const SECS_PER_DAY: i64 = 86_400;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
