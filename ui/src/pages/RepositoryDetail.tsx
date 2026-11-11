@@ -1,16 +1,17 @@
-import { useState, type CSSProperties } from 'react';
+import { useState, type CSSProperties, type FormEvent } from 'react';
 import { Link, useNavigate, useParams } from 'react-router';
-import { api, errorMessage, type EmbeddingSettings, type Job, type JobTrigger, type RepositoryDetail as Detail } from '../api';
+import { api, type Job, type JobTrigger, type RepositoryDetail as Detail } from '../api';
 import { ConfirmDialog } from '../components/Dialog';
 import { Field } from '../components/Field';
-import { Loading, Notice, PageHeader } from '../components/Shell';
-import { StatusBlock, jobProgress, jobProgressText, repoStatus } from '../components/StatusBlock';
-import { useToast } from '../components/Toast';
+import { LoadState } from '../components/LoadState';
+import { CellLabel, Notice, PageHeader } from '../components/Shell';
+import { StatusBlock, clampedProgress, jobProgressText, repoStatus, useEmbeddingsOn } from '../components/StatusBlock';
+import { useAction } from '../hooks/useAction';
 import { useApi } from '../hooks/useApi';
-import { ago, count, duration, shortSha } from '../format';
+import { ago, count, duration, sentence, shortSha } from '../format';
 
 const TRIGGER: Record<JobTrigger, string> = {
-  connect: 'Connected',
+  connect: 'Connect',
   webhook: 'Push',
   manual: 'Manual',
   startup: 'Restart',
@@ -36,13 +37,14 @@ type Branches = { defaultBranch: string; branches: string[] };
 export function RepositoryDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
-  const notify = useToast();
   const [active, setActive] = useState(false);
   const detail = useApi<Detail>(`/api/repositories/${id}`, { pollMs: active ? 2000 : 15000 });
   const branches = useApi<Branches>(`/api/repositories/${id}/branches`);
-  const embeddings = useApi<EmbeddingSettings>('/api/settings/embeddings');
-  const [busy, setBusy] = useState(false);
+  const embeddingsOn = useEmbeddingsOn();
+  const action = useAction();
   const [confirming, setConfirming] = useState(false);
+  // The branch picked in the select; null = unchanged. Applied only by the "Change branch" button.
+  const [branchChoice, setBranchChoice] = useState<string | null>(null);
 
   const repo = detail.data?.repository;
   const isActive = repo?.activeJob != null;
@@ -54,58 +56,53 @@ export function RepositoryDetail() {
         <Link className="sl-link" to="/repositories">
           Repositories
         </Link>
-        {detail.error ? <Notice tone="error">{detail.error.message}</Notice> : <Loading />}
+        <LoadState state={detail} />
       </div>
     );
   }
 
-  async function sync(force: boolean) {
-    setBusy(true);
-    try {
-      await api.post(`/api/repositories/${id}/sync`, { force });
-      notify(force ? 'Rebuild started' : 'Sync started');
-      await detail.reload();
-    } catch (e) {
-      notify(errorMessage(e), 'error');
-    } finally {
-      setBusy(false);
-    }
+  function sync(force: boolean) {
+    void action.run(
+      async () => {
+        await api.post(`/api/repositories/${id}/sync`, { force });
+        await detail.reload();
+      },
+      { key: force ? 'rebuild' : 'sync', success: force ? 'Rebuild started' : 'Sync started' },
+    );
   }
 
-  async function changeBranch(value: string) {
-    setBusy(true);
-    try {
-      await api.patch(`/api/repositories/${id}`, { branch: value === '' ? null : value });
-      notify(value === '' ? 'Following the default branch' : `Branch set to ${value}`);
-      await detail.reload();
-    } catch (e) {
-      notify(errorMessage(e), 'error');
-    } finally {
-      setBusy(false);
-    }
+  function changeBranch(event: FormEvent) {
+    event.preventDefault();
+    if (branchChoice === null) return;
+    const value = branchChoice;
+    void action.run(
+      async () => {
+        await api.patch(`/api/repositories/${id}`, { branch: value === '' ? null : value });
+        setBranchChoice(null);
+        await detail.reload();
+      },
+      { key: 'branch', success: value === '' ? 'Following the default branch' : `Branch set to ${value}` },
+    );
   }
 
   async function disconnect() {
     if (!repo) return;
-    setBusy(true);
-    try {
-      await api.del(`/api/repositories/${id}`);
-      notify(`Disconnected ${repo.fullName}`);
-      navigate('/repositories');
-    } catch (e) {
-      notify(errorMessage(e), 'error');
-      setBusy(false);
-      setConfirming(false);
-    }
+    const name = repo.fullName;
+    const done = await action.run(() => api.del(`/api/repositories/${id}`), { key: 'disconnect', success: `Disconnected ${name}` });
+    if (done) navigate('/repositories');
+    else setConfirming(false);
   }
 
   const status = repoStatus(repo);
   const job = repo.activeJob;
-  const progress = job?.status === 'running' ? Math.min(100, jobProgress(job, embeddings.data?.enabled ?? false)) : null;
+  const progress = job?.status === 'running' ? clampedProgress(job, embeddingsOn) : 0;
   // GET …/branches returns only GitHub's first page; keep the tracked branch selectable when it is not on it.
   const listed = branches.data?.branches ?? [repo.effectiveBranch];
   const branchOptions = repo.branch !== null && !listed.includes(repo.branch) ? [repo.branch, ...listed] : listed;
   const connected = repo.state === 'connected';
+  const savedBranch = repo.branch ?? '';
+  const selectedBranch = branchChoice ?? savedBranch;
+  const busy = action.busy !== null;
 
   return (
     <div className="sl-page">
@@ -116,19 +113,25 @@ export function RepositoryDetail() {
         title={repo.fullName}
         mono
         action={
-          <button type="button" className="sl-button sl-button-primary" disabled={busy || !connected || job !== null} onClick={() => void sync(false)}>
+          <button type="button" className="sl-button sl-button-primary" disabled={busy || job !== null} onClick={() => sync(false)}>
             Sync now
           </button>
         }
       />
-      {repo.state === 'disconnected' ? <Notice tone="error">{repo.stateReason ?? 'GitHub no longer shares this repository.'} Search and API keys skip it until access returns.</Notice> : null}
+      <LoadState state={detail} />
+      {repo.state === 'disconnected' ? (
+        <Notice tone="error">
+          {sentence(repo.stateReason ?? 'GitHub no longer shares this repository')} Search and API keys skip it until access returns.
+        </Notice>
+      ) : null}
+      {status === 'failed' && repo.lastJob?.error ? <Notice tone="error">{repo.lastJob.error}</Notice> : null}
 
       <div className="sl-facts-row">
         <StatusBlock status={status} />
         <dl className="sl-facts">
           <div className="sl-fact">
             <dt className="sl-fact-label">Branch</dt>
-            <dd className="sl-fact-value">{repo.effectiveBranch}</dd>
+            <dd className="sl-fact-value sl-break">{repo.effectiveBranch}</dd>
           </div>
           <div className="sl-fact">
             <dt className="sl-fact-label">Commit</dt>
@@ -156,11 +159,11 @@ export function RepositoryDetail() {
       </div>
 
       {job ? (
-        <div className="sl-progress" style={{ '--p': `${progress ?? 0}%` } as CSSProperties}>
-          <div className="sl-progress-track" role="progressbar" aria-label="Indexing progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progress ?? 0)}>
+        <div className="sl-progress" style={{ '--p': `${progress}%` } as CSSProperties}>
+          <div className="sl-progress-track" role="progressbar" aria-label="Indexing progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progress)}>
             <div className="sl-progress-fill" />
           </div>
-          <p className="sl-progress-text">{job.status === 'queued' ? 'Waiting for a free worker.' : jobProgressText(job)}</p>
+          <p className="sl-progress-text">{jobProgressText(job)}</p>
         </div>
       ) : null}
 
@@ -169,25 +172,30 @@ export function RepositoryDetail() {
           Branch and index
         </h2>
         <div className="sl-toolbar">
-          <Field label="Branch">
-            {(props) => (
-              <select {...props} className="sl-select" value={repo.branch ?? ''} disabled={busy || !connected} onChange={(e) => void changeBranch(e.target.value)}>
-                <option value="">Follow default branch ({repo.defaultBranch})</option>
-                {branchOptions
-                  .filter((name) => name !== '')
-                  .map((name) => (
-                    <option key={name} value={name}>
-                      {name}
-                    </option>
-                  ))}
-              </select>
-            )}
-          </Field>
+          <form className="sl-inline-form" onSubmit={changeBranch}>
+            <Field label="Branch">
+              {(props) => (
+                <select {...props} className="sl-select" value={selectedBranch} disabled={!connected} onChange={(e) => setBranchChoice(e.target.value === savedBranch ? null : e.target.value)}>
+                  <option value="">Follow default branch ({repo.defaultBranch})</option>
+                  {branchOptions
+                    .filter((name) => name !== '')
+                    .map((name) => (
+                      <option key={name} value={name}>
+                        {name}
+                      </option>
+                    ))}
+                </select>
+              )}
+            </Field>
+            <button type="submit" className="sl-button sl-button-secondary" disabled={!connected || branchChoice === null || busy}>
+              Change branch
+            </button>
+          </form>
           <div className="sl-actions">
-            <button type="button" className="sl-button sl-button-secondary" disabled={busy || !connected || job !== null} onClick={() => void sync(true)}>
+            <button type="button" className="sl-button sl-button-secondary" disabled={busy || job !== null} onClick={() => sync(true)}>
               Rebuild index
             </button>
-            <button type="button" className="sl-button sl-button-danger" disabled={busy} onClick={() => setConfirming(true)}>
+            <button type="button" className="sl-button sl-button-quiet-danger" disabled={busy} onClick={() => setConfirming(true)}>
               Disconnect
             </button>
           </div>
@@ -201,18 +209,18 @@ export function RepositoryDetail() {
         {detail.data && detail.data.jobs.length > 0 ? (
           <div className="sl-table-wrap" tabIndex={0} role="region" aria-labelledby="activity-heading">
             <table className="sl-table">
-              <thead>
+              <thead className="sl-thead">
                 <tr className="sl-tr">
                   <th className="sl-th">Trigger</th>
+                  <th className="sl-th">Status</th>
                   <th className="sl-th">Commit</th>
                   <th className="sl-th sl-num">Changed</th>
                   <th className="sl-th sl-num">Deleted</th>
                   <th className="sl-th sl-num">Skipped</th>
                   <th className="sl-th sl-num">Duration</th>
-                  <th className="sl-th">Status</th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody className="sl-tbody">
                 {detail.data.jobs.map((j) => (
                   <JobRows key={j.id} job={j} />
                 ))}
@@ -259,16 +267,37 @@ function JobRows({ job }: { job: Job }) {
   const cell = job.error ? 'sl-td sl-td-joined' : 'sl-td';
   return (
     <>
-      <tr className="sl-tr">
-        <td className={cell}>{TRIGGER[job.trigger]}</td>
-        <td className={`${cell} sl-mono`}>{shortSha(job.targetCommit)}</td>
-        <td className={`${cell} sl-num`}>{count(job.filesChanged)}</td>
-        <td className={`${cell} sl-num`}>{count(job.filesDeleted)}</td>
-        <td className={`${cell} sl-num`}>{count(job.filesSkipped)}</td>
-        <td className={`${cell} sl-num`}>{duration(job.startedAt, job.finishedAt)}</td>
+      <tr className={job.error ? 'sl-tr sl-tr-joined' : 'sl-tr'}>
+        <td className={cell}>
+          <CellLabel>Trigger</CellLabel>
+          {TRIGGER[job.trigger]}
+        </td>
         <td className={job.status === 'failed' ? `${cell} sl-text-red` : cell}>
-          {JOB_STATUS[job.status]}
-          <span className="sl-td-sub">{ago(job.createdAt)}</span>
+          <CellLabel>Status</CellLabel>
+          <span>
+            {JOB_STATUS[job.status]}
+            <span className="sl-td-sub">{ago(job.createdAt)}</span>
+          </span>
+        </td>
+        <td className={`${cell} sl-mono`}>
+          <CellLabel>Commit</CellLabel>
+          {shortSha(job.targetCommit)}
+        </td>
+        <td className={`${cell} sl-num`}>
+          <CellLabel>Changed</CellLabel>
+          {count(job.filesChanged)}
+        </td>
+        <td className={`${cell} sl-num`}>
+          <CellLabel>Deleted</CellLabel>
+          {count(job.filesDeleted)}
+        </td>
+        <td className={`${cell} sl-num`}>
+          <CellLabel>Skipped</CellLabel>
+          {count(job.filesSkipped)}
+        </td>
+        <td className={`${cell} sl-num`}>
+          <CellLabel>Duration</CellLabel>
+          {duration(job.startedAt, job.finishedAt)}
         </td>
       </tr>
       {job.error ? (

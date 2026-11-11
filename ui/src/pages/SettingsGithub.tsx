@@ -1,23 +1,28 @@
+import { useRef } from 'react';
 import { ApiError, type GithubSettings } from '../api';
 import { CopyButton } from '../components/CopyButton';
-import { Loading, Notice, PageHeader, SettingsTabs } from '../components/Shell';
+import { LoadState } from '../components/LoadState';
+import { PageHeader, SettingsTabs } from '../components/Shell';
 import { useApi } from '../hooks/useApi';
 import { useUser } from '../hooks/useSession';
 import { ago } from '../format';
 
+function describe(error: Error): string {
+  if (error instanceof ApiError && error.code === 'app_not_configured') return 'No GitHub App is configured. Restart SourceLens and open the setup page.';
+  return error.message;
+}
+
 export function SettingsGithub() {
   const user = useUser();
   const github = useApi<GithubSettings>('/api/settings/github');
+  const webhookRef = useRef<HTMLElement>(null);
   const data = github.data;
-  const notConfigured = github.error instanceof ApiError && github.error.code === 'app_not_configured';
 
   return (
-    <div className="sl-page">
+    <div className="sl-page sl-page-settings">
       <PageHeader title="Settings" />
       <SettingsTabs owner={user.role === 'owner'} />
-      {github.loading ? <Loading /> : null}
-      {notConfigured ? <Notice tone="error">No GitHub App is configured. Restart SourceLens and open the setup page.</Notice> : null}
-      {github.error && !notConfigured ? <Notice tone="error">{github.error.message}</Notice> : null}
+      <LoadState state={github} describe={describe} />
       {data ? (
         <>
           <dl className="sl-settings-list">
@@ -36,8 +41,10 @@ export function SettingsGithub() {
             <div className="sl-settings-item">
               <dt className="sl-settings-label">Webhook URL</dt>
               <dd className="sl-settings-value sl-settings-copy">
-                <code className="sl-mono sl-break">{data.webhookUrl}</code>
-                <CopyButton text={data.webhookUrl} />
+                <code className="sl-mono sl-break" ref={webhookRef}>
+                  {data.webhookUrl}
+                </code>
+                <CopyButton text={data.webhookUrl} target={webhookRef} what="URL" />
               </dd>
             </div>
             <div className="sl-settings-item">
@@ -52,7 +59,7 @@ export function SettingsGithub() {
             </div>
             <div className="sl-settings-item">
               <dt className="sl-settings-label">Last delivery</dt>
-              <dd className="sl-settings-value">{data.lastDeliveryAt ? `${data.lastDeliveryEvent ?? 'Event'} ${ago(data.lastDeliveryAt)}` : 'No deliveries yet'}</dd>
+              <dd className="sl-settings-value">{data.lastDeliveryAt ? `${data.lastDeliveryEvent ?? 'Unknown'} event, ${ago(data.lastDeliveryAt)}` : 'No deliveries yet'}</dd>
             </div>
           </dl>
           <div className="sl-actions">

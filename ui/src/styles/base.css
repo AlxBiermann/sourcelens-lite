@@ -63,5 +63,5 @@ img {
 
 ::selection {
   background: var(--yellow);
-  color: #000000;
+  color: var(--on-yellow);
 }

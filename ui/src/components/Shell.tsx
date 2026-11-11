@@ -62,7 +62,9 @@ export function Shell() {
 export function PageHeader({ title, action, mono }: { title: string; action?: ReactNode; mono?: boolean }) {
   return (
     <div className="sl-page-header">
-      <h1 className={mono ? 'sl-title sl-title-long' : 'sl-title'}>{title}</h1>
+      <h1 className={mono ? 'sl-title sl-title-long' : 'sl-title'} title={mono ? title : undefined}>
+        {title}
+      </h1>
       {action ? <div className="sl-page-action">{action}</div> : null}
     </div>
   );
@@ -96,4 +98,13 @@ export function Notice({ tone = 'warning', children }: { tone?: 'warning' | 'err
 
 export function Loading() {
   return <p className="sl-muted">Loading…</p>;
+}
+
+/** Label for a table cell; shown only where tables become stacked blocks on narrow screens. */
+export function CellLabel({ children }: { children: string }) {
+  return (
+    <span className="sl-td-label" aria-hidden="true">
+      {children}
+    </span>
+  );
 }

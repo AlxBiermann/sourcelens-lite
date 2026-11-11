@@ -39,3 +39,9 @@ export function duration(start: number | null, end: number | null): string {
 export function shortSha(sha: string | null): string {
   return sha ? sha.slice(0, 7) : '';
 }
+
+/** Ends `text` with a full stop unless it already ends with punctuation. */
+export function sentence(text: string): string {
+  const trimmed = text.trim();
+  return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+}

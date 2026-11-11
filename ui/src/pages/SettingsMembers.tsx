@@ -1,10 +1,11 @@
 import { useState, type FormEvent } from 'react';
 import { Navigate } from 'react-router';
-import { api, errorMessage, type Member } from '../api';
+import { api, type Member } from '../api';
 import { ConfirmDialog } from '../components/Dialog';
 import { Field } from '../components/Field';
-import { Loading, Notice, PageHeader, SettingsTabs } from '../components/Shell';
-import { useToast } from '../components/Toast';
+import { LoadState } from '../components/LoadState';
+import { CellLabel, PageHeader, SettingsTabs } from '../components/Shell';
+import { useAction } from '../hooks/useAction';
 import { useApi } from '../hooks/useApi';
 import { useUser } from '../hooks/useSession';
 import { ago } from '../format';
@@ -13,57 +14,53 @@ export function SettingsMembers() {
   const user = useUser();
   const owner = user.role === 'owner';
   const members = useApi<Member[]>(owner ? '/api/members' : null);
-  const notify = useToast();
+  const action = useAction();
   const [login, setLogin] = useState('');
   const [formError, setFormError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
   const [removing, setRemoving] = useState<Member | null>(null);
 
   if (!owner) return <Navigate to="/settings/embeddings" replace />;
 
-  async function add(event: FormEvent) {
+  const busy = action.busy !== null;
+
+  function add(event: FormEvent) {
     event.preventDefault();
     const value = login.trim().replace(/^@/, '');
     if (!/^[A-Za-z0-9-]{1,39}$/.test(value)) {
       setFormError('Enter a GitHub username: letters, digits and hyphens, at most 39 characters.');
       return;
     }
-    setBusy(true);
     setFormError(null);
-    try {
-      await api.post<Member>('/api/members', { login: value });
-      notify('Member added');
-      setLogin('');
-      await members.reload();
-    } catch (e) {
-      setFormError(errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
+    void action.run(
+      async () => {
+        await api.post<Member>('/api/members', { login: value });
+        setLogin('');
+        await members.reload();
+      },
+      { key: 'add', success: 'Member added', onError: setFormError },
+    );
   }
 
-  async function remove() {
+  function remove() {
     if (!removing) return;
-    setBusy(true);
-    try {
-      await api.del(`/api/members/${removing.id}`);
-      notify('Member removed');
-      setRemoving(null);
-      await members.reload();
-    } catch (e) {
-      notify(errorMessage(e), 'error');
-    } finally {
-      setBusy(false);
-    }
+    const id = removing.id;
+    void action.run(
+      async () => {
+        await api.del(`/api/members/${id}`);
+        setRemoving(null);
+        await members.reload();
+      },
+      { key: 'remove', success: 'Member removed' },
+    );
   }
 
   return (
-    <div className="sl-page">
+    <div className="sl-page sl-page-settings">
       <PageHeader title="Settings" />
       <SettingsTabs owner />
-      <p className="sl-prose sl-muted">Members sign in with GitHub. They can connect repositories and create API keys; only you manage members and embedding settings.</p>
+      <p className="sl-prose sl-muted">Members sign in with GitHub. Members can search every connected repository and manage all API keys. Only you manage members and embedding settings.</p>
 
-      <form className="sl-inline-form" onSubmit={(e) => void add(e)}>
+      <form className="sl-inline-form" onSubmit={add}>
         <Field label="GitHub username" error={formError}>
           {(props) => <input {...props} className="sl-input sl-input-mono" value={login} onChange={(e) => setLogin(e.target.value)} autoComplete="off" spellCheck={false} />}
         </Field>
@@ -72,14 +69,13 @@ export function SettingsMembers() {
         </button>
       </form>
 
-      {members.loading && !members.data ? <Loading /> : null}
-      {members.error && !members.data ? <Notice tone="error">{members.error.message}</Notice> : null}
+      <LoadState state={members} />
       {members.data ? (
         <div className="sl-table-wrap" tabIndex={0} role="region" aria-label="Members">
           <table className="sl-table">
-            <thead>
+            <thead className="sl-thead">
               <tr className="sl-tr">
-                <th className="sl-th">Login</th>
+                <th className="sl-th">GitHub username</th>
                 <th className="sl-th">Role</th>
                 <th className="sl-th">Last sign-in</th>
                 <th className="sl-th">
@@ -87,7 +83,7 @@ export function SettingsMembers() {
                 </th>
               </tr>
             </thead>
-            <tbody>
+            <tbody className="sl-tbody">
               {members.data.map((member) => (
                 <tr key={member.id} className="sl-tr">
                   <td className="sl-td">
@@ -100,10 +96,16 @@ export function SettingsMembers() {
                     </span>
                   </td>
                   <td className="sl-td">
-                    {member.role === 'owner' ? 'Owner' : 'Member'}
-                    {member.pending ? <span className="sl-pending">Invited</span> : null}
+                    <CellLabel>Role</CellLabel>
+                    <span>
+                      {member.role === 'owner' ? 'Owner' : 'Member'}
+                      {member.pending ? <span className="sl-pending">Invited</span> : null}
+                    </span>
                   </td>
-                  <td className="sl-td">{member.lastLoginAt ? ago(member.lastLoginAt) : 'Never'}</td>
+                  <td className="sl-td">
+                    <CellLabel>Last sign-in</CellLabel>
+                    {member.lastLoginAt ? ago(member.lastLoginAt) : 'Never'}
+                  </td>
                   <td className="sl-td sl-td-actions">
                     {member.role === 'owner' ? null : (
                       <div className="sl-cell-buttons">
@@ -123,10 +125,10 @@ export function SettingsMembers() {
       <ConfirmDialog
         open={removing !== null}
         title={`Remove ${removing?.login ?? ''}?`}
-        body="They are signed out and can no longer use SourceLens. API keys they created keep working."
+        body="They are signed out and can no longer use SourceLens. The API keys they created stop working."
         confirmLabel="Remove member"
         busy={busy}
-        onConfirm={() => void remove()}
+        onConfirm={remove}
         onClose={() => setRemoving(null)}
       />
     </div>

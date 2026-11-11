@@ -1,5 +1,6 @@
-import type { Job, Repository } from '../api';
+import type { EmbeddingSettings, Job, Repository } from '../api';
 import { count } from '../format';
+import { useApi } from '../hooks/useApi';
 
 export type RepoStatus = 'ready' | 'indexing' | 'queued' | 'failed' | 'disconnected';
 
@@ -20,17 +21,24 @@ export function repoStatus(repo: Repository): RepoStatus {
   return 'queued';
 }
 
-/** Share of a running job that is done, 0–100. Indexing fills 0–60 when embeddings follow, else 0–100. */
-export function jobProgress(job: Job, embeddingsOn: boolean): number {
-  if (job.phase === 'embed') return 60 + (40 * job.embedDone) / Math.max(job.embedTotal, 1);
-  if (job.phase === 'index') return ((embeddingsOn ? 60 : 100) * job.filesDone) / Math.max(job.filesTotal, 1);
-  return 0;
+/** Share of a job that is done, clamped to 0–100. Indexing fills 0–60 when embeddings follow, else 0–100. */
+export function clampedProgress(job: Job, embeddingsOn: boolean): number {
+  let share = 0;
+  if (job.phase === 'embed') share = 60 + (40 * job.embedDone) / Math.max(job.embedTotal, 1);
+  else if (job.phase === 'index') share = ((embeddingsOn ? 60 : 100) * job.filesDone) / Math.max(job.filesTotal, 1);
+  return Math.min(100, Math.max(0, share));
 }
 
 export function jobProgressText(job: Job): string {
+  if (job.status === 'queued') return 'Waiting to index';
   if (job.phase === 'embed') return `Embedding ${count(job.embedDone)} of ${count(job.embedTotal)} chunks`;
   if (job.phase === 'index') return `${count(job.filesDone)} of ${count(job.filesTotal)} files`;
   return 'Reading the branch';
+}
+
+/** Whether embeddings are on; decides how indexing progress is scaled. */
+export function useEmbeddingsOn(): boolean {
+  return useApi<EmbeddingSettings>('/api/settings/embeddings').data?.enabled ?? false;
 }
 
 export function StatusBlock({ status }: { status: RepoStatus }) {

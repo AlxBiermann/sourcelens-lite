@@ -2,18 +2,33 @@
 :root {
   color-scheme: light;
 
+  /* The dark palette, used by the dark theme and by the always-dark navigation rail. */
+  --dark-bg: #000000;
+  --dark-fg: #ffffff;
+  --dark-surface: #1a1a1a;
+  --dark-rule: #2e2e2e;
+  --dark-muted: #a3a3a3;
+
   --yellow: #ffd60a;
   --yellow-press: #e6bf00;
+  /* Text and marks on yellow fills, in both themes. */
+  --on-yellow: #000000;
   --bg: #ffffff;
   --fg: #000000;
   --surface: #f4f4f4;
   --rule: #e6e6e6;
-  --muted: #767676;
+  --muted: #6b6b6b;
   --red: #d7261e;
   --on-red: #ffffff;
   --blue: #2440e6;
-  --rail-bg: #000000;
-  --rail-fg: #ffffff;
+  /* Track behind 4px yellow progress bars; must stay visible against both the page and the fill. */
+  --track: #6b6b6b;
+  /* Underline of the active tab: yellow on white is too faint, so the light theme uses black. */
+  --tab-mark: #000000;
+  --rail-bg: var(--dark-bg);
+  --rail-fg: var(--dark-fg);
+  --rail-muted: var(--dark-muted);
+  --rail-surface: var(--dark-surface);
   --rail-border: transparent;
   --focus: #000000;
   --focus-on-ink: #ffffff;
@@ -30,6 +45,8 @@
   --space-6: 32px;
   --space-7: 48px;
   --space-8: 72px;
+  /* Inset of content that follows a 4px marker bar, so its text lines up with --space-5. */
+  --bar-inset: calc(var(--space-5) - 4px);
 
   --radius-control: 6px;
   --control-height: 44px;
@@ -39,16 +56,18 @@
 :root[data-theme='dark'] {
   color-scheme: dark;
 
-  --bg: #000000;
-  --fg: #ffffff;
-  --surface: #1a1a1a;
-  --rule: #2e2e2e;
-  --muted: #a3a3a3;
+  --bg: var(--dark-bg);
+  --fg: var(--dark-fg);
+  --surface: var(--dark-surface);
+  --rule: var(--dark-rule);
+  --muted: var(--dark-muted);
   --red: #ff6b60;
   /* White on #FF6B60 is below 3:1, so text on red fills turns black in the dark theme. */
   --on-red: #000000;
   --blue: #8fa2ff;
-  --rail-border: #2e2e2e;
+  --track: var(--dark-rule);
+  --tab-mark: var(--yellow);
+  --rail-border: var(--dark-rule);
   --focus: #ffd60a;
   --focus-on-ink: #ffd60a;
   --scrim: rgb(0 0 0 / 0.6);

@@ -132,6 +132,8 @@ export type SearchHit = {
   language: string | null;
   kind: string;
   symbolPath: string;
+  /** Up to three symbols that start inside the chunk; shown for `block` / `block_part` chunks. */
+  names: string[];
   startLine: number;
   endLine: number;
   content: string;
@@ -140,6 +142,8 @@ export type SearchHit = {
 };
 
 export type SearchResult = { mode: 'lexical' | 'hybrid'; terms: string[]; results: SearchHit[] };
+
+export type SearchLanguages = { languages: string[] };
 
 export class ApiError extends Error {
   readonly code: string;

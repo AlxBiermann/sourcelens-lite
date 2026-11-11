@@ -1,9 +1,9 @@
-import { useMemo, useState } from 'react';
-import { api, errorMessage, type Installation, type Repository } from '../api';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { api, type Installation, type Repository } from '../api';
 import { Dialog } from '../components/Dialog';
 import { Field } from '../components/Field';
-import { Loading, Notice } from '../components/Shell';
-import { useToast } from '../components/Toast';
+import { LoadState } from '../components/LoadState';
+import { useAction } from '../hooks/useAction';
 import { useApi } from '../hooks/useApi';
 import { useSession } from '../hooks/useSession';
 
@@ -12,8 +12,8 @@ export function AddRepositories({ open, onClose, onConnected }: { open: boolean;
   const installations = useApi<Installation[]>(open ? '/api/github/repositories' : null);
   const [filter, setFilter] = useState('');
   const [connected, setConnected] = useState<Record<string, true>>({});
-  const [pending, setPending] = useState<string | null>(null);
-  const notify = useToast();
+  const action = useAction();
+  const filterInput = useRef<HTMLInputElement>(null);
 
   const groups = useMemo(() => {
     const needle = filter.trim().toLowerCase();
@@ -23,18 +23,21 @@ export function AddRepositories({ open, onClose, onConnected }: { open: boolean;
     }));
   }, [installations.data, filter]);
 
-  async function connect(installationId: number, fullName: string) {
-    setPending(fullName);
-    try {
-      const repo = await api.post<Repository>('/api/repositories', { fullName, installationId });
-      setConnected((current) => ({ ...current, [fullName]: true }));
-      notify(`Connected ${fullName}`);
-      onConnected(repo);
-    } catch (e) {
-      notify(errorMessage(e), 'error');
-    } finally {
-      setPending(null);
-    }
+  // The list arrives after the dialog opened, when "Close" already has focus; move it to the filter.
+  const hasList = (installations.data?.length ?? 0) > 0;
+  useEffect(() => {
+    if (hasList) filterInput.current?.focus();
+  }, [hasList]);
+
+  function connect(installationId: number, fullName: string) {
+    void action.run(
+      async () => {
+        const repo = await api.post<Repository>('/api/repositories', { fullName, installationId });
+        setConnected((current) => ({ ...current, [fullName]: true }));
+        onConnected(repo);
+      },
+      { key: fullName, success: `Connected ${fullName}` },
+    );
   }
 
   const installUrl = state?.setup.installUrl;
@@ -53,8 +56,7 @@ export function AddRepositories({ open, onClose, onConnected }: { open: boolean;
         </button>
       }
     >
-      {installations.loading ? <Loading /> : null}
-      {installations.error ? <Notice tone="error">{installations.error.message}</Notice> : null}
+      <LoadState state={installations} />
       {empty ? (
         <div className="sl-empty">
           <p className="sl-empty-text">The GitHub App is not installed anywhere you can access.</p>
@@ -65,10 +67,10 @@ export function AddRepositories({ open, onClose, onConnected }: { open: boolean;
           ) : null}
         </div>
       ) : null}
-      {installations.data && installations.data.length > 0 ? (
+      {hasList ? (
         <div className="sl-stack">
           <Field label="Filter repositories">
-            {(props) => <input {...props} type="search" className="sl-input" value={filter} onChange={(e) => setFilter(e.target.value)} autoComplete="off" spellCheck={false} />}
+            {(props) => <input {...props} ref={filterInput} type="search" className="sl-input" value={filter} onChange={(e) => setFilter(e.target.value)} autoComplete="off" spellCheck={false} />}
           </Field>
           {filter && visible === 0 ? <p className="sl-muted">No repository matches "{filter.trim()}".</p> : null}
           {groups.map(({ installation, repositories }) => (
@@ -93,9 +95,9 @@ export function AddRepositories({ open, onClose, onConnected }: { open: boolean;
                       <span className="sl-pick-branch">{repo.defaultBranch}</span>
                       <button
                         type="button"
-                        className={isConnected ? 'sl-button sl-button-quiet sl-button-small' : 'sl-button sl-button-secondary sl-button-small'}
-                        disabled={isConnected || pending !== null}
-                        onClick={() => void connect(installation.installationId, repo.fullName)}
+                        className={isConnected ? 'sl-button sl-button-quiet sl-button-small sl-pick-button' : 'sl-button sl-button-secondary sl-button-small sl-pick-button'}
+                        disabled={isConnected || action.busy !== null}
+                        onClick={() => connect(installation.installationId, repo.fullName)}
                       >
                         {isConnected ? 'Connected' : 'Connect'}
                       </button>

@@ -1,12 +1,14 @@
 import { useState, type FormEvent } from 'react';
-import { api, errorMessage, type Repository, type SearchHit, type SearchResult } from '../api';
+import { api, errorMessage, type Repository, type SearchHit, type SearchLanguages, type SearchResult } from '../api';
 import { CodeBlock } from '../components/CodeBlock';
 import { Field } from '../components/Field';
+import { LoadState } from '../components/LoadState';
 import { Notice, PageHeader } from '../components/Shell';
 import { useApi } from '../hooks/useApi';
 import { plural } from '../format';
 
-const LANGUAGES = ['c', 'cpp', 'csharp', 'go', 'java', 'javascript', 'kotlin', 'php', 'python', 'ruby', 'rust', 'scala', 'typescript', 'markdown'];
+/** Chunks without a symbol path: show the symbols that start inside them instead. */
+const NAMED_KINDS: Record<string, true> = { block: true, block_part: true };
 
 function Tags({ hit }: { hit: SearchHit }) {
   const symbol = hit.matchedBy.includes('symbol');
@@ -21,8 +23,14 @@ function Tags({ hit }: { hit: SearchHit }) {
   );
 }
 
+function symbolLabel(hit: SearchHit): string {
+  const detail = NAMED_KINDS[hit.kind] && hit.names.length > 0 ? hit.names.join(', ') : hit.symbolPath;
+  return detail ? `${hit.kind} ${detail}` : hit.kind;
+}
+
 export function Playground() {
   const repos = useApi<Repository[]>('/api/repositories');
+  const languages = useApi<SearchLanguages>('/api/search/languages');
   const [query, setQuery] = useState('');
   const [repoId, setRepoId] = useState('');
   const [language, setLanguage] = useState('');
@@ -55,6 +63,9 @@ export function Playground() {
     }
   }
 
+  // One permanent live region, so the first result count is announced too. Errors are announced by their notice.
+  const status = busy ? 'Searching…' : result ? `${plural(result.results.length, 'result')}, ${result.mode} search` : '';
+
   return (
     <div className="sl-page">
       <PageHeader title="Playground" />
@@ -69,7 +80,7 @@ export function Playground() {
             type="search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="A name, keywords or a question"
+            placeholder="Name, keywords or question"
             autoComplete="off"
             spellCheck={false}
           />
@@ -94,7 +105,7 @@ export function Playground() {
             {(props) => (
               <select {...props} className="sl-select" value={language} onChange={(e) => setLanguage(e.target.value)}>
                 <option value="">Any language</option>
-                {LANGUAGES.map((name) => (
+                {(languages.data?.languages ?? []).map((name) => (
                   <option key={name} value={name}>
                     {name}
                   </option>
@@ -108,28 +119,29 @@ export function Playground() {
         </div>
       </form>
 
+      {repos.error ? <LoadState state={repos} /> : null}
+      {languages.error ? <LoadState state={languages} /> : null}
       {error ? <Notice tone="error">{error}</Notice> : null}
 
-      {result === null && !error ? <p className="sl-muted">Search across {plural(searchable.length, 'indexed repository', 'indexed repositories')}.</p> : null}
+      <p className={result ? 'sl-results-summary' : 'sl-visually-hidden'} role="status">
+        {status}
+      </p>
+
+      {result === null && !error && repos.data ? <p className="sl-muted">Search across {plural(searchable.length, 'indexed repository', 'indexed repositories')}.</p> : null}
 
       {result ? (
         <section className="sl-results" aria-label="Search results">
-          <p className="sl-results-summary" aria-live="polite">
-            {plural(result.results.length, 'result')}, {result.mode} search
-          </p>
           {result.results.map((hit, index) => {
             const semanticOnly = hit.matchedBy.length > 0 && hit.matchedBy.every((channel) => channel === 'semantic');
             return (
               <article key={`${hit.repository}:${hit.path}:${hit.startLine}:${index}`} className="sl-hit">
                 <header className="sl-hit-head">
-                  <span className="sl-hit-location">
-                    {hit.repository} {hit.path}:{hit.startLine}-{hit.endLine}
-                  </span>
-                  <span className="sl-hit-symbol">
-                    {hit.kind}
-                    {hit.symbolPath ? ` ${hit.symbolPath}` : ''}
-                  </span>
                   <Tags hit={hit} />
+                  <span className="sl-hit-repo">{hit.repository}</span>
+                  <span className="sl-hit-location">
+                    {hit.path}:{hit.startLine}-{hit.endLine}
+                  </span>
+                  <span className="sl-hit-symbol">{symbolLabel(hit)}</span>
                 </header>
                 <CodeBlock code={hit.content} startLine={hit.startLine} terms={semanticOnly ? [] : result.terms} semanticOnly={semanticOnly} label={`${hit.path} lines ${hit.startLine} to ${hit.endLine}`} />
               </article>

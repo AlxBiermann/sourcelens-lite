@@ -1,4 +1,4 @@
-import { useMemo, type ReactNode } from 'react';
+import { Fragment, useMemo, type ReactNode, type Ref } from 'react';
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -35,22 +35,22 @@ export function CodeBlock({ code, startLine = 1, terms = [], semanticOnly = fals
     <pre className={semanticOnly ? 'sl-code sl-code-semantic' : 'sl-code'} aria-label={label} tabIndex={0}>
       <code className="sl-code-inner">
         {lines.map((line, index) => (
-          <span key={index} className="sl-code-line">
+          <Fragment key={index}>
             <span className="sl-code-number" aria-hidden="true">
               {`${String(startLine + index).padStart(width, ' ')}  `}
             </span>
-            <span className="sl-code-text">{markLine(line, pattern)}</span>
+            {markLine(line, pattern)}
             {'\n'}
-          </span>
+          </Fragment>
         ))}
       </code>
     </pre>
   );
 }
 
-export function Snippet({ text }: { text: string }) {
+export function Snippet({ text, ref }: { text: string; ref?: Ref<HTMLPreElement> }) {
   return (
-    <pre className="sl-code" tabIndex={0}>
+    <pre className="sl-code" tabIndex={0} ref={ref}>
       <code className="sl-snippet">{text}</code>
     </pre>
   );

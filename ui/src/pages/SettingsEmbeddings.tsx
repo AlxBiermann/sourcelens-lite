@@ -1,8 +1,9 @@
 import { useEffect, useState, type CSSProperties, type FormEvent } from 'react';
-import { api, errorMessage, type EmbeddingSettings, type EmbeddingSettingsInput, type EmbeddingTestResult } from '../api';
+import { api, type EmbeddingSettings, type EmbeddingSettingsInput, type EmbeddingTestResult } from '../api';
 import { Choice, Field } from '../components/Field';
-import { Loading, Notice, PageHeader, SettingsTabs } from '../components/Shell';
-import { useToast } from '../components/Toast';
+import { LoadState } from '../components/LoadState';
+import { Notice, PageHeader, SettingsTabs } from '../components/Shell';
+import { useAction } from '../hooks/useAction';
 import { useApi } from '../hooks/useApi';
 import { useUser } from '../hooks/useSession';
 import { count, plural } from '../format';
@@ -53,9 +54,8 @@ export function SettingsEmbeddings() {
   const user = useUser();
   const owner = user.role === 'owner';
   const settings = useApi<EmbeddingSettings>('/api/settings/embeddings', { pollMs: 10000 });
-  const notify = useToast();
+  const action = useAction();
   const [form, setForm] = useState<Form | null>(null);
-  const [busy, setBusy] = useState<'test' | 'save' | null>(null);
   const [test, setTest] = useState<EmbeddingTestResult | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
 
@@ -68,49 +68,54 @@ export function SettingsEmbeddings() {
     setTest(null);
   }
 
-  async function runTest() {
+  function runTest() {
     if (!form) return;
-    setBusy('test');
+    const input = toInput(form);
     setTest(null);
-    try {
-      setTest(await api.post<EmbeddingTestResult>('/api/settings/embeddings/test', toInput(form)));
-    } catch (e) {
-      setTest({ ok: false, error: errorMessage(e) });
-    } finally {
-      setBusy(null);
-    }
+    void action.run(async () => setTest(await api.post<EmbeddingTestResult>('/api/settings/embeddings/test', input)), {
+      key: 'test',
+      onError: (error) => setTest({ ok: false, error }),
+    });
   }
 
-  async function save(event: FormEvent) {
+  function save(event: FormEvent) {
     event.preventDefault();
     if (!form) return;
-    setBusy('save');
+    const input = toInput(form);
     setSaveError(null);
-    try {
-      const saved = await api.put<EmbeddingSettings & { reembedRepositories: number }>('/api/settings/embeddings', toInput(form));
-      setForm(toForm(saved));
-      notify(saved.reembedRepositories > 0 ? `Saved. Re-embedding ${plural(saved.reembedRepositories, 'repository', 'repositories')}.` : 'Saved.');
-      await settings.reload();
-    } catch (e) {
-      setSaveError(errorMessage(e));
-    } finally {
-      setBusy(null);
-    }
+    void action.run(
+      async () => {
+        const saved = await api.put<EmbeddingSettings & { reembedRepositories: number }>('/api/settings/embeddings', input);
+        setForm(toForm(saved));
+        await settings.reload();
+        return saved.reembedRepositories;
+      },
+      {
+        key: 'save',
+        success: (repositories) => (repositories > 0 ? `Saved. Re-embedding ${plural(repositories, 'repository', 'repositories')}.` : 'Saved.'),
+        onError: setSaveError,
+      },
+    );
   }
 
   const data = settings.data;
+  const busy = action.busy !== null;
   const coverage = data && data.totalChunks > 0 ? (100 * data.embeddedChunks) / data.totalChunks : 0;
+  const keyHint = !data?.apiKeySet
+    ? 'Leave empty for servers without authentication.'
+    : form && form.baseUrl.trim() !== data.baseUrl
+      ? 'Enter the API key for the new base URL.'
+      : 'Leave empty to keep the saved key.';
 
   return (
-    <div className="sl-page">
+    <div className="sl-page sl-page-settings">
       <PageHeader title="Settings" />
       <SettingsTabs owner={owner} />
       <p className="sl-prose sl-muted">
         Embeddings add search by meaning next to keyword and identifier search. SourceLens calls any server that speaks the OpenAI embeddings API, such as OpenAI, Ollama or LM Studio.
       </p>
       {!owner ? <Notice>Only the owner can change embedding settings.</Notice> : null}
-      {settings.error && !data ? <Notice tone="error">{settings.error.message}</Notice> : null}
-      {!form ? <Loading /> : null}
+      <LoadState state={settings} />
 
       {data ? (
         <section className="sl-meter" aria-label="Embedding coverage">
@@ -125,17 +130,17 @@ export function SettingsEmbeddings() {
       ) : null}
 
       {form && data ? (
-        <form className="sl-form sl-form-narrow" onSubmit={(e) => void save(e)}>
+        <form className="sl-form" onSubmit={save}>
           <fieldset className="sl-fieldset" disabled={!owner}>
             <legend className="sl-visually-hidden">Embedding settings</legend>
             <label className="sl-switch">
               <input type="checkbox" role="switch" className="sl-switch-input" checked={form.enabled} onChange={(e) => update('enabled', e.target.checked)} />
-              <span className="sl-switch-label">Use embeddings</span>
+              <span>Use embeddings</span>
             </label>
             <Field label="Base URL" hint="For example https://api.openai.com/v1 or http://localhost:11434/v1.">
               {(props) => <input {...props} className="sl-input sl-input-mono" type="url" value={form.baseUrl} onChange={(e) => update('baseUrl', e.target.value)} autoComplete="off" spellCheck={false} />}
             </Field>
-            <Field label="API key" hint={data.apiKeySet ? 'Leave empty to keep the saved key.' : 'Leave empty for servers without authentication.'}>
+            <Field label="API key" hint={keyHint}>
               {(props) => (
                 <input {...props} className="sl-input sl-input-mono" type="password" value={form.apiKey} placeholder={data.apiKeySet ? 'Saved' : undefined} onChange={(e) => update('apiKey', e.target.value)} autoComplete="new-password" disabled={form.clearApiKey} />
               )}
@@ -171,10 +176,10 @@ export function SettingsEmbeddings() {
 
           {owner ? (
             <div className="sl-actions">
-              <button type="submit" className="sl-button sl-button-primary" disabled={busy !== null}>
+              <button type="submit" className="sl-button sl-button-primary" disabled={busy}>
                 Save embedding settings
               </button>
-              <button type="button" className="sl-button sl-button-secondary" disabled={busy !== null || !form.baseUrl.trim() || !form.model.trim()} onClick={() => void runTest()}>
+              <button type="button" className="sl-button sl-button-secondary" disabled={busy || !form.baseUrl.trim() || !form.model.trim()} onClick={runTest}>
                 Test connection
               </button>
             </div>

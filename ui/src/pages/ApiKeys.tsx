@@ -1,11 +1,12 @@
-import { useState, type FormEvent } from 'react';
-import { api, errorMessage, type ApiKey, type Repository } from '../api';
+import { useId, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
+import { api, type ApiKey, type Repository } from '../api';
 import { Snippet } from '../components/CodeBlock';
 import { CopyButton } from '../components/CopyButton';
 import { ConfirmDialog, Dialog } from '../components/Dialog';
 import { Choice, Field } from '../components/Field';
-import { Loading, Notice, PageHeader } from '../components/Shell';
-import { useToast } from '../components/Toast';
+import { LoadState } from '../components/LoadState';
+import { CellLabel, PageHeader } from '../components/Shell';
+import { useAction } from '../hooks/useAction';
 import { useApi } from '../hooks/useApi';
 import { useSession } from '../hooks/useSession';
 import { ago, date, plural } from '../format';
@@ -59,40 +60,60 @@ function AccessPicker({ all, setAll, selected, setSelected, repos }: { all: bool
   );
 }
 
-function CreatedKey({ created, publicUrl }: { created: Created; publicUrl: string }) {
+function CreatedKey({ created, publicUrl, titleId }: { created: Created; publicUrl: string; titleId: string }) {
   const tabs = snippets(`${publicUrl}/mcp`, created.secret);
   const [tab, setTab] = useState(tabs[0].id);
   const current = tabs.find((t) => t.id === tab) ?? tabs[0];
+  const baseId = useId();
+  const secretRef = useRef<HTMLElement>(null);
+  const snippetRef = useRef<HTMLPreElement>(null);
+  const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
+
+  function onTabKey(event: KeyboardEvent<HTMLButtonElement>, index: number) {
+    const last = tabs.length - 1;
+    const next = event.key === 'ArrowRight' ? (index === last ? 0 : index + 1) : event.key === 'ArrowLeft' ? (index === 0 ? last : index - 1) : event.key === 'Home' ? 0 : event.key === 'End' ? last : null;
+    if (next === null) return;
+    event.preventDefault();
+    setTab(tabs[next].id);
+    tabRefs.current[next]?.focus();
+  }
 
   return (
     <div className="sl-stack">
       <div className="sl-secret">
-        <code className="sl-secret-value">{created.secret}</code>
-        <CopyButton text={created.secret} label="Copy key" className="sl-button sl-button-primary sl-button-small" />
+        <code className="sl-secret-value" ref={secretRef}>
+          {created.secret}
+        </code>
+        <CopyButton text={created.secret} label="Copy key" className="sl-button sl-button-primary sl-button-small" target={secretRef} what="key" autoFocus describedBy={titleId} />
       </div>
       <div className="sl-stack-tight">
         <div className="sl-tabs" role="tablist" aria-label="Client configuration">
-          {tabs.map((t) => (
+          {tabs.map((t, index) => (
             <button
               key={t.id}
+              ref={(el) => {
+                tabRefs.current[index] = el;
+              }}
               type="button"
               role="tab"
-              id={`client-tab-${t.id}`}
+              id={`${baseId}-tab-${t.id}`}
               aria-selected={t.id === tab}
-              aria-controls="client-panel"
+              aria-controls={`${baseId}-panel`}
+              tabIndex={t.id === tab ? 0 : -1}
               className={t.id === tab ? 'sl-tab sl-tab-active' : 'sl-tab'}
               onClick={() => setTab(t.id)}
+              onKeyDown={(event) => onTabKey(event, index)}
             >
               {t.label}
             </button>
           ))}
         </div>
-        <div className="sl-stack-tight" role="tabpanel" id="client-panel" aria-labelledby={`client-tab-${current.id}`}>
+        <div className="sl-stack-tight" role="tabpanel" id={`${baseId}-panel`} aria-labelledby={`${baseId}-tab-${current.id}`}>
           <div className="sl-snippet-head">
             <p className="sl-hint">{current.caption}</p>
-            <CopyButton text={current.text} />
+            <CopyButton text={current.text} target={snippetRef} what="configuration" />
           </div>
-          <Snippet text={current.text} />
+          <Snippet text={current.text} ref={snippetRef} />
         </div>
       </div>
     </div>
@@ -103,7 +124,8 @@ export function ApiKeys() {
   const { state } = useSession();
   const keys = useApi<ApiKey[]>('/api/keys');
   const repos = useApi<Repository[]>('/api/repositories');
-  const notify = useToast();
+  const action = useAction();
+  const titleId = useId();
 
   const [editing, setEditing] = useState<ApiKey | 'new' | null>(null);
   const [created, setCreated] = useState<Created | null>(null);
@@ -112,10 +134,10 @@ export function ApiKeys() {
   const [expiry, setExpiry] = useState<number | null>(null);
   const [all, setAll] = useState(true);
   const [selected, setSelected] = useState<number[]>([]);
-  const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
 
   const repoList = repos.data ?? [];
+  const busy = action.busy !== null;
 
   function open(target: ApiKey | 'new') {
     setEditing(target);
@@ -132,7 +154,7 @@ export function ApiKeys() {
     setCreated(null);
   }
 
-  async function save(event: FormEvent) {
+  function save(event: FormEvent) {
     event.preventDefault();
     if (!name.trim()) {
       setFormError('Enter a name.');
@@ -142,40 +164,41 @@ export function ApiKeys() {
       setFormError('Select at least one repository.');
       return;
     }
-    setBusy(true);
     setFormError(null);
     const repositoryIds = all ? null : selected;
-    try {
-      if (editing === 'new') {
-        const result = await api.post<Created>('/api/keys', { name: name.trim(), expiresInDays: expiry, repositoryIds });
-        setCreated(result);
-        notify('Key created');
-      } else if (editing) {
-        await api.patch<ApiKey>(`/api/keys/${editing.id}`, { name: name.trim(), repositoryIds });
-        notify('Key saved');
-        close();
-      }
-      await keys.reload();
-    } catch (e) {
-      setFormError(errorMessage(e));
-    } finally {
-      setBusy(false);
+    if (editing === 'new') {
+      // The dialog itself shows the result, so no toast.
+      void action.run(
+        async () => {
+          setCreated(await api.post<Created>('/api/keys', { name: name.trim(), expiresInDays: expiry, repositoryIds }));
+          await keys.reload();
+        },
+        { onError: setFormError },
+      );
+    } else if (editing) {
+      const id = editing.id;
+      void action.run(
+        async () => {
+          await api.patch<ApiKey>(`/api/keys/${id}`, { name: name.trim(), repositoryIds });
+          close();
+          await keys.reload();
+        },
+        { success: 'Key saved', onError: setFormError },
+      );
     }
   }
 
-  async function revoke() {
+  function revoke() {
     if (!revoking) return;
-    setBusy(true);
-    try {
-      await api.del(`/api/keys/${revoking.id}`);
-      notify('Key revoked');
-      setRevoking(null);
-      await keys.reload();
-    } catch (e) {
-      notify(errorMessage(e), 'error');
-    } finally {
-      setBusy(false);
-    }
+    const id = revoking.id;
+    void action.run(
+      async () => {
+        await api.del(`/api/keys/${id}`);
+        setRevoking(null);
+        await keys.reload();
+      },
+      { success: 'Key revoked' },
+    );
   }
 
   const now = Date.now() / 1000;
@@ -189,8 +212,7 @@ export function ApiKeys() {
     <div className="sl-page">
       <PageHeader title="API keys" action={keys.data?.length === 0 ? undefined : createButton} />
       <p className="sl-prose sl-muted">Agents use API keys to search your repositories over MCP. Every key is read-only.</p>
-      {keys.error && !keys.data ? <Notice tone="error">{keys.error.message}</Notice> : null}
-      {keys.loading && !keys.data ? <Loading /> : null}
+      <LoadState state={keys} />
       {keys.data && keys.data.length === 0 ? (
         <div className="sl-empty">
           <p className="sl-empty-text">No API keys. Create one to connect an agent over MCP.</p>
@@ -200,7 +222,7 @@ export function ApiKeys() {
       {keys.data && keys.data.length > 0 ? (
         <div className="sl-table-wrap" tabIndex={0} role="region" aria-label="API keys">
           <table className="sl-table">
-            <thead>
+            <thead className="sl-thead">
               <tr className="sl-tr">
                 <th className="sl-th">Name</th>
                 <th className="sl-th">Access</th>
@@ -211,18 +233,29 @@ export function ApiKeys() {
                 </th>
               </tr>
             </thead>
-            <tbody>
+            <tbody className="sl-tbody">
               {keys.data.map((key) => {
                 const expired = key.expiresAt !== null && key.expiresAt < now;
                 return (
                   <tr key={key.id} className="sl-tr">
                     <td className="sl-td">
-                      <span className="sl-td-main">{key.name}</span>
-                      <span className="sl-td-sub sl-mono">sl_…{key.last4}</span>
+                      <span>
+                        <span className="sl-td-main">{key.name}</span>
+                        <span className="sl-td-sub sl-mono">sl_…{key.last4}</span>
+                      </span>
                     </td>
-                    <td className="sl-td">{key.allRepositories ? 'All repositories' : plural(key.repositoryIds.length, 'repository', 'repositories')}</td>
-                    <td className="sl-td">{key.lastUsedAt ? ago(key.lastUsedAt) : 'Never'}</td>
-                    <td className={expired ? 'sl-td sl-text-red' : 'sl-td'}>{key.expiresAt === null ? 'Never' : expired ? `Expired ${date(key.expiresAt)}` : date(key.expiresAt)}</td>
+                    <td className="sl-td">
+                      <CellLabel>Access</CellLabel>
+                      {key.allRepositories ? 'All repositories' : plural(key.repositoryIds.length, 'repository', 'repositories')}
+                    </td>
+                    <td className="sl-td">
+                      <CellLabel>Last used</CellLabel>
+                      {key.lastUsedAt ? ago(key.lastUsedAt) : 'Never'}
+                    </td>
+                    <td className={expired ? 'sl-td sl-text-red' : 'sl-td'}>
+                      <CellLabel>Expires</CellLabel>
+                      {key.expiresAt === null ? 'Never' : expired ? `Expired ${date(key.expiresAt)}` : date(key.expiresAt)}
+                    </td>
                     <td className="sl-td sl-td-actions">
                       <div className="sl-cell-buttons">
                         <button type="button" className="sl-button sl-button-secondary sl-button-small" onClick={() => open(key)}>
@@ -244,8 +277,10 @@ export function ApiKeys() {
       <Dialog
         open={editing !== null}
         title={created ? 'Copy your key now. It is not shown again.' : editing === 'new' ? 'Create key' : 'Edit key'}
+        titleId={titleId}
         onClose={close}
         wide={created !== null}
+        dismissible={created === null}
         actions={
           created ? (
             <button type="button" className="sl-button sl-button-secondary" onClick={close}>
@@ -264,9 +299,9 @@ export function ApiKeys() {
         }
       >
         {created && state ? (
-          <CreatedKey created={created} publicUrl={state.publicUrl} />
+          <CreatedKey created={created} publicUrl={state.publicUrl} titleId={titleId} />
         ) : (
-          <form id="key-form" className="sl-form" onSubmit={(e) => void save(e)}>
+          <form id="key-form" className="sl-form" onSubmit={save}>
             <Field label="Name" hint="Name it after the agent or machine that uses it.">
               {(props) => <input {...props} className="sl-input" value={name} onChange={(e) => setName(e.target.value)} autoComplete="off" maxLength={100} />}
             </Field>
@@ -296,7 +331,7 @@ export function ApiKeys() {
         body="Agents using it lose access immediately."
         confirmLabel="Revoke key"
         busy={busy}
-        onConfirm={() => void revoke()}
+        onConfirm={revoke}
         onClose={() => setRevoking(null)}
       />
     </div>

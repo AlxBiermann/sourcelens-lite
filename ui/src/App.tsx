@@ -1,5 +1,6 @@
 import { Navigate, Route, Routes, useLocation, useSearchParams } from 'react-router';
-import { Shell } from './components/Shell';
+import { EntryPage } from './components/EntryPage';
+import { Notice, Shell } from './components/Shell';
 import { useSession } from './hooks/useSession';
 import { ApiKeys } from './pages/ApiKeys';
 import { Login } from './pages/Login';
@@ -35,19 +36,14 @@ export function App() {
   if (!state) {
     if (!error) return null;
     return (
-      <div className="sl-entry-page">
-        <div className="sl-entry-content">
-          <h1 className="sl-entry-wordmark">SourceLens</h1>
-          <p className="sl-notice sl-notice-error" role="alert">
-            {error.message}
-          </p>
-          <div className="sl-actions">
-            <button type="button" className="sl-button sl-button-primary" onClick={() => void reload()}>
-              Try again
-            </button>
-          </div>
+      <EntryPage>
+        <Notice tone="error">{error.message}</Notice>
+        <div className="sl-actions">
+          <button type="button" className="sl-button sl-button-primary" onClick={() => void reload()}>
+            Try again
+          </button>
         </div>
-      </div>
+      </EntryPage>
     );
   }
 

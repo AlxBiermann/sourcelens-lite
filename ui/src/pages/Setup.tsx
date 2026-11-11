@@ -1,8 +1,9 @@
 import { useState, type FormEvent, type ReactNode } from 'react';
 import { useSearchParams } from 'react-router';
 import { api, errorMessage } from '../api';
+import { EntryPage } from '../components/EntryPage';
 import { Field } from '../components/Field';
-import { ThemeToggle } from '../components/ThemeToggle';
+import { Notice } from '../components/Shell';
 import { useSession } from '../hooks/useSession';
 
 const TOKEN_KEY = 'sourcelens.setupToken';
@@ -44,14 +45,14 @@ function postManifest(postUrl: string, manifest: unknown) {
 
 function Step({ number, title, state, children }: { number: number; title: string; state: 'done' | 'current' | 'later'; children: ReactNode }) {
   return (
-    <li className={state === 'current' ? 'sl-step sl-step-current' : 'sl-step'}>
-      <span className={state === 'current' ? 'sl-step-number sl-step-number-current' : 'sl-step-number'} aria-hidden="true">
-        {number}
+    <li className="sl-step">
+      <span className={`sl-step-number sl-step-number-${state}`} aria-hidden="true">
+        {state === 'done' ? '✓' : number}
       </span>
-      <div className="sl-step-body">
+      <div className={state === 'done' ? 'sl-step-body sl-step-body-done' : 'sl-step-body'}>
         <h2 className="sl-step-title">
           {title}
-          {state === 'done' ? <span className="sl-step-done">Done</span> : null}
+          {state === 'done' ? <span className="sl-visually-hidden"> (done)</span> : null}
         </h2>
         {children}
       </div>
@@ -99,74 +100,59 @@ export function Setup() {
   const signInHref = `/auth/github/login?setup_token=${encodeURIComponent(token.trim())}`;
 
   return (
-    <div className="sl-entry-page">
-      <div className="sl-entry-top">
-        <ThemeToggle />
-      </div>
-      <div className="sl-entry-content">
-        <h1 className="sl-entry-wordmark">SourceLens</h1>
-        <p className="sl-entry-lead">Three steps connect this instance to GitHub and make you its owner.</p>
-        {error && ERRORS[error] ? (
-          <p className="sl-notice sl-notice-error" role="alert">
-            {ERRORS[error]}
-          </p>
-        ) : null}
-        {formError ? (
-          <p className="sl-notice sl-notice-error" role="alert">
-            {formError}
-          </p>
-        ) : null}
-        <ol className="sl-steps">
-          <Step number={1} title="Create the GitHub App" state={stepState(1)}>
-            {appConfigured ? (
-              <p className="sl-prose">
-                The GitHub App {appSlug ? <strong>{appSlug}</strong> : null} is configured.
-              </p>
-            ) : (
-              <form className="sl-form" onSubmit={(e) => void createApp(e)}>
-                {tokenField}
-                <Field label="Organization" hint="Leave empty to create the app on your personal account.">
-                  {(props) => <input {...props} className="sl-input" value={organization} onChange={(e) => setOrganization(e.target.value)} autoComplete="off" spellCheck={false} />}
-                </Field>
-                <div className="sl-actions">
-                  <button type="submit" className="sl-button sl-button-primary" disabled={busy || !token.trim()}>
-                    Create GitHub App
-                  </button>
-                </div>
-              </form>
-            )}
-          </Step>
-          <Step number={2} title="Install it" state={stepState(2)}>
-            <p className="sl-prose">Choose the repositories SourceLens may read. You can change this later on GitHub.</p>
-            {appConfigured && installUrl ? (
+    <EntryPage lead="Three steps connect this instance to GitHub and make you its owner.">
+      {error && ERRORS[error] ? <Notice tone="error">{ERRORS[error]}</Notice> : null}
+      {formError ? <Notice tone="error">{formError}</Notice> : null}
+      <ol className="sl-steps">
+        <Step number={1} title="Create the GitHub App" state={stepState(1)}>
+          {appConfigured ? (
+            <p className="sl-prose">
+              The GitHub App {appSlug ? <strong>{appSlug}</strong> : null} is configured.
+            </p>
+          ) : (
+            <form className="sl-form" onSubmit={(e) => void createApp(e)}>
+              {tokenField}
+              <Field label="Organization" hint="Leave empty to create the app on your personal account.">
+                {(props) => <input {...props} className="sl-input" value={organization} onChange={(e) => setOrganization(e.target.value)} autoComplete="off" spellCheck={false} />}
+              </Field>
               <div className="sl-actions">
-                <a className={current === 2 ? 'sl-button sl-button-primary' : 'sl-button sl-button-secondary'} href={installUrl} target="_blank" rel="noreferrer">
-                  Install on GitHub
-                </a>
+                <button type="submit" className="sl-button sl-button-primary" disabled={busy || !token.trim()}>
+                  Create GitHub App
+                </button>
               </div>
-            ) : null}
-          </Step>
-          <Step number={3} title="Sign in" state={stepState(3)}>
-            <p className="sl-prose">The first person to sign in with the setup token becomes the owner of this instance.</p>
-            {appConfigured ? (
-              <div className="sl-form">
-                {tokenField}
-                <div className="sl-actions">
-                  {token.trim() ? (
-                    <a className={current === 3 ? 'sl-button sl-button-primary' : 'sl-button sl-button-secondary'} href={signInHref} onClick={() => rememberToken(token.trim())}>
-                      Sign in with GitHub
-                    </a>
-                  ) : (
-                    <button type="button" className="sl-button sl-button-secondary" disabled>
-                      Sign in with GitHub
-                    </button>
-                  )}
-                </div>
+            </form>
+          )}
+        </Step>
+        <Step number={2} title="Install it" state={stepState(2)}>
+          <p className="sl-prose">Choose the repositories SourceLens may read. You can change this later on GitHub.</p>
+          {appConfigured && installUrl ? (
+            <div className="sl-actions">
+              <a className={current === 2 ? 'sl-button sl-button-primary' : 'sl-button sl-button-secondary'} href={installUrl} target="_blank" rel="noreferrer">
+                Install on GitHub
+              </a>
+            </div>
+          ) : null}
+        </Step>
+        <Step number={3} title="Sign in" state={stepState(3)}>
+          <p className="sl-prose">The first person to sign in with the setup token becomes the owner of this instance.</p>
+          {appConfigured ? (
+            <div className="sl-form">
+              {tokenField}
+              <div className="sl-actions">
+                {token.trim() ? (
+                  <a className={current === 3 ? 'sl-button sl-button-primary' : 'sl-button sl-button-secondary'} href={signInHref} onClick={() => rememberToken(token.trim())}>
+                    Sign in with GitHub
+                  </a>
+                ) : (
+                  <button type="button" className="sl-button sl-button-secondary" disabled>
+                    Sign in with GitHub
+                  </button>
+                )}
               </div>
-            ) : null}
-          </Step>
-        </ol>
-      </div>
-    </div>
+            </div>
+          ) : null}
+        </Step>
+      </ol>
+    </EntryPage>
   );
 }

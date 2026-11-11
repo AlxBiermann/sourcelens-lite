@@ -1,36 +1,34 @@
 import { useState } from 'react';
 import { useSearchParams } from 'react-router';
-import { api, errorMessage, type EmbeddingSettings, type GithubSettings, type Repository } from '../api';
+import { api, type GithubSettings, type Repository } from '../api';
+import { LoadState } from '../components/LoadState';
 import { RepoRow } from '../components/RepoRow';
-import { Loading, Notice, PageHeader } from '../components/Shell';
-import { useToast } from '../components/Toast';
+import { Notice, PageHeader } from '../components/Shell';
+import { useEmbeddingsOn } from '../components/StatusBlock';
+import { useAction } from '../hooks/useAction';
 import { useApi } from '../hooks/useApi';
 import { AddRepositories } from './AddRepositories';
 
 export function Repositories() {
   const [params, setParams] = useSearchParams();
   const [adding, setAdding] = useState(params.get('installed') === '1');
-  const [syncing, setSyncing] = useState<number | null>(null);
   const [active, setActive] = useState(false);
-  const notify = useToast();
   const repos = useApi<Repository[]>('/api/repositories', { pollMs: active ? 2000 : 15000 });
   const github = useApi<GithubSettings>('/api/settings/github');
-  const embeddings = useApi<EmbeddingSettings>('/api/settings/embeddings');
+  const embeddingsOn = useEmbeddingsOn();
+  const action = useAction();
 
   const anyActive = repos.data?.some((repo) => repo.activeJob !== null) ?? false;
   if (anyActive !== active) setActive(anyActive);
 
-  async function sync(repo: Repository) {
-    setSyncing(repo.id);
-    try {
-      await api.post(`/api/repositories/${repo.id}/sync`, {});
-      notify('Sync started');
-      await repos.reload();
-    } catch (e) {
-      notify(errorMessage(e), 'error');
-    } finally {
-      setSyncing(null);
-    }
+  function sync(repo: Repository) {
+    void action.run(
+      async () => {
+        await api.post(`/api/repositories/${repo.id}/sync`, {});
+        await repos.reload();
+      },
+      { key: repo.id, success: 'Sync started' },
+    );
   }
 
   function closeDialog() {
@@ -48,8 +46,7 @@ export function Repositories() {
     <div className="sl-page">
       <PageHeader title="Repositories" action={repos.data?.length === 0 ? undefined : addButton} />
       {github.data && !github.data.webhookActive ? <Notice>GitHub cannot reach this address, so pushes are not picked up automatically. Use Sync now.</Notice> : null}
-      {repos.error && !repos.data ? <Notice tone="error">{repos.error.message}</Notice> : null}
-      {repos.loading && !repos.data ? <Loading /> : null}
+      <LoadState state={repos} />
       {repos.data && repos.data.length === 0 ? (
         <div className="sl-empty">
           <p className="sl-empty-text">No repositories yet. Add one and SourceLens indexes its default branch.</p>
@@ -59,7 +56,7 @@ export function Repositories() {
       {repos.data && repos.data.length > 0 ? (
         <ul className="sl-ledger" aria-label="Connected repositories">
           {repos.data.map((repo) => (
-            <RepoRow key={repo.id} repo={repo} embeddingsOn={embeddings.data?.enabled ?? false} onSync={(r) => void sync(r)} syncing={syncing === repo.id} />
+            <RepoRow key={repo.id} repo={repo} embeddingsOn={embeddingsOn} onSync={sync} syncing={action.busy === repo.id} />
           ))}
         </ul>
       ) : null}
