@@ -1,0 +1,1 @@
+//! Markdown chunking (slice `chunker`).
