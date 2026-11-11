@@ -1,6 +1,6 @@
 //! Read-only MCP server: stateless Streamable HTTP with JSON responses only.
 
-use std::collections::HashMap;
+use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
@@ -10,13 +10,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use rusqlite::{params, OptionalExtension};
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 use crate::crypto::sha256_hex;
 use crate::error::{ApiError, ApiResult};
-use crate::http::keys::KEY_PREFIX;
+use crate::http::keys::{KEY_PREFIX, SECS_PER_DAY};
 use crate::repositories::{self, RepoRow, CONNECTED_IDS};
-use crate::search::{self, symbols, Filter, SearchHit, SearchRequest};
+use crate::search::symbols::{self, SymbolRow};
+use crate::search::{self, Filter, SearchHit, SearchRequest};
 use crate::state::{lock, now, AppState};
 
 const SUPPORTED_VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "2025-03-26"];
@@ -30,10 +32,14 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
 const UNAUTHORIZED: i64 = -32001;
-const FORBIDDEN: i64 = -32000;
+/// Implementation-defined server error: foreign origin, rate limit.
+const SERVER_ERROR: i64 = -32000;
 
 const SEARCH_TEXT_BUDGET: usize = 24_000;
 const SEARCH_PREVIEW_LINES: usize = 6;
+const SEARCH_PREVIEW_CHARS: usize = 1_500;
+/// Longer lines of a search hit are cut, in the text and in `structuredContent`.
+const MAX_LINE_CHARS: usize = 400;
 const GET_CODE_DEFAULT_LINES: usize = 400;
 const GET_CODE_MAX_LINES: usize = 800;
 const FIND_SYMBOL_DEFAULT: usize = 20;
@@ -60,96 +66,89 @@ async fn method_not_allowed() -> Response {
 }
 
 async fn handle(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    if let Some(origin) = headers.get(header::ORIGIN) {
-        let allowed = origin
-            .to_str()
-            .is_ok_and(|o| o.trim_end_matches('/') == state.cfg.public_origin());
-        if !allowed {
-            return rpc_error(
-                StatusCode::FORBIDDEN,
-                Value::Null,
-                FORBIDDEN,
-                "Forbidden: origin not allowed",
-            );
-        }
+    match serve(&state, &headers, &body).await {
+        Ok(response) => response,
+        Err(reject) => reject.into_response(),
     }
+}
 
-    let bearer = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            let (scheme, token) = v.trim().split_once(' ')?;
-            scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
-        });
-    let Some(secret) = bearer else {
-        return unauthorized();
+async fn serve(state: &AppState, headers: &HeaderMap, body: &[u8]) -> Result<Response, Reject> {
+    check_origin(state, headers)?;
+    let scope = authorize(state, headers).await?;
+    state
+        .mcp_rate
+        .check(scope.key_id)
+        .map_err(Reject::RateLimited)?;
+    check_version(headers)?;
+    let message: Value = serde_json::from_slice(body)
+        .map_err(|_| Reject::BadRequest(PARSE_ERROR, "Parse error: body is not valid JSON"))?;
+    let Some(Envelope { id, method, params }) = parse_envelope(&message)? else {
+        // A notification, or a response to a server request (this server sends none).
+        return Ok(StatusCode::ACCEPTED.into_response());
     };
-    let scope = match authenticate(&state, secret).await {
-        Ok(scope) => scope,
-        Err(err) if err.status == StatusCode::UNAUTHORIZED => return unauthorized(),
-        Err(err) => return rpc_error(err.status, Value::Null, INTERNAL_ERROR, &err.message),
-    };
-
-    if let Some(version) = headers.get("mcp-protocol-version") {
-        let supported = version
-            .to_str()
-            .is_ok_and(|v| SUPPORTED_VERSIONS.contains(&v.trim()));
-        if !supported {
-            return rpc_error(
-                StatusCode::BAD_REQUEST,
-                Value::Null,
-                INVALID_REQUEST,
-                "Unsupported MCP-Protocol-Version header",
-            );
-        }
-    }
-
-    let message: Value = match serde_json::from_slice(&body) {
-        Ok(value) => value,
-        Err(_) => {
-            return rpc_error(
-                StatusCode::BAD_REQUEST,
-                Value::Null,
-                PARSE_ERROR,
-                "Parse error: body is not valid JSON",
-            )
-        }
-    };
-    let Some(message) = message.as_object() else {
-        return invalid_request("Invalid request: expected one JSON-RPC message object");
-    };
-    if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return invalid_request("Invalid request: jsonrpc must be \"2.0\"");
-    }
-    let Some(id) = message.get("id") else {
-        // Notification.
-        return StatusCode::ACCEPTED.into_response();
-    };
-    let Some(method) = message.get("method") else {
-        if message.contains_key("result") || message.contains_key("error") {
-            // A response to a server request; this server sends none, so there is nothing to do.
-            return StatusCode::ACCEPTED.into_response();
-        }
-        return invalid_request("Invalid request: method is missing");
-    };
-    if !(id.is_string() || id.is_i64() || id.is_u64()) {
-        return invalid_request("Invalid request: id must be a string or an integer");
-    }
-    let Some(method) = method.as_str() else {
-        return invalid_request("Invalid request: method must be a string");
-    };
-    let params = message.get("params").unwrap_or(&Value::Null);
 
     let result = match method {
         "initialize" => Ok(initialize(params)),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
-        "tools/call" => call_tool(&state, &scope, params).await,
+        "tools/call" => call_tool(state, &scope, params).await,
         _ => Err((METHOD_NOT_FOUND, format!("Method not found: {method}"))),
     };
-    match result {
+    Ok(match result {
         Ok(result) => Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })).into_response(),
         Err((code, message)) => rpc_error(StatusCode::OK, id.clone(), code, &message),
+    })
+}
+
+/// A request answered before it reaches a method.
+enum Reject {
+    Origin,
+    Unauthorized,
+    /// Seconds until the key may send again.
+    RateLimited(u64),
+    BadRequest(i64, &'static str),
+    Internal(ApiError),
+}
+
+impl IntoResponse for Reject {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Origin => rpc_error(
+                StatusCode::FORBIDDEN,
+                Value::Null,
+                SERVER_ERROR,
+                "Forbidden: origin not allowed",
+            ),
+            Self::Unauthorized => {
+                let mut response = rpc_error(
+                    StatusCode::UNAUTHORIZED,
+                    Value::Null,
+                    UNAUTHORIZED,
+                    "Unauthorized: invalid or missing API key",
+                );
+                response.headers_mut().insert(
+                    header::WWW_AUTHENTICATE,
+                    HeaderValue::from_static("Bearer realm=\"sourcelens\""),
+                );
+                response
+            }
+            Self::RateLimited(seconds) => {
+                let mut response = rpc_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Value::Null,
+                    SERVER_ERROR,
+                    &format!("Rate limit exceeded. Retry in {seconds} s."),
+                );
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+                response
+            }
+            Self::BadRequest(code, message) => {
+                rpc_error(StatusCode::BAD_REQUEST, Value::Null, code, message)
+            }
+            Self::Internal(err) => rpc_error(err.status, Value::Null, INTERNAL_ERROR, &err.message),
+        }
     }
 }
 
@@ -158,27 +157,94 @@ fn rpc_error(status: StatusCode, id: Value, code: i64, message: &str) -> Respons
     (status, Json(body)).into_response()
 }
 
-fn invalid_request(message: &str) -> Response {
-    rpc_error(
-        StatusCode::BAD_REQUEST,
-        Value::Null,
-        INVALID_REQUEST,
-        message,
-    )
+/// Browsers may only call `/mcp` from the public origin; clients without `Origin` are not browsers.
+fn check_origin(state: &AppState, headers: &HeaderMap) -> Result<(), Reject> {
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return Ok(());
+    };
+    let allowed = origin
+        .to_str()
+        .is_ok_and(|o| o.trim_end_matches('/') == state.cfg.public_origin());
+    if allowed {
+        Ok(())
+    } else {
+        Err(Reject::Origin)
+    }
 }
 
-fn unauthorized() -> Response {
-    let mut response = rpc_error(
-        StatusCode::UNAUTHORIZED,
-        Value::Null,
-        UNAUTHORIZED,
-        "Unauthorized: invalid or missing API key",
-    );
-    response.headers_mut().insert(
-        header::WWW_AUTHENTICATE,
-        HeaderValue::from_static("Bearer realm=\"sourcelens\""),
-    );
-    response
+async fn authorize(state: &AppState, headers: &HeaderMap) -> Result<KeyScope, Reject> {
+    let secret = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            let (scheme, token) = v.trim().split_once(' ')?;
+            scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
+        })
+        .ok_or(Reject::Unauthorized)?;
+    authenticate(state, secret).await.map_err(|err| {
+        if err.status == StatusCode::UNAUTHORIZED {
+            Reject::Unauthorized
+        } else {
+            Reject::Internal(err)
+        }
+    })
+}
+
+fn check_version(headers: &HeaderMap) -> Result<(), Reject> {
+    let Some(version) = headers.get("mcp-protocol-version") else {
+        return Ok(());
+    };
+    let supported = version
+        .to_str()
+        .is_ok_and(|v| SUPPORTED_VERSIONS.contains(&v.trim()));
+    if supported {
+        Ok(())
+    } else {
+        Err(Reject::BadRequest(
+            INVALID_REQUEST,
+            "Unsupported MCP-Protocol-Version header",
+        ))
+    }
+}
+
+/// A JSON-RPC request that expects an answer.
+struct Envelope<'a> {
+    id: &'a Value,
+    method: &'a str,
+    params: &'a Value,
+}
+
+/// `None` for notifications and responses, which get no answer.
+fn parse_envelope(message: &Value) -> Result<Option<Envelope<'_>>, Reject> {
+    let invalid = |message| Reject::BadRequest(INVALID_REQUEST, message);
+    let message = message
+        .as_object()
+        .ok_or_else(|| invalid("Invalid request: expected one JSON-RPC message object"))?;
+    if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err(invalid("Invalid request: jsonrpc must be \"2.0\""));
+    }
+    let Some(id) = message.get("id") else {
+        return Ok(None);
+    };
+    let Some(method) = message.get("method") else {
+        if message.contains_key("result") || message.contains_key("error") {
+            return Ok(None);
+        }
+        return Err(invalid("Invalid request: method is missing"));
+    };
+    if !(id.is_string() || id.is_i64() || id.is_u64()) {
+        return Err(invalid(
+            "Invalid request: id must be a string or an integer",
+        ));
+    }
+    let method = method
+        .as_str()
+        .ok_or_else(|| invalid("Invalid request: method must be a string"))?;
+    Ok(Some(Envelope {
+        id,
+        method,
+        params: message.get("params").unwrap_or(&Value::Null),
+    }))
 }
 
 /// What an API key may read.
@@ -217,7 +283,8 @@ pub async fn authenticate(state: &AppState, secret: &str) -> ApiResult<KeyScope>
             } else {
                 conn.prepare(&format!(
                     "SELECT repo_id FROM api_key_repos
-                     WHERE key_id = ?1 AND repo_id IN ({CONNECTED_IDS}) ORDER BY repo_id"
+                     WHERE key_id = ?1 AND repo_id IN ({CONNECTED_IDS})
+                     ORDER BY repo_id"
                 ))?
                 .query_map([key_id], |r| r.get(0))?
                 .collect::<rusqlite::Result<Vec<i64>>>()?
@@ -226,12 +293,13 @@ pub async fn authenticate(state: &AppState, secret: &str) -> ApiResult<KeyScope>
         })
         .await?;
     let scope = found.ok_or_else(invalid_key)?;
-    touch(state, scope.key_id).await?;
+    touch(state, scope.key_id);
     Ok(scope)
 }
 
-/// Writes `last_used_at` at most once per [`TOUCH_INTERVAL`] per key.
-async fn touch(state: &AppState, key_id: i64) -> ApiResult<()> {
+/// Records `last_used_at` at most once per [`TOUCH_INTERVAL`] per key, in the background: it is
+/// bookkeeping, and the writer may be busy with an index batch.
+fn touch(state: &AppState, key_id: i64) {
     let due = {
         let mut touched = lock(&state.key_touch);
         let now = Instant::now();
@@ -243,18 +311,23 @@ async fn touch(state: &AppState, key_id: i64) -> ApiResult<()> {
         }
         due
     };
-    if due {
-        state
-            .db
+    if !due {
+        return;
+    }
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        let written: rusqlite::Result<usize> = db
             .write(move |conn| {
                 conn.execute(
                     "UPDATE api_keys SET last_used_at = ?1 WHERE id = ?2",
                     params![now(), key_id],
                 )
             })
-            .await?;
-    }
-    Ok(())
+            .await;
+        if let Err(err) = written {
+            tracing::warn!("Could not record the use of API key {key_id}: {err}");
+        }
+    });
 }
 
 fn invalid_key() -> ApiError {
@@ -274,20 +347,15 @@ fn initialize(params: &Value) -> Value {
     })
 }
 
-fn tool_definitions() -> Value {
-    fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
-        json!({
-            "name": name,
-            "description": description,
-            "inputSchema": {
-                "type": "object",
-                "properties": properties,
-                "required": required,
-                "additionalProperties": false,
-            },
-            "annotations": { "readOnlyHint": true },
-        })
-    }
+/// A tool's contract: `properties` is both the advertised schema and the set of accepted arguments.
+struct ToolSpec {
+    name: &'static str,
+    description: &'static str,
+    properties: Value,
+    required: &'static [&'static str],
+}
+
+fn tool_specs() -> [ToolSpec; 5] {
     let repositories = json!({
         "type": "array",
         "items": { "type": "string" },
@@ -296,54 +364,74 @@ fn tool_definitions() -> Value {
     let repository =
         json!({ "type": "string", "description": "Repository full name, e.g. owner/repo." });
     let path = json!({ "type": "string", "description": "File path inside the repository." });
-    json!([
-        tool(
-            "list_repositories",
-            "List the repositories this API key can search, with branch and index state.",
-            json!({}),
-            &[],
-        ),
-        tool(
-            "search_code",
-            "Search code by meaning, keywords or identifiers across indexed repositories. Returns the best matching code blocks with repository, path and line range.",
-            json!({
+    [
+        ToolSpec {
+            name: "list_repositories",
+            description: "List the repositories this API key can search, with branch and index state.",
+            properties: json!({}),
+            required: &[],
+        },
+        ToolSpec {
+            name: "search_code",
+            description: "Search code by meaning, keywords or identifiers across indexed repositories. Returns the best matching code blocks with repository, path and line range.",
+            properties: json!({
                 "query": { "type": "string", "description": "What to look for: words, identifiers or a description." },
                 "repositories": repositories,
                 "languages": { "type": "array", "items": { "type": "string" }, "description": "Language names, e.g. rust, typescript." },
                 "pathPrefix": { "type": "string", "description": "Only files whose path starts with this prefix." },
                 "limit": { "type": "integer", "minimum": 1, "maximum": search::MAX_LIMIT, "default": search::DEFAULT_LIMIT },
             }),
-            &["query"],
-        ),
-        tool(
-            "get_code",
-            "Read a file or a line range from an indexed repository.",
-            json!({
+            required: &["query"],
+        },
+        ToolSpec {
+            name: "get_code",
+            description: "Read a file or a line range from an indexed repository.",
+            properties: json!({
                 "repository": repository,
                 "path": path,
                 "startLine": { "type": "integer", "minimum": 1, "description": "First line, 1-based. Default 1." },
                 "endLine": { "type": "integer", "minimum": 1, "description": "Last line, inclusive." },
             }),
-            &["repository", "path"],
-        ),
-        tool(
-            "get_file_outline",
-            "List the symbols of one file with kinds, signatures and line ranges.",
-            json!({ "repository": repository, "path": path }),
-            &["repository", "path"],
-        ),
-        tool(
-            "find_symbol",
-            "Find where a function, class, type or other symbol is defined. Matches exact names first, then prefixes, then substrings.",
-            json!({
+            required: &["repository", "path"],
+        },
+        ToolSpec {
+            name: "get_file_outline",
+            description: "List the symbols of one file with kinds, signatures and line ranges.",
+            properties: json!({ "repository": repository, "path": path }),
+            required: &["repository", "path"],
+        },
+        ToolSpec {
+            name: "find_symbol",
+            description: "Find where a function, class, type or other symbol is defined. Matches exact names first, then prefixes, then substrings.",
+            properties: json!({
                 "name": { "type": "string", "description": "Symbol name, optionally qualified (Type.method, mod::fn)." },
                 "repositories": repositories,
-                "kind": { "type": "string", "description": "Symbol kind, e.g. function, method, class, struct." },
+                "kind": { "type": "string", "description": "Symbol kind, e.g. function, method, class, struct, constant. Markdown headings are only returned for kind heading (any level) or heading_1 … heading_6." },
                 "limit": { "type": "integer", "minimum": 1, "maximum": FIND_SYMBOL_MAX, "default": FIND_SYMBOL_DEFAULT },
             }),
-            &["name"],
-        ),
-    ])
+            required: &["name"],
+        },
+    ]
+}
+
+fn tool_definitions() -> Value {
+    let tools: Vec<Value> = tool_specs()
+        .into_iter()
+        .map(|spec| {
+            json!({
+                "name": spec.name,
+                "description": spec.description,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": spec.properties,
+                    "required": spec.required,
+                    "additionalProperties": false,
+                },
+                "annotations": { "readOnlyHint": true },
+            })
+        })
+        .collect();
+    Value::Array(tools)
 }
 
 /// Failure of a `tools/call`: invalid arguments become a JSON-RPC error, everything else an `isError` result.
@@ -369,6 +457,13 @@ struct ToolOutput {
     structured: Value,
 }
 
+impl ToolOutput {
+    fn new(text: String, structured: impl Serialize) -> Result<Self, ToolError> {
+        let structured = serde_json::to_value(structured).map_err(ApiError::internal)?;
+        Ok(Self { text, structured })
+    }
+}
+
 async fn call_tool(
     state: &AppState,
     scope: &KeyScope,
@@ -383,25 +478,16 @@ async fn call_tool(
         Some(Value::Object(map)) => map,
         Some(_) => return Err((INVALID_PARAMS, "params.arguments must be an object".into())),
     };
-    let output = match name {
-        "list_repositories" => list_repositories(state, scope, Args::new(arguments, &[])?).await,
-        "search_code" => {
-            let allowed = ["query", "repositories", "languages", "pathPrefix", "limit"];
-            search_code(state, scope, Args::new(arguments, &allowed)?).await
-        }
-        "get_code" => {
-            let allowed = ["repository", "path", "startLine", "endLine"];
-            get_code(state, scope, Args::new(arguments, &allowed)?).await
-        }
-        "get_file_outline" => {
-            let allowed = ["repository", "path"];
-            get_file_outline(state, scope, Args::new(arguments, &allowed)?).await
-        }
-        "find_symbol" => {
-            let allowed = ["name", "repositories", "kind", "limit"];
-            find_symbol(state, scope, Args::new(arguments, &allowed)?).await
-        }
-        _ => return Err((INVALID_PARAMS, format!("Unknown tool: {name}"))),
+    let Some(spec) = tool_specs().into_iter().find(|spec| spec.name == name) else {
+        return Err((INVALID_PARAMS, format!("Unknown tool: {name}")));
+    };
+    let args = Args::new(arguments, &spec.properties)?;
+    let output = match spec.name {
+        "list_repositories" => list_repositories(state, scope).await,
+        "search_code" => search_code(state, scope, args).await,
+        "get_code" => get_code(state, scope, args).await,
+        "get_file_outline" => get_file_outline(state, scope, args).await,
+        _ => find_symbol(state, scope, args).await,
     };
     match output {
         Ok(output) => Ok(json!({
@@ -420,8 +506,10 @@ async fn call_tool(
 struct Args<'a>(&'a Map<String, Value>);
 
 impl<'a> Args<'a> {
-    fn new(map: &'a Map<String, Value>, allowed: &[&str]) -> Result<Self, (i64, String)> {
-        match map.keys().find(|key| !allowed.contains(&key.as_str())) {
+    /// Rejects arguments that are not in the tool's schema `properties`.
+    fn new(map: &'a Map<String, Value>, properties: &Value) -> Result<Self, (i64, String)> {
+        let known = |key: &str| properties.get(key).is_some();
+        match map.keys().find(|key| !known(key)) {
             Some(key) => Err((INVALID_PARAMS, format!("Unknown argument \"{key}\""))),
             None => Ok(Self(map)),
         }
@@ -529,14 +617,20 @@ fn narrow(repos: &[RepoRow], names: &[&str]) -> Result<Vec<i64>, ToolError> {
     Ok(ids)
 }
 
-async fn list_repositories(
-    state: &AppState,
-    scope: &KeyScope,
-    _args: Args<'_>,
-) -> Result<ToolOutput, ToolError> {
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListedRepository<'a> {
+    name: &'a str,
+    branch: &'a str,
+    indexed_commit: Option<&'a str>,
+    indexed_at: Option<i64>,
+    file_count: i64,
+}
+
+async fn list_repositories(state: &AppState, scope: &KeyScope) -> Result<ToolOutput, ToolError> {
     let repos = scope_repositories(state, scope).await?;
     let mut lines = Vec::with_capacity(repos.len());
-    let mut structured = Vec::with_capacity(repos.len());
+    let mut listed = Vec::with_capacity(repos.len());
     for repo in &repos {
         let index_state = match (&repo.indexed_commit, repo.indexed_at) {
             (Some(commit), at) => {
@@ -554,23 +648,20 @@ async fn list_repositories(
             repo.full_name,
             repo.effective_branch()
         ));
-        structured.push(json!({
-            "name": repo.full_name,
-            "branch": repo.effective_branch(),
-            "indexedCommit": repo.indexed_commit,
-            "indexedAt": repo.indexed_at,
-            "fileCount": repo.file_count,
-        }));
+        listed.push(ListedRepository {
+            name: &repo.full_name,
+            branch: repo.effective_branch(),
+            indexed_commit: repo.indexed_commit.as_deref(),
+            indexed_at: repo.indexed_at,
+            file_count: repo.file_count,
+        });
     }
     let text = if lines.is_empty() {
         "No repositories are available to this API key. Connect repositories in SourceLens or widen the key's access.".to_string()
     } else {
         lines.join("\n")
     };
-    Ok(ToolOutput {
-        text,
-        structured: json!({ "repositories": structured }),
-    })
+    ToolOutput::new(text, json!({ "repositories": listed }))
 }
 
 async fn search_code(
@@ -595,8 +686,16 @@ async fn search_code(
         },
     )
     .await?;
+    let hits: Vec<SearchHit> = response
+        .hits
+        .into_iter()
+        .map(|hit| SearchHit {
+            content: cap_lines(&hit.content),
+            ..hit
+        })
+        .collect();
 
-    let count = response.hits.len();
+    let count = hits.len();
     let noun = if count == 1 { "result" } else { "results" };
     let mut text = format!(
         "{count} {noun} for \"{}\" ({})",
@@ -605,8 +704,7 @@ async fn search_code(
     );
     let mut used = text.chars().count();
     let mut truncating = false;
-    for (n, hit) in response.hits.iter().enumerate() {
-        let label = format!("{} {}", hit.kind, hit.symbol_path);
+    for (n, hit) in hits.iter().enumerate() {
         let heading = format!(
             "\n\n{}. {} {}:{}-{}  {}\n",
             n + 1,
@@ -614,7 +712,7 @@ async fn search_code(
             hit.path,
             hit.start_line,
             hit.end_line,
-            label.trim_end()
+            hit_label(hit)
         );
         let full = fenced(hit.language.as_deref(), &hit.content);
         let block_len = heading.chars().count() + full.chars().count();
@@ -623,29 +721,66 @@ async fn search_code(
         }
         text.push_str(&heading);
         if truncating {
-            text.push_str(&preview(hit));
+            text.push_str(&preview(hit.language.as_deref(), &hit.content));
         } else {
             text.push_str(&full);
         }
         used += block_len;
     }
-    let results: Vec<&SearchHit> = response.hits.iter().collect();
-    Ok(ToolOutput {
-        text,
-        structured: json!({ "mode": response.mode, "results": results }),
-    })
+    ToolOutput::new(text, json!({ "mode": response.mode, "results": hits }))
 }
 
-fn preview(hit: &SearchHit) -> String {
-    let lines: Vec<&str> = hit.content.split('\n').collect();
-    if lines.len() <= SEARCH_PREVIEW_LINES {
-        return fenced(hit.language.as_deref(), &hit.content);
+/// `kind symbol_path`; chunks that group declarations (`block`, `block_part`) have no symbol
+/// path and show the names of the symbols they contain instead.
+fn hit_label(hit: &SearchHit) -> String {
+    let name = if matches!(hit.kind.as_str(), "block" | "block_part") && !hit.names.is_empty() {
+        hit.names.join(", ")
+    } else {
+        hit.symbol_path.clone()
+    };
+    format!("{} {name}", hit.kind).trim_end().to_string()
+}
+
+/// Cuts every line longer than [`MAX_LINE_CHARS`] to `… [+N chars]`.
+fn cap_lines(content: &str) -> String {
+    content
+        .split('\n')
+        .map(cap_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn cap_line(line: &str) -> Cow<'_, str> {
+    match line.char_indices().nth(MAX_LINE_CHARS) {
+        None => Cow::Borrowed(line),
+        Some((at, _)) => {
+            let rest = line[at..].chars().count();
+            Cow::Owned(format!("{}… [+{rest} chars]", &line[..at]))
+        }
     }
-    let head = lines[..SEARCH_PREVIEW_LINES].join("\n");
+}
+
+/// The first [`SEARCH_PREVIEW_LINES`] lines, fewer when they exceed [`SEARCH_PREVIEW_CHARS`]
+/// (always at least one line).
+fn preview(language: Option<&str>, content: &str) -> String {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let mut shown = 0;
+    let mut chars = 0;
+    for line in &lines {
+        let len = line.chars().count() + 1;
+        if shown == SEARCH_PREVIEW_LINES || (shown > 0 && chars + len > SEARCH_PREVIEW_CHARS) {
+            break;
+        }
+        shown += 1;
+        chars += len;
+    }
+    if shown == lines.len() {
+        return fenced(language, content);
+    }
     format!(
         "{}\n… {} more lines, read with get_code",
-        fenced(hit.language.as_deref(), &head),
-        lines.len() - SEARCH_PREVIEW_LINES
+        fenced(language, &lines[..shown].join("\n")),
+        lines.len() - shown
     )
 }
 
@@ -664,7 +799,7 @@ async fn load_file(
     with_content: bool,
 ) -> Result<FileRow, ToolError> {
     let repo_id = repo.id;
-    let lookup_path = normalize_path(path).to_string();
+    let lookup_path = path.to_string();
     let row = state
         .db
         .read(move |conn| {
@@ -684,7 +819,6 @@ async fn load_file(
             .optional()
         })
         .await?;
-    let path = normalize_path(path);
     match row {
         None => Err(ToolError::Failed(format!(
             "No file \"{path}\" in {}. Use search_code or get_file_outline to find paths.",
@@ -700,13 +834,60 @@ async fn load_file(
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodeRange<'a> {
+    repository: &'a str,
+    path: &'a str,
+    start_line: usize,
+    end_line: usize,
+    line_count: usize,
+    commit: Option<&'a str>,
+    content: &'a str,
+}
+
+/// Lines `start..=end` to return and the `wanted_end` the caller asked for (more than one page
+/// when `end < wanted_end`).
+struct Page {
+    start: usize,
+    end: usize,
+    wanted_end: usize,
+}
+
+/// Clamps the requested range to the file and to one page: [`GET_CODE_DEFAULT_LINES`] without
+/// `endLine` (the rest of the file, served in pages), else at most [`GET_CODE_MAX_LINES`].
+fn page(
+    path: &str,
+    start_arg: Option<i64>,
+    end_arg: Option<i64>,
+    line_count: usize,
+) -> Result<Page, ToolError> {
+    let start = to_line(start_arg.unwrap_or(1));
+    if start > line_count {
+        return Err(ToolError::Failed(format!(
+            "\"{path}\" has {line_count} lines; startLine {start} is past the end."
+        )));
+    }
+    let wanted_end = end_arg.map_or(line_count, to_line).min(line_count);
+    let page_lines = if end_arg.is_some() {
+        GET_CODE_MAX_LINES
+    } else {
+        GET_CODE_DEFAULT_LINES
+    };
+    Ok(Page {
+        start,
+        end: wanted_end.min(start + page_lines - 1),
+        wanted_end,
+    })
+}
+
 async fn get_code(
     state: &AppState,
     scope: &KeyScope,
     args: Args<'_>,
 ) -> Result<ToolOutput, ToolError> {
     let repository = args.string("repository")?;
-    let path = args.string("path")?;
+    let path = normalize_path(args.string("path")?);
     let start_arg = args.integer("startLine")?;
     let end_arg = args.integer("endLine")?;
     if let (Some(start), Some(end)) = (start_arg, end_arg) {
@@ -720,8 +901,7 @@ async fn get_code(
     let repos = scope_repositories(state, scope).await?;
     let repo = resolve(&repos, repository)?;
     let file = load_file(state, repo, path, true).await?;
-    let path = normalize_path(path);
-    let content = String::from_utf8_lossy(file.content.as_deref().unwrap_or_default()).into_owned();
+    let content = String::from_utf8_lossy(file.content.as_deref().unwrap_or_default());
     let lines = split_lines(&content);
     let line_count = lines.len();
     let commit = repo.indexed_commit.as_deref();
@@ -730,31 +910,27 @@ async fn get_code(
         .unwrap_or_default();
 
     if line_count == 0 {
-        return Ok(ToolOutput {
-            text: format!("{} {path} is empty{at_commit}.", repo.full_name),
-            structured: json!({
-                "repository": repo.full_name, "path": path, "startLine": 0, "endLine": 0,
-                "lineCount": 0, "commit": commit, "content": "",
-            }),
-        });
+        let empty = CodeRange {
+            repository: &repo.full_name,
+            path,
+            start_line: 0,
+            end_line: 0,
+            line_count: 0,
+            commit,
+            content: "",
+        };
+        return ToolOutput::new(
+            format!("{} {path} is empty{at_commit}.", repo.full_name),
+            empty,
+        );
     }
 
-    let start = to_line(start_arg.unwrap_or(1));
-    if start > line_count {
-        return Err(ToolError::Failed(format!(
-            "\"{path}\" has {line_count} lines; startLine {start} is past the end."
-        )));
-    }
-    // Without endLine the caller wants the rest of the file, served in pages.
-    let wanted_end = end_arg.map_or(line_count, to_line).min(line_count);
-    let page = if end_arg.is_some() {
-        GET_CODE_MAX_LINES
-    } else {
-        GET_CODE_DEFAULT_LINES
-    };
-    let end = wanted_end.min(start + page - 1);
+    let Page {
+        start,
+        end,
+        wanted_end,
+    } = page(path, start_arg, end_arg, line_count)?;
     let code = lines[start - 1..end].join("\n");
-
     let mut text = format!(
         "{} {path}:{start}-{end} of {line_count} lines{at_commit}\n{}",
         repo.full_name,
@@ -766,23 +942,16 @@ async fn get_code(
             end + 1
         ));
     }
-    Ok(ToolOutput {
-        text,
-        structured: json!({
-            "repository": repo.full_name, "path": path, "startLine": start, "endLine": end,
-            "lineCount": line_count, "commit": commit, "content": code,
-        }),
-    })
-}
-
-struct OutlineSymbol {
-    kind: String,
-    name: String,
-    qualified_name: String,
-    signature: Option<String>,
-    start_line: u32,
-    end_line: u32,
-    depth: u32,
+    let range = CodeRange {
+        repository: &repo.full_name,
+        path,
+        start_line: start,
+        end_line: end,
+        line_count,
+        commit,
+        content: &code,
+    };
+    ToolOutput::new(text, range)
 }
 
 async fn get_file_outline(
@@ -791,32 +960,14 @@ async fn get_file_outline(
     args: Args<'_>,
 ) -> Result<ToolOutput, ToolError> {
     let repository = args.string("repository")?;
-    let path = args.string("path")?;
+    let path = normalize_path(args.string("path")?);
     let repos = scope_repositories(state, scope).await?;
     let repo = resolve(&repos, repository)?;
     let file = load_file(state, repo, path, false).await?;
-    let path = normalize_path(path);
     let file_id = file.id;
     let symbols = state
         .db
-        .read(move |conn| {
-            conn.prepare(
-                "SELECT kind, name, qualified_name, signature, start_line, end_line, depth
-                 FROM symbols WHERE file_id = ?1 ORDER BY start_line, depth, id",
-            )?
-            .query_map([file_id], |r| {
-                Ok(OutlineSymbol {
-                    kind: r.get(0)?,
-                    name: r.get(1)?,
-                    qualified_name: r.get(2)?,
-                    signature: r.get(3)?,
-                    start_line: r.get(4)?,
-                    end_line: r.get(5)?,
-                    depth: r.get(6)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()
-        })
+        .read(move |conn| symbols::outline(conn, file_id))
         .await?;
 
     let text = if symbols.is_empty() {
@@ -826,32 +977,38 @@ async fn get_file_outline(
             .iter()
             .map(|s| {
                 let indent = "  ".repeat(usize::try_from(s.depth).unwrap_or(0));
-                let signature = s
-                    .signature
-                    .as_deref()
-                    .map(|sig| format!(" — {sig}"))
-                    .unwrap_or_default();
                 format!(
-                    "{indent}L{}-{} {} {}{signature}",
-                    s.start_line, s.end_line, s.kind, s.name
+                    "{indent}L{}-{} {} {}{}",
+                    s.start_line,
+                    s.end_line,
+                    s.kind,
+                    s.name,
+                    signature_suffix(s)
                 )
             })
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let structured: Vec<Value> = symbols
-        .iter()
-        .map(|s| {
-            json!({
-                "kind": s.kind, "name": s.name, "qualifiedName": s.qualified_name, "signature": s.signature,
-                "startLine": s.start_line, "endLine": s.end_line, "depth": s.depth,
-            })
-        })
-        .collect();
-    Ok(ToolOutput {
+    ToolOutput::new(
         text,
-        structured: json!({ "repository": repo.full_name, "path": path, "symbols": structured }),
-    })
+        json!({ "repository": repo.full_name, "path": path, "symbols": symbols }),
+    )
+}
+
+fn signature_suffix(symbol: &SymbolRow) -> String {
+    symbol
+        .signature
+        .as_deref()
+        .map(|sig| format!(" — {sig}"))
+        .unwrap_or_default()
+}
+
+#[derive(Serialize)]
+struct FoundSymbol<'a> {
+    #[serde(flatten)]
+    symbol: &'a SymbolRow,
+    repository: &'a str,
+    path: &'a str,
 }
 
 async fn find_symbol(
@@ -874,67 +1031,47 @@ async fn find_symbol(
         ));
     }
 
-    let lookup_name = name.clone();
-    let found = if repo_ids.is_empty() {
-        Vec::new()
-    } else {
-        state
-            .db
-            .read(move |conn| {
-                let rows = symbols::lookup(conn, &repo_ids, &lookup_name, kind.as_deref(), limit)?;
-                let mut path_of = conn.prepare("SELECT path FROM files WHERE id = ?1")?;
-                let mut paths: HashMap<i64, String> = HashMap::new();
-                let mut found = Vec::with_capacity(rows.len());
-                for row in rows {
-                    let path = match paths.get(&row.file_id) {
-                        Some(path) => path.clone(),
-                        None => {
-                            let path: String = path_of.query_row([row.file_id], |r| r.get(0))?;
-                            paths.insert(row.file_id, path.clone());
-                            path
-                        }
-                    };
-                    found.push((row, path));
-                }
-                Ok::<_, rusqlite::Error>(found)
-            })
-            .await?
+    let filter = Filter {
+        repo_ids,
+        ..Filter::default()
     };
+    let lookup_name = name.clone();
+    let rows = state
+        .db
+        .read(move |conn| symbols::lookup(conn, &filter, &lookup_name, kind.as_deref(), limit))
+        .await?;
 
-    let names: HashMap<i64, &str> = repos
-        .iter()
-        .map(|repo| (repo.id, repo.full_name.as_str()))
-        .collect();
-    let mut text = Vec::with_capacity(found.len());
-    let mut structured = Vec::with_capacity(found.len());
-    for (n, (row, path)) in found.iter().enumerate() {
-        let repository = names.get(&row.repo_id).copied().unwrap_or_default();
+    let mut text = Vec::with_capacity(rows.len());
+    let mut found = Vec::with_capacity(rows.len());
+    for (n, row) in rows.iter().enumerate() {
+        let repository = repos
+            .iter()
+            .find(|repo| repo.id == row.repo_id)
+            .map_or("", |repo| repo.full_name.as_str());
         text.push(format!(
-            "{}. {} {} — {repository} {path}:{}-{}",
+            "{}. {} {} — {repository} {}:{}-{}",
             n + 1,
             row.kind,
             row.qualified_name,
+            row.path,
             row.start_line,
             row.end_line
         ));
         if let Some(signature) = &row.signature {
             text.push(format!("   {signature}"));
         }
-        structured.push(json!({
-            "kind": row.kind, "name": row.name, "qualifiedName": row.qualified_name, "signature": row.signature,
-            "startLine": row.start_line, "endLine": row.end_line, "depth": row.depth,
-            "repository": repository, "path": path,
-        }));
+        found.push(FoundSymbol {
+            symbol: row,
+            repository,
+            path: &row.path,
+        });
     }
     let text = if text.is_empty() {
         format!("No symbol named \"{name}\" found. Try search_code with a description or related words.")
     } else {
         text.join("\n")
     };
-    Ok(ToolOutput {
-        text,
-        structured: json!({ "symbols": structured }),
-    })
+    ToolOutput::new(text, json!({ "symbols": found }))
 }
 
 fn normalize_path(path: &str) -> &str {
@@ -978,7 +1115,7 @@ fn fenced(language: Option<&str>, code: &str) -> String {
 
 /// `YYYY-MM-DD` (UTC) of a unix timestamp.
 fn date(unix: i64) -> String {
-    let days = unix.div_euclid(86_400);
+    let days = unix.div_euclid(SECS_PER_DAY);
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
