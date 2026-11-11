@@ -7,12 +7,13 @@
 
 use std::cmp::Reverse;
 
-use super::{adapter, markdown};
+use super::adapter::{self, AdapterChunk};
+use super::markdown;
 
-pub const CHUNKER_VERSION: i64 = 1;
+pub const CHUNKER_VERSION: i64 = 2;
 /// Chunk budget in non-whitespace characters, measured over whole lines.
 pub const MAX_CHUNK_CHARS: u32 = 2000;
-/// Sibling chunks below this many non-whitespace characters merge with the next sibling.
+/// Sibling chunks that are both below this many non-whitespace characters merge.
 pub const MIN_CHUNK_CHARS: u32 = 300;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,10 +51,26 @@ pub(super) struct LineRange {
 pub(super) struct RawChunk {
     pub(super) kind: &'static str,
     pub(super) name: Option<String>,
+    /// Segments placed before `name` in the symbol path (Go receiver, C++ scope).
+    pub(super) owner: Vec<String>,
+    /// Package or namespace prefixed to qualified names.
+    pub(super) namespace: Option<String>,
     pub(super) range: LineRange,
     /// Start lines of direct body members, used as AST-aligned split points.
     pub(super) boundaries: Vec<u32>,
     pub(super) signature: Option<String>,
+    /// Contributes a symbol only; never becomes a chunk.
+    pub(super) symbol_only: bool,
+}
+
+/// A raw chunk with its place in the declaration tree.
+#[derive(Debug, Clone)]
+struct Logical {
+    chunk: RawChunk,
+    /// Index of the direct parent in the same list.
+    parent: Option<usize>,
+    path: Vec<String>,
+    mergeable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -79,78 +96,29 @@ pub fn chunk_file(path: &str, language: Option<&str>, content: &str) -> (Vec<Chu
         return (Vec::new(), Vec::new());
     }
     let source = SourceFile::new(content);
+    let logical = logical_chunks(raw_chunks(path, language, content, &source));
+    let symbols = collect_symbols(&logical);
+    let absorbed = absorbed_chunks(&source, &logical);
+    let logical = merge_small_siblings(&source, logical, &absorbed);
 
-    let raw_chunks = match language {
-        Some("markdown") => markdown::markdown_chunks(&source),
-        Some(language) => adapter::parse(language, path, content)
-            .map(|chunks| {
-                let line_count = source.line_count();
-                let raw_chunks = chunks
-                    .into_iter()
-                    .map(|chunk| {
-                        let start = chunk.start_line.clamp(1, line_count);
-                        RawChunk {
-                            kind: adapter_chunk_kind(&chunk.kind),
-                            name: chunk.name,
-                            range: line_range(start, chunk.end_line.min(line_count).max(start)),
-                            boundaries: chunk.child_boundaries,
-                            signature: chunk.signature,
-                        }
-                    })
-                    .collect();
-                merge_sibling_chunks(&source, raw_chunks)
-            })
-            .unwrap_or_default(),
-        None => Vec::new(),
-    };
-    let mut raw_chunks = if raw_chunks.is_empty() {
-        fallback_chunks(&source, "fallback")
-    } else {
-        raw_chunks
-    };
-
-    raw_chunks.sort_by_key(|chunk| {
-        (
-            chunk.range.start,
-            Reverse(chunk.range.end),
-            !is_parent_kind(chunk.kind),
-            chunk.kind,
-        )
-    });
-    let parents = parent_indices(&raw_chunks);
-    let mut symbol_paths: Vec<Vec<String>> = Vec::with_capacity(raw_chunks.len());
-    for (index, chunk) in raw_chunks.iter().enumerate() {
-        let mut path = parents[index]
-            .map(|parent| symbol_paths[parent].clone())
-            .unwrap_or_default();
-        if !matches!(chunk.kind, "imports" | "package" | "fallback") {
-            if let Some(name) = &chunk.name {
-                path.push(name.clone());
-            }
-        }
-        symbol_paths.push(path);
-    }
-
-    let symbols = collect_symbols(&source, &raw_chunks, &symbol_paths);
-    let absorbed = absorbed_chunks(&source, &raw_chunks, &parents);
-    let (logical, logical_parents, logical_paths) =
-        merge_small_siblings(&source, raw_chunks, &parents, symbol_paths, &absorbed);
-
-    let chunks = split_chunks(&source, &logical, &logical_parents)
+    let mut symbol_starts: Vec<(u32, &str)> = symbols
+        .iter()
+        .map(|symbol| (symbol.start_line, symbol.name.as_str()))
+        .collect();
+    symbol_starts.sort_by_key(|(line, _)| *line);
+    let chunks = split_chunks(&source, &logical)
         .into_iter()
         .map(|part| {
-            let names = symbols
-                .iter()
-                .filter(|symbol| {
-                    symbol.start_line >= part.range.start && symbol.start_line <= part.range.end
-                })
-                .map(|symbol| symbol.name.clone())
-                .collect();
+            let from = symbol_starts.partition_point(|(line, _)| *line < part.range.start);
+            let to = symbol_starts.partition_point(|(line, _)| *line <= part.range.end);
             let (start_byte, end_byte) = source.byte_range(part.range);
             Chunk {
                 kind: part.kind,
-                symbol_path: logical_paths[part.logical_index].clone(),
-                names,
+                symbol_path: logical[part.logical_index].path.clone(),
+                names: symbol_starts[from..to.max(from)]
+                    .iter()
+                    .map(|(_, name)| (*name).to_owned())
+                    .collect(),
                 start_line: part.range.start,
                 end_line: part.range.end,
                 start_byte,
@@ -161,26 +129,118 @@ pub fn chunk_file(path: &str, language: Option<&str>, content: &str) -> (Vec<Chu
     (chunks, symbols)
 }
 
-/// Direct parent of each chunk: the smallest enclosing earlier chunk of a parent kind.
-fn parent_indices(chunks: &[RawChunk]) -> Vec<Option<usize>> {
+/// Declaration, statement and symbol-only chunks from the adapter or the Markdown scanner, or
+/// line windows when neither yields a chunk.
+fn raw_chunks(
+    path: &str,
+    language: Option<&str>,
+    content: &str,
+    source: &SourceFile,
+) -> Vec<RawChunk> {
+    let chunks = match language {
+        Some("markdown") => markdown::markdown_chunks(source),
+        Some(language) => adapter::parse(language, path, content)
+            .map(|chunks| adapter_raw_chunks(source, chunks))
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    if chunks.iter().all(|chunk| chunk.symbol_only) {
+        fallback_chunks(source)
+    } else {
+        chunks
+    }
+}
+
+fn adapter_raw_chunks(source: &SourceFile, chunks: Vec<AdapterChunk>) -> Vec<RawChunk> {
+    let line_count = source.line_count();
+    let (symbol_only, chunks): (Vec<RawChunk>, Vec<RawChunk>) = chunks
+        .into_iter()
+        .map(|chunk| {
+            let start = chunk.start_line.clamp(1, line_count);
+            RawChunk {
+                kind: chunk.kind,
+                name: chunk.name,
+                owner: chunk.owner,
+                namespace: chunk.namespace,
+                range: line_range(start, chunk.end_line.min(line_count).max(start)),
+                boundaries: chunk.child_boundaries,
+                signature: chunk.signature,
+                symbol_only: chunk.symbol_only,
+            }
+        })
+        .partition(|chunk| chunk.symbol_only);
+    let mut chunks = merge_sibling_chunks(source, chunks);
+    chunks.extend(symbol_only);
     chunks
-        .iter()
-        .enumerate()
-        .map(|(index, chunk)| {
-            chunks
-                .iter()
-                .enumerate()
-                .filter(|(candidate_index, candidate)| {
-                    *candidate_index < index
-                        && is_parent_kind(candidate.kind)
-                        && (candidate.range != chunk.range || !is_parent_kind(chunk.kind))
-                        && candidate.range.start <= chunk.range.start
-                        && candidate.range.end >= chunk.range.end
-                })
-                .min_by_key(|(_, candidate)| candidate.range.end - candidate.range.start)
-                .map(|(index, _)| index)
+}
+
+/// Sorts the raw chunks into document order and links each to its parent and symbol path.
+fn logical_chunks(mut chunks: Vec<RawChunk>) -> Vec<Logical> {
+    chunks.sort_by_key(|chunk| {
+        (
+            chunk.range.start,
+            Reverse(chunk.range.end),
+            !is_parent_kind(chunk.kind),
+            chunk.kind,
+        )
+    });
+    let parents = parent_indices(&chunks);
+    let paths = symbol_paths(&chunks, &parents);
+    chunks
+        .into_iter()
+        .zip(parents)
+        .zip(paths)
+        .map(|((chunk, parent), path)| Logical {
+            chunk,
+            parent,
+            path,
+            mergeable: false,
         })
         .collect()
+}
+
+/// Direct parent of each chunk: the smallest enclosing earlier chunk of a parent kind. `chunks`
+/// is sorted by start, then by end descending, so enclosing chunks form a stack.
+fn parent_indices(chunks: &[RawChunk]) -> Vec<Option<usize>> {
+    let mut parents = Vec::with_capacity(chunks.len());
+    let mut open: Vec<usize> = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        while open
+            .last()
+            .is_some_and(|&top| chunks[top].range.end < chunk.range.start)
+        {
+            open.pop();
+        }
+        let parent = open.iter().rev().copied().find(|&candidate| {
+            let candidate = &chunks[candidate];
+            candidate.range.end >= chunk.range.end
+                && (candidate.range != chunk.range || !is_parent_kind(chunk.kind))
+        });
+        parents.push(parent);
+        if is_parent_kind(chunk.kind) && !chunk.symbol_only {
+            open.push(index);
+        }
+    }
+    parents
+}
+
+/// Parent path plus the chunk's owner segments and name; imports, packages and unnamed chunks
+/// (statements, Markdown fences, lists, tables, line windows) add nothing.
+fn symbol_paths(chunks: &[RawChunk], parents: &[Option<usize>]) -> Vec<Vec<String>> {
+    let mut paths: Vec<Vec<String>> = Vec::with_capacity(chunks.len());
+    for (chunk, parent) in chunks.iter().zip(parents) {
+        let mut path = parent
+            .map(|parent| paths[parent].clone())
+            .unwrap_or_default();
+        if let Some(name) = &chunk.name {
+            if !matches!(chunk.kind, "imports" | "package") {
+                path.extend(chunk.owner.iter().cloned());
+                path.push(name.clone());
+            }
+        }
+        paths.push(path);
+    }
+    paths
 }
 
 fn is_symbol_kind(kind: &str) -> bool {
@@ -202,6 +262,7 @@ fn is_symbol_kind(kind: &str) -> bool {
             | "object"
             | "companion_object"
             | "property"
+            | "constant"
             | "module"
             | "extension"
             | "heading_1"
@@ -214,165 +275,107 @@ fn is_symbol_kind(kind: &str) -> bool {
 }
 
 /// Symbols come from the raw declaration chunks, independent of how chunks are merged or split.
-fn collect_symbols(
-    source: &SourceFile,
-    chunks: &[RawChunk],
-    symbol_paths: &[Vec<String>],
-) -> Vec<Symbol> {
-    let package = chunks
+fn collect_symbols(logical: &[Logical]) -> Vec<Symbol> {
+    logical
         .iter()
-        .filter(|chunk| chunk.kind == "package")
-        .find_map(|chunk| package_name(source, chunk.range));
-    chunks
-        .iter()
-        .zip(symbol_paths)
-        .filter(|(chunk, path)| is_symbol_kind(chunk.kind) && !path.is_empty())
-        .filter_map(|(chunk, path)| {
-            let name = path.last()?.clone();
-            let joined = path.join(".");
+        .filter(|item| is_symbol_kind(item.chunk.kind) && item.chunk.name.is_some())
+        .filter_map(|item| {
+            let name = item.path.last()?.clone();
+            let joined = item.path.join(".");
             Some(Symbol {
-                kind: chunk.kind,
+                kind: item.chunk.kind,
                 name,
-                qualified_name: match &package {
-                    Some(package) => format!("{package}.{joined}"),
+                qualified_name: match &item.chunk.namespace {
+                    Some(namespace) => format!("{namespace}.{joined}"),
                     None => joined,
                 },
-                signature: chunk.signature.clone(),
-                start_line: chunk.range.start,
-                end_line: chunk.range.end,
-                depth: path.len() as u32 - 1,
+                signature: item.chunk.signature.clone(),
+                start_line: item.chunk.range.start,
+                end_line: item.chunk.range.end,
+                depth: (item.path.len() - 1).saturating_sub(item.chunk.owner.len()) as u32,
             })
         })
         .collect()
 }
 
-fn package_name(source: &SourceFile, range: LineRange) -> Option<String> {
-    (range.start..=range.end).find_map(|line| {
-        source
-            .line(line)
-            .trim()
-            .strip_prefix("package ")
-            .map(|value| value.trim().trim_end_matches(';').to_owned())
-            .filter(|value| !value.is_empty())
-    })
-}
-
 /// Containers that fit the budget absorb all their descendants, so member content is not
-/// emitted twice.
-fn absorbed_chunks(
-    source: &SourceFile,
-    chunks: &[RawChunk],
-    parents: &[Option<usize>],
-) -> Vec<bool> {
-    let mut absorbed = vec![false; chunks.len()];
-    for (index, chunk) in chunks.iter().enumerate() {
+/// emitted twice. Descendants follow their container contiguously in document order.
+fn absorbed_chunks(source: &SourceFile, logical: &[Logical]) -> Vec<bool> {
+    let mut absorbed = vec![false; logical.len()];
+    for (index, item) in logical.iter().enumerate() {
         if absorbed[index]
-            || !is_parent_kind(chunk.kind)
-            || source.measure(chunk.range) > MAX_CHUNK_CHARS
+            || !is_parent_kind(item.chunk.kind)
+            || source.measure(item.chunk.range) > MAX_CHUNK_CHARS
         {
             continue;
         }
-        for descendant in index + 1..chunks.len() {
-            let mut ancestor = parents[descendant];
+        for descendant in index + 1..logical.len() {
+            if logical[descendant].chunk.range.start > item.chunk.range.end {
+                break;
+            }
+            let mut ancestor = logical[descendant].parent;
             while let Some(current) = ancestor {
                 if current == index {
                     absorbed[descendant] = true;
                     break;
                 }
-                ancestor = parents[current];
+                ancestor = logical[current].parent;
             }
         }
     }
     absorbed
 }
 
-/// Drops absorbed chunks and merges each small childless sibling forward into one `block`.
-/// Returns the logical chunks with their parents and symbol paths.
+/// Drops absorbed and symbol-only chunks and merges runs of small childless siblings into one
+/// `block`; a sibling at or above `MIN_CHUNK_CHARS` keeps its own chunk, kind and name.
 fn merge_small_siblings(
     source: &SourceFile,
-    chunks: Vec<RawChunk>,
-    parents: &[Option<usize>],
-    symbol_paths: Vec<Vec<String>>,
+    logical: Vec<Logical>,
     absorbed: &[bool],
-) -> (Vec<RawChunk>, Vec<Option<usize>>, Vec<Vec<String>>) {
-    let mut has_children = vec![false; chunks.len()];
-    for (index, parent) in parents.iter().enumerate() {
-        if let Some(parent) = parent {
-            if !absorbed[index] {
-                has_children[*parent] = true;
+) -> Vec<Logical> {
+    let mut has_children = vec![false; logical.len()];
+    for (index, item) in logical.iter().enumerate() {
+        if let Some(parent) = item.parent {
+            if !absorbed[index] && !item.chunk.symbol_only {
+                has_children[parent] = true;
             }
         }
     }
-    let mergeable =
-        |index: usize, kind: &str| !has_children[index] && !matches!(kind, "imports" | "package");
 
-    let mut new_index = vec![None; chunks.len()];
-    let mut merged: Vec<RawChunk> = Vec::with_capacity(chunks.len());
-    let mut merged_parents: Vec<Option<usize>> = Vec::with_capacity(chunks.len());
-    let mut merged_paths: Vec<Vec<String>> = Vec::with_capacity(chunks.len());
-    let mut merged_mergeable: Vec<bool> = Vec::with_capacity(chunks.len());
-    for ((index, chunk), path) in chunks.into_iter().enumerate().zip(symbol_paths) {
-        if absorbed[index] {
+    let mut new_index: Vec<Option<usize>> = vec![None; logical.len()];
+    let mut merged: Vec<Logical> = Vec::with_capacity(logical.len());
+    for (index, mut item) in logical.into_iter().enumerate() {
+        if absorbed[index] || item.chunk.symbol_only {
             continue;
         }
-        let parent = parents[index].and_then(|parent| new_index[parent]);
-        let chunk_mergeable = mergeable(index, chunk.kind);
-        if let Some(last) = merged.len().checked_sub(1) {
-            let previous = &merged[last];
-            let end = previous.range.end.max(chunk.range.end);
-            if chunk_mergeable
-                && merged_mergeable[last]
-                && merged_parents[last] == parent
-                && source.measure(previous.range) < MIN_CHUNK_CHARS
-                && source.measure(line_range(previous.range.start, end)) <= MAX_CHUNK_CHARS
+        let parent = item.parent.and_then(|parent| new_index[parent]);
+        let mergeable = !has_children[index] && !matches!(item.chunk.kind, "imports" | "package");
+        let parent_path = parent.map(|parent| merged[parent].path.clone());
+        if let Some(last) = merged.last_mut() {
+            let end = last.chunk.range.end.max(item.chunk.range.end);
+            if mergeable
+                && last.mergeable
+                && last.parent == parent
+                && source.measure(last.chunk.range) < MIN_CHUNK_CHARS
+                && source.measure(item.chunk.range) < MIN_CHUNK_CHARS
+                && source.measure(line_range(last.chunk.range.start, end)) <= MAX_CHUNK_CHARS
             {
-                let previous = &mut merged[last];
-                previous.range.end = end;
-                previous.kind = "block";
-                previous.name = None;
-                previous.signature = None;
-                previous.boundaries.push(chunk.range.start);
-                merged_paths[last] = parent
-                    .map(|parent| merged_paths[parent].clone())
-                    .unwrap_or_default();
-                new_index[index] = Some(last);
+                last.chunk.range.end = end;
+                last.chunk.kind = "block";
+                last.chunk.name = None;
+                last.chunk.signature = None;
+                last.chunk.boundaries.push(item.chunk.range.start);
+                last.path = parent_path.unwrap_or_default();
+                new_index[index] = Some(merged.len() - 1);
                 continue;
             }
         }
+        item.parent = parent;
+        item.mergeable = mergeable;
         new_index[index] = Some(merged.len());
-        merged.push(chunk);
-        merged_parents.push(parent);
-        merged_paths.push(path);
-        merged_mergeable.push(chunk_mergeable);
+        merged.push(item);
     }
-    (merged, merged_parents, merged_paths)
-}
-
-fn adapter_chunk_kind(kind: &str) -> &'static str {
-    match kind {
-        "imports" => "imports",
-        "package" => "package",
-        "statement" => "statement",
-        "function" => "function",
-        "method" => "method",
-        "constructor" => "constructor",
-        "class" => "class",
-        "interface" => "interface",
-        "struct" => "struct",
-        "enum" => "enum",
-        "union" => "union",
-        "trait" => "trait",
-        "impl" => "impl",
-        "record" => "record",
-        "object" => "object",
-        "companion_object" => "companion_object",
-        "macro" => "macro",
-        "module" => "module",
-        "type" => "type",
-        "property" => "property",
-        "extension" => "extension",
-        _ => "block",
-    }
+    merged
 }
 
 impl<'a> SourceFile<'a> {
@@ -518,16 +521,14 @@ fn flush_sibling_run(
     } else {
         run[1..].iter().map(|chunk| chunk.range.start).collect()
     };
+    let kind = if run_imports == Some(true) {
+        "imports"
+    } else {
+        "block"
+    };
     merged.push(RawChunk {
-        kind: if run_imports == Some(true) {
-            "imports"
-        } else {
-            "block"
-        },
-        name: None,
-        range: line_range(first.range.start, end),
         boundaries,
-        signature: None,
+        ..raw(kind, None, line_range(first.range.start, end))
     });
     run.clear();
 }
@@ -544,31 +545,24 @@ fn is_comment_only(source: &SourceFile, range: LineRange) -> bool {
     })
 }
 
-/// Splits every logical chunk into parts under the character budget. `parents`
-/// holds each chunk's direct parent index; oversized containers emit their header,
-/// gaps between members and tail, so member content is never duplicated.
-fn split_chunks(
-    source: &SourceFile,
-    chunks: &[RawChunk],
-    parents: &[Option<usize>],
-) -> Vec<ChunkPart> {
-    let budget = MAX_CHUNK_CHARS;
-    let mut parts = Vec::with_capacity(chunks.len());
-    for (logical_index, chunk) in chunks.iter().enumerate() {
-        let ranges = if source.measure(chunk.range) <= budget {
+/// Splits every logical chunk into parts under the character budget. Oversized containers
+/// emit their header, gaps between members and tail, so member content is never duplicated.
+fn split_chunks(source: &SourceFile, logical: &[Logical]) -> Vec<ChunkPart> {
+    let mut members: Vec<Vec<LineRange>> = vec![Vec::new(); logical.len()];
+    for item in logical {
+        if let Some(parent) = item.parent {
+            members[parent].push(item.chunk.range);
+        }
+    }
+    let mut parts = Vec::with_capacity(logical.len());
+    for (logical_index, item) in logical.iter().enumerate() {
+        let chunk = &item.chunk;
+        let ranges = if source.measure(chunk.range) <= MAX_CHUNK_CHARS {
             vec![chunk.range]
+        } else if is_parent_kind(chunk.kind) && !members[logical_index].is_empty() {
+            container_segments(source, chunk.range, &members[logical_index])
         } else {
-            let members = parents
-                .iter()
-                .enumerate()
-                .filter(|(_, parent)| **parent == Some(logical_index))
-                .map(|(member, _)| chunks[member].range)
-                .collect::<Vec<_>>();
-            if is_parent_kind(chunk.kind) && !members.is_empty() {
-                container_segments(source, chunk.range, &members, budget)
-            } else {
-                leaf_segments(source, chunk.range, &chunk.boundaries, budget)
-            }
+            leaf_segments(source, chunk.range, &chunk.boundaries)
         };
         for (part_index, range) in ranges.into_iter().enumerate() {
             parts.push(ChunkPart {
@@ -592,7 +586,6 @@ fn container_segments(
     source: &SourceFile,
     range: LineRange,
     members: &[LineRange],
-    budget: u32,
 ) -> Vec<LineRange> {
     let header_end = members[0].start.saturating_sub(1).max(range.start);
     let mut segments = vec![line_range(range.start, header_end)];
@@ -611,10 +604,10 @@ fn container_segments(
         if index > 0 && (source.is_blank(segment) || is_closing_only(source, segment)) {
             continue;
         }
-        if source.measure(segment) <= budget {
+        if source.measure(segment) <= MAX_CHUNK_CHARS {
             ranges.push(segment);
         } else {
-            ranges.extend(window_split(source, segment.start, segment.end, budget));
+            ranges.extend(window_split(source, segment.start, segment.end));
         }
     }
     ranges
@@ -631,12 +624,7 @@ fn is_closing_only(source: &SourceFile, range: LineRange) -> bool {
 /// Segments `[start, b1-1], [b1, b2-1], …, [bn, end]` from member boundaries,
 /// greedily packed while the pack fits the budget; a single over-budget segment
 /// is windowed.
-fn leaf_segments(
-    source: &SourceFile,
-    range: LineRange,
-    boundaries: &[u32],
-    budget: u32,
-) -> Vec<LineRange> {
+fn leaf_segments(source: &SourceFile, range: LineRange, boundaries: &[u32]) -> Vec<LineRange> {
     let mut starts = boundaries
         .iter()
         .copied()
@@ -656,16 +644,16 @@ fn leaf_segments(
         segment_start = segment_end + 1;
         if let Some(current) = pack.take() {
             let extended = line_range(current.start, segment.end);
-            if source.measure(extended) <= budget {
+            if source.measure(extended) <= MAX_CHUNK_CHARS {
                 pack = Some(extended);
                 continue;
             }
             ranges.push(current);
         }
-        if source.measure(segment) <= budget {
+        if source.measure(segment) <= MAX_CHUNK_CHARS {
             pack = Some(segment);
         } else {
-            ranges.extend(window_split(source, segment.start, segment.end, budget));
+            ranges.extend(window_split(source, segment.start, segment.end));
         }
     }
     ranges.extend(pack);
@@ -675,12 +663,14 @@ fn leaf_segments(
 /// Line windows over `start..=end`, each extended while it fits the budget and then
 /// backed off to the last blank or lone `}` line. Every window holds at least one
 /// line, so a single over-budget line still terminates.
-fn window_split(source: &SourceFile, start: u32, end: u32, budget: u32) -> Vec<LineRange> {
+fn window_split(source: &SourceFile, start: u32, end: u32) -> Vec<LineRange> {
     let mut windows = Vec::new();
     let mut cursor = start;
     while cursor <= end {
         let mut window_end = cursor;
-        while window_end < end && source.measure(line_range(cursor, window_end + 1)) <= budget {
+        while window_end < end
+            && source.measure(line_range(cursor, window_end + 1)) <= MAX_CHUNK_CHARS
+        {
             window_end += 1;
         }
         if window_end < end && window_end > cursor {
@@ -703,10 +693,10 @@ fn best_split_end(source: &SourceFile, start: u32, target_end: u32) -> u32 {
     target_end
 }
 
-fn fallback_chunks(source: &SourceFile, kind: &'static str) -> Vec<RawChunk> {
-    window_split(source, 1, source.line_count(), MAX_CHUNK_CHARS)
+fn fallback_chunks(source: &SourceFile) -> Vec<RawChunk> {
+    window_split(source, 1, source.line_count())
         .into_iter()
-        .map(|range| raw(kind, format!("{kind}-{}", range.start), range))
+        .map(|range| raw("fallback", None, range))
         .collect()
 }
 
@@ -733,21 +723,16 @@ fn is_parent_kind(kind: &str) -> bool {
     )
 }
 
-pub(super) fn dedupe_chunks(mut chunks: Vec<RawChunk>) -> Vec<RawChunk> {
-    chunks.sort_by_key(|chunk| (chunk.range.start, chunk.range.end, chunk.kind));
-    chunks.dedup_by(|left, right| {
-        left.kind == right.kind && left.range == right.range && left.name == right.name
-    });
-    chunks
-}
-
-pub(super) fn raw(kind: &'static str, name: String, range: LineRange) -> RawChunk {
+pub(super) fn raw(kind: &'static str, name: Option<String>, range: LineRange) -> RawChunk {
     RawChunk {
         kind,
-        name: Some(name),
+        name,
+        owner: Vec::new(),
+        namespace: None,
         range,
         boundaries: Vec::new(),
         signature: None,
+        symbol_only: false,
     }
 }
 

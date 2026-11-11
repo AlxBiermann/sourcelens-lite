@@ -9,37 +9,29 @@ use std::time::{Duration, Instant};
 
 use tree_sitter::{Language, Node, ParseOptions, Parser, Tree};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ParserBudget {
-    pub max_source_bytes: usize,
-    pub max_ast_depth: usize,
-    pub max_nodes: usize,
-    pub max_parse_time: Duration,
-    pub max_estimated_memory_bytes: usize,
-}
-
-impl Default for ParserBudget {
-    fn default() -> Self {
-        Self {
-            max_source_bytes: 2 * 1024 * 1024,
-            max_ast_depth: 384,
-            max_nodes: 250_000,
-            max_parse_time: Duration::from_secs(2),
-            max_estimated_memory_bytes: 64 * 1024 * 1024,
-        }
-    }
-}
+const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_AST_DEPTH: usize = 384;
+const MAX_NODES: usize = 250_000;
+const MAX_PARSE_TIME: Duration = Duration::from_secs(2);
+const MAX_ESTIMATED_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdapterChunk {
-    pub kind: String,
-    pub name: Option<String>,
-    pub start_line: u32,
-    pub end_line: u32,
+pub(super) struct AdapterChunk {
+    pub(super) kind: &'static str,
+    pub(super) name: Option<String>,
+    /// Segments placed before the name in the symbol path: the Go receiver type, the C++ scope of
+    /// an out-of-line definition (`Widget::draw`).
+    pub(super) owner: Vec<String>,
+    /// Package or namespace (dot-separated) that prefixes qualified names.
+    pub(super) namespace: Option<String>,
+    pub(super) start_line: u32,
+    pub(super) end_line: u32,
     /// Start lines of the direct body members of this declaration (1-based), used as split points.
-    pub child_boundaries: Vec<u32>,
+    pub(super) child_boundaries: Vec<u32>,
     /// Declaration text up to its body, whitespace collapsed, at most 300 chars.
-    pub signature: Option<String>,
+    pub(super) signature: Option<String>,
+    /// Declares a symbol (constant, field) without forming a chunk of its own.
+    pub(super) symbol_only: bool,
 }
 
 const MAX_SIGNATURE_CHARS: usize = 300;
@@ -47,12 +39,21 @@ const MAX_SIGNATURE_CHARS: usize = 300;
 /// Parses `source` with the grammar of `language` and returns its declaration chunks.
 /// `None` when there is no grammar, a budget is exceeded, the tree is mostly errors, or
 /// no chunk was produced; callers then fall back to line windows.
-pub fn parse(language: &str, path: &str, source: &str) -> Option<Vec<AdapterChunk>> {
-    let (language, grammar) = grammar(language, path)?;
-    parse_tree_sitter(language, path, source, ParserBudget::default(), &grammar)
+pub(super) fn parse(language: &str, path: &str, source: &str) -> Option<Vec<AdapterChunk>> {
+    let chunks = parse_as(language, path, source);
+    // `.h` is labelled C, but many such headers are C++; the C grammar rejects those.
+    if chunks.is_none() && language == "c" && path.to_ascii_lowercase().ends_with(".h") {
+        return parse_as("cpp", path, source);
+    }
+    chunks
 }
 
-/// Canonical grammar name and tree-sitter language for a language label.
+fn parse_as(language: &str, path: &str, source: &str) -> Option<Vec<AdapterChunk>> {
+    let (key, grammar) = grammar(language, path)?;
+    parse_tree_sitter(language, key, source, &grammar)
+}
+
+/// Parser-cache key and tree-sitter grammar for a language label.
 fn grammar(name: &str, path: &str) -> Option<(&'static str, Language)> {
     match name {
         "go" => Some(("go", tree_sitter_go::LANGUAGE.into())),
@@ -67,13 +68,12 @@ fn grammar(name: &str, path: &str) -> Option<(&'static str, Language)> {
         "javascript" => Some(("javascript", tree_sitter_javascript::LANGUAGE.into())),
         "java" => Some(("java", tree_sitter_java::LANGUAGE.into())),
         "kotlin" => Some(("kotlin", tree_sitter_kotlin_ng::LANGUAGE.into())),
+        "typescript" if path.ends_with(".tsx") => {
+            Some(("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()))
+        }
         "typescript" => Some((
             "typescript",
-            if path.ends_with(".tsx") {
-                tree_sitter_typescript::LANGUAGE_TSX.into()
-            } else {
-                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
-            },
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         )),
         _ => None,
     }
@@ -140,17 +140,17 @@ const BODY_KINDS: &[&str] = &[
 
 const FUNCTION_VALUE_KINDS: &[&str] = &["arrow_function", "function_expression", "function"];
 
+/// C/C++ type specifiers that declare a type when they have a body.
+const SPECIFIER_KINDS: &[&str] = &[
+    "struct_specifier",
+    "enum_specifier",
+    "union_specifier",
+    "class_specifier",
+];
+
 thread_local! {
     /// One parser per grammar and thread; reset before every parse so no document state survives.
     static PARSERS: RefCell<HashMap<&'static str, Parser>> = RefCell::new(HashMap::new());
-}
-
-fn parser_key(language: &'static str, path: &str) -> &'static str {
-    match language {
-        "typescript" if path.ends_with(".tsx") => "typescript:tsx",
-        "typescript" => "typescript:ts",
-        other => other,
-    }
 }
 
 /// `None` when the grammar cannot be loaded or parsing hit the deadline.
@@ -189,19 +189,18 @@ fn parse_with_cached_parser(
 }
 
 fn parse_tree_sitter(
-    language: &'static str,
-    path: &str,
+    language: &str,
+    key: &'static str,
     source: &str,
-    budget: ParserBudget,
     grammar: &Language,
 ) -> Option<Vec<AdapterChunk>> {
     let started = Instant::now();
     let source_bytes = source.len();
-    if source_bytes > budget.max_source_bytes {
+    if source_bytes > MAX_SOURCE_BYTES {
         return None;
     }
-    let deadline = started + budget.max_parse_time;
-    let tree = parse_with_cached_parser(parser_key(language, path), grammar, source, deadline)?;
+    let deadline = started + MAX_PARSE_TIME;
+    let tree = parse_with_cached_parser(key, grammar, source, deadline)?;
 
     let root = tree.root_node();
     let mut walk = Walk {
@@ -211,6 +210,7 @@ fn parse_tree_sitter(
         absorbed: HashSet::new(),
         handled: HashSet::new(),
         root_candidates: Vec::new(),
+        file_namespace: None,
     };
     let mut node_count = 0usize;
     let mut error_bytes = 0usize;
@@ -218,10 +218,10 @@ fn parse_tree_sitter(
     let mut stack = vec![(root, 0usize, false, false)];
     while let Some((node, depth, inside_function, inside_statement)) = stack.pop() {
         node_count += 1;
-        if node_count > budget.max_nodes
-            || depth > budget.max_ast_depth
-            || estimate_memory(source_bytes, node_count) > budget.max_estimated_memory_bytes
-            || started.elapsed() > budget.max_parse_time
+        if node_count > MAX_NODES
+            || depth > MAX_AST_DEPTH
+            || estimate_memory(source_bytes, node_count) > MAX_ESTIMATED_MEMORY_BYTES
+            || started.elapsed() > MAX_PARSE_TIME
         {
             return None;
         }
@@ -272,7 +272,7 @@ fn parse_tree_sitter(
 
 /// Chunk-candidate state of one tree walk.
 struct Walk<'t, 's> {
-    language: &'static str,
+    language: &'s str,
     source: &'s [u8],
     chunks: Vec<AdapterChunk>,
     /// Comments/attributes absorbed into a following declaration.
@@ -281,6 +281,8 @@ struct Walk<'t, 's> {
     handled: HashSet<usize>,
     /// Unclassified nodes whose effective parent is the root; emitted as `statement` unless absorbed.
     root_candidates: Vec<Node<'t>>,
+    /// Name of the last file-level `package`/namespace declaration seen in document order.
+    file_namespace: Option<String>,
 }
 
 impl<'t> Walk<'t, '_> {
@@ -303,18 +305,29 @@ impl<'t> Walk<'t, '_> {
                 self.push_declaration(chunk_kind, node, inner);
                 return false;
             }
+            self.push_values(node, inner);
             return self.root_statement(node);
         }
         if is_transparent(self.language, node) {
+            if let Some(body) = block_namespace_body(self.language, node) {
+                self.push_namespace_header(node, body);
+            }
             return false;
         }
         if is_comment(kind) || ATTRIBUTE_KINDS.contains(&kind) {
             return self.root_statement(node);
         }
         if let Some(chunk_kind) = classify_node(self.language, node, self.source) {
+            if chunk_kind == "package" {
+                self.file_namespace = namespace_name(node, self.source);
+            }
+            if let Some(specifier) = typedef_specifier(self.language, node) {
+                self.handled.insert(specifier.id());
+            }
             self.push_declaration(chunk_kind, node, node);
             return false;
         }
+        self.push_values(node, node);
         self.root_statement(node)
     }
 
@@ -329,6 +342,23 @@ impl<'t> Walk<'t, '_> {
 
     fn effective_parent_is_root(&self, node: Node<'t>) -> bool {
         effective_parent(self.language, node).is_some_and(|parent| parent.parent().is_none())
+    }
+
+    /// Enclosing block namespaces (C#, PHP), else the file-level package or namespace.
+    fn namespace_of(&self, node: Node<'t>) -> Option<String> {
+        let mut segments = Vec::new();
+        let mut ancestor = node.parent();
+        while let Some(current) = ancestor {
+            if block_namespace_body(self.language, current).is_some() {
+                segments.extend(namespace_name(current, self.source));
+            }
+            ancestor = current.parent();
+        }
+        if segments.is_empty() {
+            return self.file_namespace.clone();
+        }
+        segments.reverse();
+        Some(segments.join("."))
     }
 
     /// `range_node` provides the line range (wrapper incl. `export`/decorators), `declaration`
@@ -366,14 +396,75 @@ impl<'t> Walk<'t, '_> {
                 declaration_signature(declaration, body, self.source),
             )
         };
+        let (name, owner) = declaration_name(self.language, declaration, self.source);
         self.chunks.push(AdapterChunk {
-            kind: kind.to_owned(),
-            name: chunk_name(self.language, declaration, self.source),
+            kind,
+            name,
+            owner,
+            namespace: self.namespace_of(declaration),
             start_line,
             end_line,
             child_boundaries,
             signature,
+            symbol_only: false,
         });
+    }
+
+    /// One-line `package` chunk for the header of a block namespace whose members are walked as
+    /// root-level declarations.
+    fn push_namespace_header(&mut self, node: Node<'t>, body: Node<'t>) {
+        // The name and other header parts must not become root statements of their own.
+        for part in named_children_of(node) {
+            if part.id() != body.id() {
+                self.absorbed.insert(part.id());
+            }
+        }
+        let start_row = node.start_position().row;
+        let end_row = body.start_position().row.saturating_sub(1).max(start_row);
+        let shares_member_line = named_children_of(body)
+            .first()
+            .is_some_and(|member| member.start_position().row <= end_row);
+        if shares_member_line {
+            return;
+        }
+        self.chunks.push(AdapterChunk {
+            kind: "package",
+            name: namespace_name(node, self.source),
+            owner: Vec::new(),
+            namespace: self.namespace_of(node),
+            start_line: start_row as u32 + 1,
+            end_line: end_row as u32 + 1,
+            child_boundaries: Vec::new(),
+            signature: None,
+            symbol_only: false,
+        });
+    }
+
+    /// Symbol-only entries for the constants, variables and fields `declaration` declares.
+    fn push_values(&mut self, range_node: Node<'t>, declaration: Node<'t>) {
+        let values = value_declarations(self.language, declaration, self.source);
+        if values.is_empty() {
+            return;
+        }
+        let namespace = self.namespace_of(declaration);
+        for value in values {
+            let statement = if value.statement.id() == declaration.id() {
+                range_node
+            } else {
+                value.statement
+            };
+            self.chunks.push(AdapterChunk {
+                kind: value.kind,
+                name: Some(value.name),
+                owner: Vec::new(),
+                namespace: namespace.clone(),
+                start_line: statement.start_position().row as u32 + 1,
+                end_line: last_row(statement) as u32 + 1,
+                child_boundaries: Vec::new(),
+                signature: declaration_signature(value.statement, None, self.source),
+                symbol_only: true,
+            });
+        }
     }
 
     fn finish(self) -> Vec<AdapterChunk> {
@@ -395,8 +486,10 @@ impl<'t> Walk<'t, '_> {
             let start_line = node.start_position().row as u32 + 1;
             let end_line = last_row(node) as u32 + 1;
             chunks.push(AdapterChunk {
-                kind: "statement".to_owned(),
+                kind: "statement",
                 name: None,
+                owner: Vec::new(),
+                namespace: None,
                 start_line,
                 end_line,
                 child_boundaries: member_boundaries(
@@ -405,6 +498,7 @@ impl<'t> Walk<'t, '_> {
                     end_line,
                 ),
                 signature: None,
+                symbol_only: false,
             });
         }
         chunks
@@ -451,7 +545,8 @@ fn declaration_signature(
     (!signature.is_empty()).then(|| signature.to_owned())
 }
 
-/// Declaration wrapped by a transparent node (`export`, `declare`, Python decorators).
+/// Declaration wrapped by a transparent node (`export`, `declare`, Python decorators, C++
+/// `template <…>`).
 fn transparent_inner<'t>(language: &str, node: Node<'t>) -> Option<Node<'t>> {
     match (language, node.kind()) {
         ("typescript" | "javascript", "export_statement") => {
@@ -475,6 +570,23 @@ fn transparent_inner<'t>(language: &str, node: Node<'t>) -> Option<Node<'t>> {
             )
         }),
         ("python", "decorated_definition") => node.child_by_field_name("definition"),
+        ("cpp", "template_declaration") => {
+            named_children_of(node).into_iter().rev().find(|child| {
+                child.kind() == "function_definition"
+                    || child.kind() == "alias_declaration"
+                    || SPECIFIER_KINDS.contains(&child.kind())
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Body of a C# or PHP namespace written as a block (`namespace X { … }`).
+fn block_namespace_body<'t>(language: &str, node: Node<'t>) -> Option<Node<'t>> {
+    match (language, node.kind()) {
+        ("csharp", "namespace_declaration") | ("php", "namespace_definition") => {
+            node.child_by_field_name("body")
+        }
         _ => None,
     }
 }
@@ -499,10 +611,16 @@ fn is_transparent(language: &str, node: Node<'_>) -> bool {
                 .parent()
                 .is_some_and(|parent| parent.parent().is_none() || is_transparent(language, parent))
         }
+        "csharp" | "php" => {
+            block_namespace_body(language, node).is_some()
+                || node.parent().is_some_and(|parent| {
+                    block_namespace_body(language, parent)
+                        .is_some_and(|body| body.id() == node.id())
+                })
+        }
         _ => false,
     }
 }
-
 /// Nearest ancestor that is not a transparent wrapper.
 fn effective_parent<'t>(language: &str, node: Node<'t>) -> Option<Node<'t>> {
     let mut parent = node.parent();
@@ -585,6 +703,15 @@ fn body_node<'t>(language: &str, declaration: Node<'t>) -> Option<Node<'t>> {
             "interface_type" => Some(ty),
             _ => None,
         };
+    }
+    if let Some(specifier) = typedef_specifier(language, declaration) {
+        return specifier.child_by_field_name("body");
+    }
+    if let Some(value) = function_value(language, declaration) {
+        // Expression-bodied arrow functions have no statements to split at.
+        return value
+            .child_by_field_name("body")
+            .filter(|body| body.kind() == "statement_block");
     }
     let mut body = declaration.child_by_field_name("body").or_else(|| {
         named_children_of(declaration)
@@ -713,7 +840,8 @@ fn classify_node(language: &str, node: Node<'_>, source: &[u8]) -> Option<&'stat
             "union_item" => Some("union"),
             "trait_item" => Some("trait"),
             "type_item" => Some("type"),
-            "mod_item" => Some("module"),
+            // `mod name;` only points at another file; that file holds the module.
+            "mod_item" => node.child_by_field_name("body").map(|_| "module"),
             "macro_definition" => Some("macro"),
             "impl_item" => Some("impl"),
             _ => None,
@@ -805,22 +933,19 @@ fn classify_node(language: &str, node: Node<'_>, source: &[u8]) -> Option<&'stat
                 .then(|| go_spec_kind(node)),
             _ => None,
         },
-        "c" => match kind {
+        "c" | "cpp" => match kind {
             "function_definition" => Some("function"),
-            "struct_specifier" => Some("struct"),
-            "enum_specifier" => Some("enum"),
-            "union_specifier" => Some("union"),
-            "type_definition" => Some("type"),
-            _ => None,
-        },
-        "cpp" => match kind {
-            "function_definition" => Some("function"),
-            "class_specifier" => Some("class"),
-            "struct_specifier" => Some("struct"),
-            "enum_specifier" => Some("enum"),
-            "union_specifier" => Some("union"),
-            "namespace_definition" => Some("module"),
-            "type_definition" | "alias_declaration" => Some("type"),
+            "struct_specifier" | "enum_specifier" | "union_specifier" | "class_specifier" => {
+                specifier_kind(node)
+            }
+            // `typedef struct { … } Name;` is one declaration of the struct named `Name`.
+            "type_definition" => Some(
+                typedef_specifier(language, node)
+                    .and_then(specifier_kind)
+                    .unwrap_or("type"),
+            ),
+            "namespace_definition" if language == "cpp" => Some("module"),
+            "alias_declaration" if language == "cpp" => Some("type"),
             _ => None,
         },
         "csharp" => match kind {
@@ -865,6 +990,198 @@ fn classify_node(language: &str, node: Node<'_>, source: &[u8]) -> Option<&'stat
     }
 }
 
+/// Type kind of a C/C++ struct/enum/union/class specifier that has a body (a definition, not a
+/// reference such as `struct Foo *f`).
+fn specifier_kind(node: Node<'_>) -> Option<&'static str> {
+    node.child_by_field_name("body")?;
+    match node.kind() {
+        "struct_specifier" => Some("struct"),
+        "enum_specifier" => Some("enum"),
+        "union_specifier" => Some("union"),
+        "class_specifier" => Some("class"),
+        _ => None,
+    }
+}
+
+/// The specifier with a body inside a C/C++ `typedef`.
+fn typedef_specifier<'t>(language: &str, node: Node<'t>) -> Option<Node<'t>> {
+    if !matches!(language, "c" | "cpp") || node.kind() != "type_definition" {
+        return None;
+    }
+    node.child_by_field_name("type")
+        .filter(|ty| specifier_kind(*ty).is_some())
+}
+
+/// The function value of a TS/JS declaration classified as a function or method.
+fn function_value<'t>(language: &str, node: Node<'t>) -> Option<Node<'t>> {
+    if !matches!(language, "typescript" | "javascript") {
+        return None;
+    }
+    match node.kind() {
+        "lexical_declaration" | "variable_declaration" => single_function_declarator(node)
+            .and_then(|declarator| declarator.child_by_field_name("value")),
+        "public_field_definition" | "field_definition" => node
+            .child_by_field_name("value")
+            .filter(|value| FUNCTION_VALUE_KINDS.contains(&value.kind())),
+        _ => None,
+    }
+}
+
+/// A constant, variable or field declared by a node that forms no declaration chunk.
+struct ValueDeclaration<'t> {
+    kind: &'static str,
+    name: String,
+    /// Node whose lines and first line become the symbol's range and signature.
+    statement: Node<'t>,
+}
+
+/// Root-level constants and variables, and fields in class bodies (Rust, Go, TS/JS, Python, Java,
+/// C#). Function-valued declarations are chunks of their own and never reach this.
+fn value_declarations<'t>(
+    language: &str,
+    node: Node<'t>,
+    source: &[u8],
+) -> Vec<ValueDeclaration<'t>> {
+    let text = |name: Node<'_>| {
+        name.utf8_text(source)
+            .ok()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+    };
+    let value = |kind, name: Option<Node<'_>>, statement| {
+        name.and_then(text).map(|name| ValueDeclaration {
+            kind,
+            name,
+            statement,
+        })
+    };
+    let parent_kind = effective_parent_kind(language, node);
+    let at_root = effective_parent(language, node).is_some_and(|parent| parent.parent().is_none());
+    let mut values = Vec::new();
+    match (language, node.kind()) {
+        ("rust", "const_item" | "static_item") => {
+            values.extend(value("constant", node.child_by_field_name("name"), node));
+        }
+        ("go", "const_declaration" | "var_declaration") => {
+            let mut specs = Vec::new();
+            for child in named_children_of(node) {
+                match child.kind() {
+                    "const_spec" | "var_spec" => specs.push(child),
+                    "var_spec_list" => specs.extend(
+                        named_children_of(child)
+                            .into_iter()
+                            .filter(|spec| spec.kind() == "var_spec"),
+                    ),
+                    _ => {}
+                }
+            }
+            for spec in specs {
+                // A grouped `const ( … )` block: each spec's own line is its location.
+                let statement = if spec.start_position().row == node.start_position().row {
+                    node
+                } else {
+                    spec
+                };
+                let mut cursor = spec.walk();
+                for name in spec.children_by_field_name("name", &mut cursor) {
+                    values.extend(value("constant", Some(name), statement));
+                }
+            }
+        }
+        ("typescript" | "javascript", "lexical_declaration" | "variable_declaration")
+            if at_root =>
+        {
+            for declarator in named_children_of(node) {
+                if declarator.kind() != "variable_declarator" {
+                    continue;
+                }
+                let name = declarator
+                    .child_by_field_name("name")
+                    .filter(|name| name.kind() == "identifier");
+                values.extend(value("constant", name, node));
+            }
+        }
+        ("typescript", "public_field_definition") if parent_kind == Some("class_body") => {
+            values.extend(value("property", node.child_by_field_name("name"), node));
+        }
+        ("javascript", "field_definition") if parent_kind == Some("class_body") => {
+            values.extend(value(
+                "property",
+                node.child_by_field_name("property"),
+                node,
+            ));
+        }
+        ("python", "expression_statement") => {
+            let in_class = effective_parent(language, node).is_some_and(|parent| {
+                parent.kind() == "block"
+                    && parent
+                        .parent()
+                        .is_some_and(|owner| owner.kind() == "class_definition")
+            });
+            let kind = if at_root {
+                "constant"
+            } else if in_class {
+                "property"
+            } else {
+                return values;
+            };
+            let name = node
+                .named_child(0)
+                .filter(|child| child.kind() == "assignment")
+                .and_then(|assignment| assignment.child_by_field_name("left"))
+                .filter(|left| left.kind() == "identifier");
+            values.extend(value(kind, name, node));
+        }
+        ("java", "field_declaration" | "constant_declaration") => {
+            let modifiers = named_children_of(node)
+                .into_iter()
+                .find(|child| child.kind() == "modifiers")
+                .and_then(|modifiers| modifiers.utf8_text(source).ok())
+                .unwrap_or_default();
+            let has = |word| {
+                modifiers
+                    .split_whitespace()
+                    .any(|modifier| modifier == word)
+            };
+            let kind = if node.kind() == "constant_declaration" || (has("static") && has("final")) {
+                "constant"
+            } else {
+                "property"
+            };
+            let mut cursor = node.walk();
+            for declarator in node.children_by_field_name("declarator", &mut cursor) {
+                values.extend(value(kind, declarator.child_by_field_name("name"), node));
+            }
+        }
+        ("csharp", "field_declaration") => {
+            let children = named_children_of(node);
+            let has = |word| {
+                children.iter().any(|child| {
+                    child.kind() == "modifier" && child.utf8_text(source).ok() == Some(word)
+                })
+            };
+            let kind = if has("const") || (has("static") && has("readonly")) {
+                "constant"
+            } else {
+                "property"
+            };
+            for declaration in children
+                .iter()
+                .filter(|child| child.kind() == "variable_declaration")
+            {
+                for declarator in named_children_of(*declaration) {
+                    if declarator.kind() == "variable_declarator" {
+                        values.extend(value(kind, declarator.child_by_field_name("name"), node));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    values
+}
+
 /// The only `variable_declarator` of a TS/JS declaration when its value is a function.
 fn single_function_declarator(node: Node<'_>) -> Option<Node<'_>> {
     let declarators = named_children_of(node)
@@ -903,6 +1220,36 @@ fn kotlin_class_kind(node: Node<'_>, source: &[u8]) -> &'static str {
     }
 }
 
+/// Name of a declaration and the owner segments that precede it in the symbol path.
+fn declaration_name(
+    language: &str,
+    node: Node<'_>,
+    source: &[u8],
+) -> (Option<String>, Vec<String>) {
+    match (language, node.kind()) {
+        ("c" | "cpp", "function_definition") => match function_definition_name(node, source) {
+            Some((name, owner)) => (Some(name), owner),
+            None => (node_name(node, source), Vec::new()),
+        },
+        ("go", "method_declaration") => {
+            let receiver = node
+                .child_by_field_name("receiver")
+                .and_then(|receiver| {
+                    named_children_of(receiver)
+                        .into_iter()
+                        .find(|parameter| parameter.kind() == "parameter_declaration")
+                })
+                .and_then(|parameter| parameter.child_by_field_name("type"))
+                .and_then(|ty| identifier_in(ty, source));
+            (
+                chunk_name(language, node, source),
+                receiver.into_iter().collect(),
+            )
+        }
+        _ => (chunk_name(language, node, source), Vec::new()),
+    }
+}
+
 fn chunk_name(language: &str, node: Node<'_>, source: &[u8]) -> Option<String> {
     match (language, node.kind()) {
         ("kotlin", "property_declaration") => named_children_of(node)
@@ -934,8 +1281,79 @@ fn chunk_name(language: &str, node: Node<'_>, source: &[u8]) -> Option<String> {
         ("javascript", "field_definition") => node
             .child_by_field_name("property")
             .and_then(|name| identifier_in(name, source)),
+        // Only the `name` field: an anonymous specifier must not be named after its first field.
+        (
+            "c" | "cpp",
+            "struct_specifier" | "enum_specifier" | "union_specifier" | "class_specifier",
+        ) => node
+            .child_by_field_name("name")
+            .and_then(|name| qualified_parts(name, source))
+            .map(|(name, _)| name),
         _ => node_name(node, source),
     }
+}
+
+/// Name and scope of a C/C++ function definition: `void ns::Widget::draw()` → ("draw",
+/// ["ns", "Widget"]).
+fn function_definition_name(node: Node<'_>, source: &[u8]) -> Option<(String, Vec<String>)> {
+    let mut declarator = node.child_by_field_name("declarator")?;
+    // Pointer, reference and parenthesized declarators wrap the function declarator.
+    while declarator.kind() != "function_declarator" {
+        declarator = declarator.child_by_field_name("declarator").or_else(|| {
+            named_children_of(declarator)
+                .into_iter()
+                .find(|child| child.kind().ends_with("declarator"))
+        })?;
+    }
+    qualified_parts(declarator.child_by_field_name("declarator")?, source)
+}
+
+/// Last name of a possibly qualified C++ identifier and its scope segments.
+fn qualified_parts(node: Node<'_>, source: &[u8]) -> Option<(String, Vec<String>)> {
+    let mut scope = Vec::new();
+    let mut current = node;
+    while current.kind() == "qualified_identifier" {
+        if let Some(segment) = current.child_by_field_name("scope") {
+            let segment = match segment.kind() {
+                "template_type" => segment.child_by_field_name("name").unwrap_or(segment),
+                _ => segment,
+            };
+            if let Ok(text) = segment.utf8_text(source) {
+                scope.push(text.trim().to_owned());
+            }
+        }
+        current = current.child_by_field_name("name")?;
+    }
+    if matches!(
+        current.kind(),
+        "template_function" | "template_type" | "template_method"
+    ) {
+        current = current.child_by_field_name("name").unwrap_or(current);
+    }
+    let name = current.utf8_text(source).ok()?.trim();
+    (!name.is_empty()).then(|| (name.to_owned(), scope))
+}
+
+/// Dotted name of a package or namespace declaration (`App\Http` → `App.Http`).
+fn namespace_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let name = node.child_by_field_name("name").or_else(|| {
+        named_children_of(node)
+            .into_iter()
+            .rev()
+            .find(|child| !is_comment(child.kind()) && !ATTRIBUTE_KINDS.contains(&child.kind()))
+    })?;
+    let text = name.utf8_text(source).ok()?;
+    let mut dotted = String::new();
+    for segment in text
+        .split(|character: char| matches!(character, '.' | '\\' | ':') || character.is_whitespace())
+        .filter(|segment| !segment.is_empty())
+    {
+        if !dotted.is_empty() {
+            dotted.push('.');
+        }
+        dotted.push_str(segment);
+    }
+    (!dotted.is_empty()).then_some(dotted)
 }
 
 fn node_name(node: Node<'_>, source: &[u8]) -> Option<String> {
@@ -992,6 +1410,7 @@ fn dedupe(chunks: &mut Vec<AdapterChunk>) {
         left.start_line == right.start_line
             && left.end_line == right.end_line
             && left.kind == right.kind
+            && left.name == right.name
     });
 }
 

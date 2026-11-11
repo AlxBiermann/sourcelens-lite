@@ -79,14 +79,21 @@ pub fn language_for_path(path: &str) -> Option<&'static Language> {
         .find(|language| language.extensions.contains(&extension.as_str()))
 }
 
+/// Language by name or alias, else by file extension (`ts`, `py`, `cs`).
 pub fn language_by_name(name: &str) -> Option<&'static Language> {
     let normalized = name.trim().to_ascii_lowercase();
-    LANGUAGES.iter().find(|language| {
-        language.name == normalized || language.aliases.contains(&normalized.as_str())
-    })
+    let name = normalized.as_str();
+    LANGUAGES
+        .iter()
+        .find(|language| language.name == name || language.aliases.contains(&name))
+        .or_else(|| {
+            LANGUAGES
+                .iter()
+                .find(|language| language.extensions.contains(&name))
+        })
 }
 
-pub fn normalized_extension(path: &Path) -> Option<String> {
+fn normalized_extension(path: &Path) -> Option<String> {
     path.extension()
         .and_then(|extension| extension.to_str())
         .map(str::trim)
