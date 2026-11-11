@@ -23,6 +23,11 @@ export function Login() {
             GitHub sign-in did not complete. Try again.
           </p>
         ) : null}
+        {error === 'state' ? (
+          <p className="sl-marker-error" role="alert">
+            The GitHub response did not match this browser session. Sign in again.
+          </p>
+        ) : null}
         {error === 'setup_required' ? (
           <p className="sl-marker-error" role="alert">
             This instance has no owner yet.{' '}

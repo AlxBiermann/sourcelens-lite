@@ -102,7 +102,9 @@ export function RepositoryDetail() {
   const status = repoStatus(repo);
   const job = repo.activeJob;
   const progress = job?.status === 'running' ? Math.min(100, jobProgress(job, embeddings.data?.enabled ?? false)) : null;
-  const branchOptions = branches.data?.branches ?? [repo.effectiveBranch];
+  // GET …/branches returns only GitHub's first page; keep the tracked branch selectable when it is not on it.
+  const listed = branches.data?.branches ?? [repo.effectiveBranch];
+  const branchOptions = repo.branch !== null && !listed.includes(repo.branch) ? [repo.branch, ...listed] : listed;
   const connected = repo.state === 'connected';
 
   return (
