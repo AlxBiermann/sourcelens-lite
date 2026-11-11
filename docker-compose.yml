@@ -7,5 +7,10 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - ./data:/data
+      # A named volume starts out owned by the image's non-root user; a host directory would be
+      # created by Docker as root and stay unwritable for the container.
+      - sourcelens-data:/data
     restart: unless-stopped
+
+volumes:
+  sourcelens-data:

@@ -23,31 +23,37 @@ const ACCEPT_GITHUB_JSON: &str = "application/vnd.github+json";
 /// GitHub installation tokens live 60 minutes; reuse them for 50.
 const TOKEN_TTL: Duration = Duration::from_secs(50 * 60);
 const MAX_ATTEMPTS: u32 = 3;
+/// App JWTs are backdated against clock drift and expire before GitHub's 10-minute maximum.
+const JWT_BACKDATE_SECS: i64 = 60;
+const JWT_LIFETIME_SECS: i64 = 540;
+/// Wait reported for a rate limit whose response names no reset time.
+const DEFAULT_RATE_LIMIT_WAIT_SECS: i64 = 60;
 
-#[derive(Clone)]
+/// GitHub App credentials. The same record is stored sealed under `settings['github_app']` (camelCase)
+/// and read from GitHub's manifest conversion response (snake_case aliases, `id`, `pem`).
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppCredentials {
+    #[serde(alias = "id")]
     pub app_id: u64,
     pub slug: String,
+    #[serde(alias = "client_id")]
     pub client_id: String,
+    #[serde(alias = "client_secret")]
     pub client_secret: String,
+    #[serde(alias = "webhook_secret")]
     pub webhook_secret: Option<String>,
+    #[serde(alias = "pem")]
     pub private_key_pem: String,
+    #[serde(alias = "html_url")]
     pub html_url: String,
-    /// "manifest" | "env"
+    /// "manifest" | "env"; not stored, every stored record comes from the manifest flow.
+    #[serde(skip, default = "manifest_source")]
     pub source: &'static str,
 }
 
-/// Sealed JSON stored under `settings['github_app']`.
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StoredApp {
-    app_id: u64,
-    slug: String,
-    client_id: String,
-    client_secret: String,
-    webhook_secret: Option<String>,
-    private_key_pem: String,
-    html_url: String,
+fn manifest_source() -> &'static str {
+    "manifest"
 }
 
 pub struct GitHub {
@@ -103,30 +109,12 @@ impl GitHub {
             .key
             .open(&sealed)
             .ok_or_else(|| ApiError::internal("settings['github_app'] cannot be decrypted"))?;
-        let stored: StoredApp = serde_json::from_slice(&plain).map_err(ApiError::internal)?;
-        Ok(Some(AppCredentials {
-            app_id: stored.app_id,
-            slug: stored.slug,
-            client_id: stored.client_id,
-            client_secret: stored.client_secret,
-            webhook_secret: stored.webhook_secret,
-            private_key_pem: stored.private_key_pem,
-            html_url: stored.html_url,
-            source: "manifest",
-        }))
+        let creds = serde_json::from_slice(&plain).map_err(ApiError::internal)?;
+        Ok(Some(creds))
     }
 
     pub async fn store_manifest_credentials(&self, c: &AppCredentials) -> ApiResult<()> {
-        let stored = StoredApp {
-            app_id: c.app_id,
-            slug: c.slug.clone(),
-            client_id: c.client_id.clone(),
-            client_secret: c.client_secret.clone(),
-            webhook_secret: c.webhook_secret.clone(),
-            private_key_pem: c.private_key_pem.clone(),
-            html_url: c.html_url.clone(),
-        };
-        let json = serde_json::to_vec(&stored).map_err(ApiError::internal)?;
+        let json = serde_json::to_vec(c).map_err(ApiError::internal)?;
         let sealed = self.key.seal(&json);
         self.db
             .write(move |conn| db::put_setting(conn, SETTINGS_KEY, sealed))
@@ -139,8 +127,8 @@ impl GitHub {
         let ts = now();
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
         let claims = serde_json::json!({
-            "iat": ts - 60,
-            "exp": ts + 540,
+            "iat": ts - JWT_BACKDATE_SECS,
+            "exp": ts + JWT_LIFETIME_SECS,
             "iss": c.app_id.to_string(),
         });
         let claims = URL_SAFE_NO_PAD.encode(claims.to_string());
@@ -312,7 +300,7 @@ fn rate_limit_wait(headers: &HeaderMap) -> Option<i64> {
     let wait = header("x-ratelimit-reset")
         .and_then(|v| v.parse::<i64>().ok())
         .map(|reset| reset - now())
-        .unwrap_or(60);
+        .unwrap_or(DEFAULT_RATE_LIMIT_WAIT_SECS);
     Some(wait.max(1))
 }
 
