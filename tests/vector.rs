@@ -1,7 +1,8 @@
 use rusqlite::{params, Connection};
 use sourcelens::db::Db;
 use sourcelens::index::store::{
-    apply_files, create_vec_table, knn, prepare_file, to_blob, vec_table_exists,
+    apply_files, create_vec_table, delete_paths, knn, prepare_file, purge_batch, to_blob,
+    vec_table_exists, DELETE_VECTOR_SQL, SELECT_VECTOR_SQL,
 };
 
 fn insert_repo(conn: &Connection, github_id: i64) -> i64 {
@@ -152,4 +153,110 @@ async fn unchanged_chunks_keep_their_vectors_when_a_file_is_reapplied() {
     assert_eq!(rows[1].1, 0);
     assert_eq!(rows[1].2, None);
     assert_eq!(vec_rows, 1);
+}
+
+/// `detail` column of `EXPLAIN QUERY PLAN`.
+fn query_plan(conn: &Connection, sql: &str) -> Vec<String> {
+    conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap()
+        .query_map([1], |row| row.get(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// The `vec0` plan of a statement: idxStr starts with '1' (full scan), '2' (point) or '3' (KNN).
+fn vec0_plan(conn: &Connection, sql: &str) -> char {
+    let plan = query_plan(conn, sql);
+    let line = plan
+        .iter()
+        .find(|line| line.contains("vec_chunks VIRTUAL TABLE INDEX"))
+        .unwrap_or_else(|| panic!("no vec0 step in {plan:?}"));
+    let idx_str = line.split_once(':').map(|(_, rest)| rest).unwrap_or("");
+    idx_str.chars().next().unwrap_or(' ')
+}
+
+#[tokio::test]
+async fn vector_reads_and_deletes_by_chunk_id_are_point_lookups() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open(&tmp.path().join("test.db")).unwrap();
+    let plans = db
+        .write(|conn| {
+            create_vec_table(conn, 4)?;
+            Ok::<_, rusqlite::Error>((
+                vec0_plan(
+                    conn,
+                    "DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id = ?1)",
+                ),
+                vec0_plan(conn, SELECT_VECTOR_SQL),
+                vec0_plan(conn, DELETE_VECTOR_SQL),
+            ))
+        })
+        .await
+        .unwrap();
+    // An `IN (…)` list over chunk_id makes vec0 scan every vector of every repository.
+    assert_eq!(plans.0, '1', "the former statement was a full scan");
+    assert_eq!((plans.1, plans.2), ('2', '2'));
+}
+
+#[tokio::test]
+async fn reapply_and_delete_leave_no_orphan_vectors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open(&tmp.path().join("test.db")).unwrap();
+    let v1 = format!("{}\n{}", function("alpha", "same"), function("beta", "old"));
+    let v2 = format!("{}\n{}", function("alpha", "same"), function("beta", "new"));
+    let other = function("gamma", "kept");
+
+    let counts = db
+        .write(move |conn| {
+            let repo = insert_repo(conn, 1);
+            apply_files(
+                conn,
+                repo,
+                &[
+                    prepare_file("src/lib.rs", "v1", v1.as_bytes()),
+                    prepare_file("src/other.rs", "o", other.as_bytes()),
+                ],
+            )?;
+            create_vec_table(conn, 4)?;
+            let chunk_ids: Vec<i64> = conn
+                .prepare("SELECT id FROM chunks ORDER BY id")?
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            assert_eq!(chunk_ids.len(), 3);
+            for (i, id) in chunk_ids.iter().enumerate() {
+                let mut vector = [0.0f32; 4];
+                vector[i] = 1.0;
+                insert_vector(conn, *id, repo, &vector);
+            }
+            conn.execute("UPDATE chunks SET embed_state = 1", [])?;
+
+            let orphans = |conn: &Connection| -> rusqlite::Result<(i64, i64)> {
+                Ok((
+                    conn.query_row("SELECT COUNT(*) FROM vec_chunks", [], |row| row.get(0))?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM vec_chunks WHERE chunk_id NOT IN (SELECT id FROM chunks)",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                ))
+            };
+            apply_files(
+                conn,
+                repo,
+                &[prepare_file("src/lib.rs", "v2", v2.as_bytes())],
+            )?;
+            let after_reapply = orphans(conn)?;
+            delete_paths(conn, repo, &["src/lib.rs".to_string()])?;
+            let after_delete = orphans(conn)?;
+            while !purge_batch(conn, repo)? {}
+            let after_purge = orphans(conn)?;
+            Ok::<_, rusqlite::Error>((after_reapply, after_delete, after_purge))
+        })
+        .await
+        .unwrap();
+    // Re-apply keeps the unchanged `alpha` vector and `src/other.rs`; `beta` lost its vector.
+    assert_eq!(counts.0, (2, 0));
+    assert_eq!(counts.1, (1, 0));
+    assert_eq!(counts.2, (0, 0));
 }
