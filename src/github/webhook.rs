@@ -65,7 +65,8 @@ async fn handle(state: &AppState, headers: &HeaderMap, body: &[u8]) -> ApiResult
             .db
             .write(move |conn| {
                 let inserted = conn.execute(
-                    "INSERT OR IGNORE INTO webhook_deliveries (delivery_id, event, received_at) VALUES (?1, ?2, ?3)",
+                    "INSERT OR IGNORE INTO webhook_deliveries (delivery_id, event, received_at)
+                     VALUES (?1, ?2, ?3)",
                     params![delivery, event, received_at],
                 )?;
                 conn.execute(
@@ -194,28 +195,41 @@ async fn on_installation(state: &AppState, payload: &Value) -> ApiResult<JobRequ
     let Some(installation_id) = payload["installation"]["id"].as_u64() else {
         return Ok(Vec::new());
     };
-    let action = payload["action"].as_str().unwrap_or_default().to_string();
-    let added = repository_ids(&payload["repositories"]);
+    let reason = match payload["action"].as_str().unwrap_or_default() {
+        "deleted" => "GitHub App uninstalled",
+        "suspend" => "GitHub App suspended",
+        "unsuspend" | "created" => {
+            let added = repository_ids(&payload["repositories"]);
+            return reconnect_installation(state, installation_id, added).await;
+        }
+        _ => return Ok(Vec::new()),
+    };
+    state
+        .db
+        .write(move |conn| {
+            repositories::disconnect(conn, Target::Installation(installation_id), reason)
+        })
+        .await?;
+    Ok(Vec::new())
+}
+
+/// Reconnects the repositories of an installation that is back, plus those listed in the payload:
+/// a new installation has a new id.
+async fn reconnect_installation(
+    state: &AppState,
+    installation_id: u64,
+    added: Vec<i64>,
+) -> ApiResult<JobRequests> {
     let reconnected = state
         .db
         .write(move |conn| {
-            let reason = match action.as_str() {
-                "deleted" => "GitHub App uninstalled",
-                "suspend" => "GitHub App suspended",
-                "unsuspend" | "created" => {
-                    let mut ids = repositories::reconnect(
-                        conn,
-                        Target::Installation(installation_id),
-                        installation_id,
-                    )?;
-                    // A new installation has a new id; its repositories are listed in the payload.
-                    ids.extend(reconnect_github_ids(conn, installation_id, &added)?);
-                    return Ok(ids);
-                }
-                _ => return Ok(Vec::new()),
-            };
-            repositories::disconnect(conn, Target::Installation(installation_id), reason)?;
-            Ok::<_, rusqlite::Error>(Vec::new())
+            let mut ids = repositories::reconnect(
+                conn,
+                Target::Installation(installation_id),
+                installation_id,
+            )?;
+            ids.extend(reconnect_github_ids(conn, installation_id, &added)?);
+            Ok::<_, rusqlite::Error>(ids)
         })
         .await?;
     Ok(reconnected.into_iter().map(|id| (id, None)).collect())

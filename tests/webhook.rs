@@ -332,3 +332,51 @@ async fn webhooks_without_credentials_are_not_found() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn disconnecting_events_remove_queued_jobs() {
+    let (_tmp, state, repo_id) = setup().await;
+    let cases = [
+        (
+            "installation",
+            json!({ "action": "suspend", "installation": { "id": INSTALLATION_ID } }),
+            json!({ "action": "unsuspend", "installation": { "id": INSTALLATION_ID } }),
+        ),
+        (
+            "installation_repositories",
+            json!({
+                "action": "removed",
+                "installation": { "id": INSTALLATION_ID },
+                "repositories_added": [],
+                "repositories_removed": [{ "id": GITHUB_ID }]
+            }),
+            json!({
+                "action": "added",
+                "installation": { "id": INSTALLATION_ID },
+                "repositories_added": [{ "id": GITHUB_ID }],
+                "repositories_removed": []
+            }),
+        ),
+    ];
+    for (n, (event, disconnect, reconnect)) in cases.into_iter().enumerate() {
+        // Reconnecting queues a job; a push replaces its target.
+        if n > 0 {
+            assert_eq!(jobs(&state, repo_id).await.len(), 1);
+        }
+        deliver(
+            &state,
+            "push",
+            &format!("push-{n}"),
+            &push("refs/heads/main", &"1".repeat(40)),
+        )
+        .await;
+        assert_eq!(jobs(&state, repo_id).await.len(), 1);
+
+        deliver(&state, event, &format!("off-{n}"), &disconnect).await;
+        assert_eq!(repo_row(&state, repo_id).await.0, "disconnected");
+        assert!(jobs(&state, repo_id).await.is_empty(), "{event}");
+
+        deliver(&state, event, &format!("on-{n}"), &reconnect).await;
+        assert_eq!(repo_row(&state, repo_id).await.0, "connected");
+    }
+}

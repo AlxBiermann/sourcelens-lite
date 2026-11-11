@@ -6,17 +6,19 @@ use axum::{Json, Router};
 use rusqlite::{Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiResult, GitHubFailure};
 use crate::github::api;
 use crate::http::session::{user_token, AuthUser};
 use crate::http::{Body, PathId};
 use crate::index::jobs;
 use crate::model::{JobPhase, JobStatus, RepoState, SkipReason, Trigger, EMBED_DONE};
-use crate::repositories::{self, NewRepository, RepoRow};
+use crate::repositories::{self, NewRepository, RepoRow, Target};
 use crate::state::{now, AppState};
 
 /// Longest branch name accepted.
 const MAX_BRANCH_NAME_BYTES: usize = 255;
+/// Jobs listed in a repository's activity.
+const DETAIL_JOBS: i64 = 20;
 
 /// `/api/github/repositories`, `/api/repositories[/{id}[/branches|/sync]]`.
 pub fn routes() -> Router<AppState> {
@@ -245,14 +247,16 @@ async fn detail(
                 return Ok(None);
             };
             let mut stmt = conn.prepare(&format!(
-                "SELECT {JOB_COLUMNS} FROM jobs WHERE repo_id = ?1 ORDER BY id DESC LIMIT 20"
+                "SELECT {JOB_COLUMNS} FROM jobs WHERE repo_id = ?1 ORDER BY id DESC LIMIT ?2"
             ))?;
             let jobs = stmt
-                .query_map([id], job_from_row)?
+                .query_map(rusqlite::params![id, DETAIL_JOBS], job_from_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let mut stmt = conn.prepare(
-                "SELECT skip_reason, count(*) FROM files WHERE repo_id = ?1 AND skip_reason IS NOT NULL
-                 GROUP BY skip_reason ORDER BY count(*) DESC, skip_reason",
+                "SELECT skip_reason, count(*) FROM files
+                 WHERE repo_id = ?1 AND skip_reason IS NOT NULL
+                 GROUP BY skip_reason
+                 ORDER BY count(*) DESC, skip_reason",
             )?;
             let skipped = stmt
                 .query_map([id], |row| {
@@ -297,7 +301,7 @@ async fn update_branch(
     Body(body): Body<BranchBody>,
 ) -> ApiResult<Json<Repository>> {
     let repo = repo_ref(&state, id).await?;
-    require_connected(&repo)?;
+    let repo = ensure_connected(&state, repo).await?;
     let branch = body
         .branch
         .map(|branch| branch.trim().to_string())
@@ -340,7 +344,7 @@ async fn sync(
         })?
     };
     let repo = repo_ref(&state, id).await?;
-    require_connected(&repo)?;
+    ensure_connected(&state, repo).await?;
     let job_id = jobs::enqueue(&state, id, Trigger::Manual, None, body.force).await?;
     let job = state
         .db
@@ -397,26 +401,55 @@ async fn repo_ref(state: &AppState, id: i64) -> ApiResult<RepoRow> {
         .ok_or_else(repository_not_found)
 }
 
-fn require_connected(repo: &RepoRow) -> ApiResult<()> {
+/// A disconnected repository gets one reconnect attempt: when GitHub confirms that the app can
+/// read it, it is connected through that installation again and a job is queued.
+async fn ensure_connected(state: &AppState, repo: RepoRow) -> ApiResult<RepoRow> {
     if repo.state == RepoState::Connected {
-        Ok(())
-    } else {
-        Err(ApiError::conflict(
-            "repository_disconnected",
-            format!(
-                "{} is disconnected. Give the GitHub App access to it again first.",
-                repo.full_name
-            ),
-        ))
+        return Ok(repo);
     }
+    let installation_id = match state.github.repo_installation(&repo.full_name).await {
+        Ok(installation_id) => installation_id,
+        Err(err) if matches!(err.github, Some(GitHubFailure::Status(403 | 404))) => {
+            return Err(disconnected(&repo));
+        }
+        Err(err) => return Err(err),
+    };
+    let id = repo.id;
+    let reconnected = state
+        .db
+        .write(move |conn| repositories::reconnect(conn, Target::Id(id), installation_id))
+        .await?;
+    if !reconnected.is_empty() {
+        jobs::enqueue(state, id, Trigger::Manual, None, false).await?;
+    }
+    state
+        .db
+        .read(move |conn| repositories::get(conn, id))
+        .await?
+        .filter(|current| current.state == RepoState::Connected)
+        .ok_or_else(|| disconnected(&repo))
+}
+
+/// 409 naming the stored reason why the repository is disconnected.
+fn disconnected(repo: &RepoRow) -> ApiError {
+    let reason = repo
+        .state_reason
+        .as_deref()
+        .map(|reason| format!(" ({reason})"))
+        .unwrap_or_default();
+    ApiError::conflict(
+        "repository_disconnected",
+        format!(
+            "{} is disconnected{reason}. Give the GitHub App access to it again first.",
+            repo.full_name
+        ),
+    )
 }
 
 /// Repositories that are not being deleted, ordered by name; `id` narrows to one.
 fn load_repositories(conn: &Connection, id: Option<i64>) -> rusqlite::Result<Vec<Repository>> {
-    let mut embedded = conn.prepare(
-        "SELECT count(*) FROM chunks c
-         WHERE c.file_id IN (SELECT f.id FROM files f WHERE f.repo_id = ?1) AND c.embed_state = ?2",
-    )?;
+    let mut embedded =
+        conn.prepare("SELECT count(*) FROM chunks WHERE repo_id = ?1 AND embed_state = ?2")?;
     let mut active = conn.prepare(&format!(
         "SELECT {JOB_COLUMNS} FROM jobs WHERE repo_id = ?1 AND status IN ('queued', 'running')
          ORDER BY status = 'running' DESC, id DESC LIMIT 1"

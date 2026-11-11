@@ -9,7 +9,7 @@ use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 
 use crate::db::sql::{column_u64, placeholders};
-use crate::model::{RepoState, EMBED_PENDING};
+use crate::model::{JobStatus, RepoState, EMBED_PENDING};
 
 /// Subquery of the ids of connected repositories, for `… IN (CONNECTED_IDS)` inside other tables' queries.
 pub const CONNECTED_IDS: &str = "SELECT id FROM repositories WHERE state = 'connected'";
@@ -180,8 +180,10 @@ pub struct NewRepository {
 /// Inserts a `connected` repository and returns its id.
 pub fn insert(conn: &Connection, repo: &NewRepository) -> rusqlite::Result<i64> {
     conn.query_row(
-        "INSERT INTO repositories (github_id, installation_id, full_name, private, default_branch, added_by, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) RETURNING id",
+        "INSERT INTO repositories
+           (github_id, installation_id, full_name, private, default_branch, added_by, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         RETURNING id",
         params![
             repo.github_id,
             installation_param(repo.installation_id),
@@ -281,16 +283,31 @@ impl Target {
     }
 }
 
-/// Marks the target repositories (unless they are being deleted) as `disconnected` with `reason`.
-/// Returns the number of repositories changed.
-pub fn disconnect(conn: &Connection, target: Target, reason: &str) -> rusqlite::Result<usize> {
+/// Marks the target repositories (unless they are being deleted) as `disconnected` with `reason`
+/// and deletes their queued jobs, which no worker would claim. Returns the number of repositories
+/// changed.
+pub fn disconnect(conn: &mut Connection, target: Target, reason: &str) -> rusqlite::Result<usize> {
     let (condition, value) = target.condition();
-    conn.execute(
-        &format!(
-            "UPDATE repositories SET state = ?, state_reason = ? WHERE {condition} AND state != 'deleting'"
-        ),
-        params![RepoState::Disconnected, reason, value],
-    )
+    let savepoint = conn.savepoint()?;
+    let ids = savepoint
+        .prepare(&format!(
+            "UPDATE repositories SET state = ?, state_reason = ?
+             WHERE {condition} AND state != 'deleting'
+             RETURNING id"
+        ))?
+        .query_map(params![RepoState::Disconnected, reason, value], |row| {
+            row.get::<_, i64>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    {
+        let mut delete_queued =
+            savepoint.prepare_cached("DELETE FROM jobs WHERE repo_id = ?1 AND status = ?2")?;
+        for id in &ids {
+            delete_queued.execute(params![id, JobStatus::Queued])?;
+        }
+    }
+    savepoint.commit()?;
+    Ok(ids.len())
 }
 
 /// Marks the `disconnected` target repositories as `connected` through `installation_id` and returns their ids.

@@ -4,12 +4,16 @@ use axum::http::{header, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use ring::hmac;
 use serde_json::{json, Value};
 use sourcelens::config::Config;
+use sourcelens::crypto;
 use sourcelens::github::app::AppCredentials;
 use sourcelens::github::oauth::GhToken;
 use sourcelens::http;
 use sourcelens::http::session::create_session;
+use sourcelens::index::jobs;
+use sourcelens::model::Trigger;
 use sourcelens::state::{now, AppState};
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -44,6 +48,19 @@ async fn branch(Path((_o, _r, branch)): Path<(String, String, String)>) -> Respo
     }
 }
 
+/// The app is installed on `acme/api` only, through installation 99.
+async fn repo_installation(Path((owner, repo)): Path<(String, String)>) -> Response {
+    if (owner.as_str(), repo.as_str()) == ("acme", "api") {
+        Json(json!({ "id": 99 })).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "message": "Not Found" })),
+        )
+            .into_response()
+    }
+}
+
 async fn start_fake() -> String {
     let app = Router::new()
         .route(
@@ -51,6 +68,7 @@ async fn start_fake() -> String {
             post(|| async { (StatusCode::CREATED, Json(json!({ "token": "ghs_fake" }))) }),
         )
         .route("/repos/{o}/{r}", get(user_repo))
+        .route("/repos/{o}/{r}/installation", get(repo_installation))
         .route(
             "/repos/{o}/{r}/branches",
             get(|| async { Json(json!([{ "name": "main" }, { "name": "develop" }])) }),
@@ -411,4 +429,293 @@ async fn list_computes_effective_branch_and_jobs() {
     assert_eq!(detail["repository"]["id"].as_i64(), Some(a));
     assert_eq!(detail["jobs"].as_array().unwrap().len(), 3);
     assert_eq!(detail["skipped"], json!([]));
+}
+
+// ── Reconnect, disconnect, job bookkeeping ───────────────────────────────────
+
+impl Env {
+    /// Marks the repository disconnected the way the pipeline or a webhook does.
+    async fn disconnect_by_sql(&self, id: i64, reason: &str) {
+        let reason = reason.to_string();
+        self.state
+            .db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE repositories SET state = 'disconnected', state_reason = ?2 WHERE id = ?1",
+                    rusqlite::params![id, reason],
+                )?;
+                conn.execute("DELETE FROM jobs WHERE repo_id = ?1", [id])
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn repo_state(&self, id: i64) -> (String, Option<String>, i64) {
+        self.state
+            .db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT state, state_reason, installation_id FROM repositories WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+            })
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn sync_reconnects_a_disconnected_repository_github_confirms() {
+    let env = setup().await;
+    let (_, body) = env.connect().await;
+    let id = body["id"].as_i64().unwrap();
+    env.disconnect_by_sql(id, "GitHub App has no access").await;
+
+    let (status, job) = env
+        .call("POST", &format!("/api/repositories/{id}/sync"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{job}");
+    assert_eq!(job["status"], "queued");
+    assert_eq!(env.repo_state(id).await, ("connected".into(), None, 99));
+    assert_eq!(
+        env.jobs(id).await,
+        vec![("queued".into(), "manual".into(), false)]
+    );
+}
+
+#[tokio::test]
+async fn branch_change_reconnects_a_disconnected_repository_github_confirms() {
+    let env = setup().await;
+    let (_, body) = env.connect().await;
+    let id = body["id"].as_i64().unwrap();
+    env.disconnect_by_sql(id, "GitHub App suspended").await;
+
+    let (status, body) = env
+        .call(
+            "PATCH",
+            &format!("/api/repositories/{id}"),
+            Some(json!({ "branch": "develop" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "connected");
+    assert_eq!(body["effectiveBranch"], "develop");
+    assert_eq!(body["activeJob"]["status"], "queued");
+    assert_eq!(env.repo_state(id).await, ("connected".into(), None, 99));
+}
+
+#[tokio::test]
+async fn sync_without_github_access_reports_the_stored_reason() {
+    let env = setup().await;
+    let id: i64 = env
+        .state
+        .db
+        .write(|conn| {
+            conn.query_row(
+                "INSERT INTO repositories
+                   (github_id, installation_id, full_name, private, default_branch, state, state_reason, created_at)
+                 VALUES (7, 42, 'acme/gone', 0, 'main', 'disconnected', 'Access removed on GitHub', 0)
+                 RETURNING id",
+                [],
+                |row| row.get(0),
+            )
+        })
+        .await
+        .unwrap();
+
+    for (method, body) in [("POST", None), ("PATCH", Some(json!({ "branch": "main" })))] {
+        let uri = if method == "POST" {
+            format!("/api/repositories/{id}/sync")
+        } else {
+            format!("/api/repositories/{id}")
+        };
+        let (status, body) = env.call(method, &uri, body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{method} {body}");
+        assert_eq!(error_code(&body), "repository_disconnected");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Access removed on GitHub"),
+            "{body}"
+        );
+    }
+    assert_eq!(
+        env.repo_state(id).await,
+        (
+            "disconnected".into(),
+            Some("Access removed on GitHub".into()),
+            42
+        )
+    );
+    assert!(env.jobs(id).await.is_empty());
+}
+
+#[tokio::test]
+async fn webhook_disconnect_removes_the_queued_job() {
+    let env = setup().await;
+    let (_, body) = env.connect().await;
+    let id = body["id"].as_i64().unwrap();
+    assert_eq!(body["activeJob"]["status"], "queued");
+
+    let payload =
+        json!({ "action": "deleted", "repository": { "id": 5001, "full_name": "acme/api" } })
+            .to_string();
+    let key = hmac::Key::new(hmac::HMAC_SHA256, b"hook-secret");
+    let signature = format!(
+        "sha256={}",
+        crypto::hex(hmac::sign(&key, payload.as_bytes()).as_ref())
+    );
+    let request = Request::post("/webhooks/github")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-github-event", "repository")
+        .header("x-github-delivery", "deleted-1")
+        .header("x-hub-signature-256", signature)
+        .body(Body::from(payload))
+        .unwrap();
+    let response = http::router(env.state.clone())
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    assert!(env.jobs(id).await.is_empty());
+    let (status, list) = env.call("GET", "/api/repositories", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list[0]["state"], "disconnected");
+    assert_eq!(list[0]["stateReason"], "Deleted on GitHub");
+    assert_eq!(list[0]["activeJob"], Value::Null);
+}
+
+/// A state without GitHub credentials: every job fails at once with `app_not_configured`.
+async fn bare_state() -> (TempDir, AppState) {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = AppState::new(Config::new(PUBLIC_URL, tmp.path())).unwrap();
+    (tmp, state)
+}
+
+async fn insert_repo(state: &AppState, github_id: i64, repo_state: &str) -> i64 {
+    let repo_state = repo_state.to_string();
+    state
+        .db
+        .write(move |conn| {
+            conn.query_row(
+                "INSERT INTO repositories (github_id, installation_id, full_name, private, default_branch, state, created_at)
+                 VALUES (?1, 42, 'acme/repo-' || ?1, 0, 'main', ?2, 0)
+                 RETURNING id",
+                rusqlite::params![github_id, repo_state],
+                |row| row.get(0),
+            )
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn failed_result_write_is_retried_and_the_job_does_not_stay_running() {
+    let (_tmp, state) = bare_state().await;
+    let repo_id = insert_repo(&state, 1, "connected").await;
+    // The first two attempts at writing a final status fail, as on a full disk.
+    state
+        .db
+        .write(|conn| {
+            conn.execute_batch(
+                "CREATE TABLE test_result_failures (remaining INTEGER NOT NULL);
+                 INSERT INTO test_result_failures VALUES (2);
+                 CREATE TRIGGER test_fail_result BEFORE UPDATE OF status ON jobs
+                 WHEN NEW.status IN ('succeeded', 'failed')
+                   AND (SELECT remaining FROM test_result_failures) > 0
+                 BEGIN
+                   UPDATE test_result_failures SET remaining = remaining - 1;
+                   SELECT RAISE(FAIL, 'simulated full disk');
+                 END;",
+            )
+        })
+        .await
+        .unwrap();
+    jobs::enqueue(&state, repo_id, Trigger::Manual, None, false)
+        .await
+        .unwrap();
+
+    assert!(jobs::run_next(&state).await.unwrap());
+    let (status, error, remaining): (String, Option<String>, i64) = state
+        .db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT status, error, (SELECT remaining FROM test_result_failures)
+                 FROM jobs WHERE repo_id = ?1",
+                [repo_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!((status.as_str(), remaining), ("failed", 0));
+    assert!(error.is_some());
+}
+
+#[tokio::test]
+async fn startup_reconcile_continues_after_a_failing_repository() {
+    let (_tmp, state) = bare_state().await;
+    // The failing repositories come first, so an early return would skip the others.
+    let enqueue_fails = insert_repo(&state, 1, "connected").await;
+    let purge_fails = insert_repo(&state, 2, "deleting").await;
+    let first = insert_repo(&state, 3, "connected").await;
+    let purged = insert_repo(&state, 4, "deleting").await;
+    let second = insert_repo(&state, 5, "connected").await;
+    state
+        .db
+        .write(move |conn| {
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER test_fail_enqueue BEFORE INSERT ON jobs WHEN NEW.repo_id = {enqueue_fails}
+                 BEGIN SELECT RAISE(ABORT, 'simulated enqueue failure'); END;
+                 CREATE TRIGGER test_fail_purge BEFORE DELETE ON repositories WHEN OLD.id = {purge_fails}
+                 BEGIN SELECT RAISE(ABORT, 'simulated purge failure'); END;"
+            ))
+        })
+        .await
+        .unwrap();
+
+    jobs::recover_and_reconcile(&state).await.unwrap();
+
+    let queued: Vec<(i64, String)> = state
+        .db
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT repo_id, trigger FROM jobs WHERE status = 'queued' ORDER BY repo_id",
+            )?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok::<_, rusqlite::Error>(rows)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        queued,
+        vec![(first, "startup".into()), (second, "startup".into())]
+    );
+
+    // Purges run in the background.
+    let mut remaining = Vec::new();
+    for _ in 0..400 {
+        remaining = state
+            .db
+            .read(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT id FROM repositories WHERE state = 'deleting' ORDER BY id")?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, i64>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok::<_, rusqlite::Error>(rows)
+            })
+            .await
+            .unwrap();
+        if !remaining.contains(&purged) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(remaining, vec![purge_fails]);
 }
