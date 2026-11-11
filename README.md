@@ -238,12 +238,73 @@ Configure the app like the one SourceLens would create: repository permissions `
 
 A production setup needs:
 
-- **A public HTTPS URL that GitHub can reach.** GitHub delivers push webhooks to `<public URL>/webhooks/github` and sends users back to `<public URL>/auth/github/callback` after sign-in. Put SourceLens behind a reverse proxy that terminates TLS and set `SOURCELENS_PUBLIC_URL` to the HTTPS URL.
+- **A URL that your users' browsers can open.** Set `SOURCELENS_PUBLIC_URL` to it; HTTPS through a reverse proxy that terminates TLS is recommended. It does not have to be reachable from the internet: only the webhook path must be, and only if pushes should be indexed automatically (see [Network exposure](#network-exposure)).
 - **The final URL before you create the GitHub App.** The app stores the webhook URL and callback URL from the moment it is created. An app created for a `localhost` URL has its webhook switched off, so set up the production instance with its final URL from the start (a fresh data volume runs the setup again). If the URL changes later, set the new `SOURCELENS_PUBLIC_URL` and update the app on GitHub: `https://github.com/settings/apps/<slug>` for an app on a personal account, `https://github.com/organizations/<org>/settings/apps/<slug>` for an organization app. Change "Homepage URL", "Callback URL", "Setup URL" and, under "Webhook", the webhook URL.
 - **A persistent volume for `/data`.** It holds the SQLite database with the indexed source code of every connected repository, and `secret.key`. Treat it like the source code itself: restrict access and back it up. Without `secret.key` (or the same `SOURCELENS_SECRET_KEY`), the stored GitHub App credentials cannot be decrypted.
 - **One instance per team.** Every member can search every connected repository, and every member can connect any repository that both they and the GitHub App can read. Run separate instances for groups that must not see each other's code.
 
 The container listens on port 3000, runs as a non-root user (uid 10001) and has a Docker health check on `GET /healthz`. If you mount a host directory instead of a named volume at `/data`, it must be writable by uid 10001.
+
+### Network exposure
+
+SourceLens can run inside a company network with the UI, the API and the MCP endpoint reachable only from there. The only request that comes from the internet is GitHub's webhook delivery, and that one is optional.
+
+| Endpoint | Called by | Must be reachable from |
+|---|---|---|
+| `POST /webhooks/github` | GitHub's webhook servers | The internet, only if pushes should be indexed automatically |
+| `GET /auth/github/login`, `GET /auth/github/callback` | The user's browser, sent to and back from github.com during sign-in | Users' browsers |
+| `GET /auth/github/app-created`, `GET /repositories?installed=1` | The user's browser, sent back from github.com after creating and after installing the GitHub App | Users' browsers |
+| `/` and the static assets of the UI | Users' browsers | Users' browsers |
+| `/api/*` | The UI | Users' browsers |
+| `POST /mcp` | Agents | Machines that run agents |
+| `GET /healthz` | The container health check, load balancers | The host or orchestrator |
+
+- **`/webhooks/github`** checks the `X-Hub-Signature-256` header, an HMAC-SHA256 of the raw body with the app's webhook secret. A request without a valid signature gets 401 (`invalid_signature`); if no webhook secret is configured, every request gets 404 (`webhooks_disabled`). Bodies are limited to 8 MiB, and a repeated delivery ID is answered 200 and ignored. Without webhooks, "Sync now" and the index job that runs for every repository at each start keep the index current.
+- **Sign-in, app creation and installation** need nothing public. GitHub only redirects the user's browser to these URLs; the server then exchanges the code with GitHub through outbound calls. `SOURCELENS_PUBLIC_URL` can therefore be an internal hostname that resolves only inside the network, as long as your users' browsers can open it. The browsers themselves need `github.com` (and `avatars.githubusercontent.com` for avatars in the UI).
+- **`/api/*`** requires the session cookie set after GitHub sign-in (except `GET /api/state`, which the UI reads before sign-in). Requests other than `GET`, `HEAD` and `OPTIONS` must also carry an `Origin` header equal to the origin of `SOURCELENS_PUBLIC_URL` (or `SOURCELENS_DEV_ORIGIN`); others get 403 (`origin_not_allowed`).
+- **`/mcp`** requires an API key; requests from browsers are accepted only from the origin of `SOURCELENS_PUBLIC_URL`. It needs to be reachable from outside only for agents that do not run inside the network, for example hosted agents or CI runners. The API key is then the only protection: 256 random bits, stored as a SHA-256 hash, limited to the repositories chosen for the key, with an optional expiry, revocable at once. The per-key rate limit counts only requests with a valid key, so add a rate limit on the reverse proxy and forward nothing but `POST /mcp` from outside.
+
+Outbound, the server connects to:
+
+| Host | Used for |
+|---|---|
+| `api.github.com` | GitHub REST API: app and installation tokens, branches, file trees, file contents, repository archives, the signed-in user, member lookup, the conversion of the app manifest |
+| `github.com` | OAuth: exchanging the sign-in code for a token and refreshing it (`/login/oauth/access_token`) |
+| `codeload.github.com` | Repository archives: GitHub answers the archive request on `api.github.com` with a redirect to this host, which the server follows. Archives are used when more than 200 files changed or GitHub truncates the file tree of a very large repository |
+| The embeddings base URL | Embeddings, only if configured |
+
+The server's HTTP client uses the proxy given in `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` and skips it for hosts listed in `NO_PROXY` (for example an internal embeddings server).
+
+#### Private network with webhooks
+
+To have pushes indexed automatically, let GitHub reach `POST /webhooks/github` and nothing else. The webhook handler does not look at the `Host` header, is not subject to the `Origin` check and does not use `SOURCELENS_PUBLIC_URL`, so the delivery can arrive through any hostname as long as the path, method, headers and body reach the instance unchanged.
+
+(a) **Same hostname, split DNS.** Inside the network, the hostname of `SOURCELENS_PUBLIC_URL` resolves to the instance. On the internet, it resolves to a reverse proxy that forwards only the webhook. A Caddyfile for that proxy (`10.0.0.12:3000` stands for the instance):
+
+```text
+sourcelens.example.com {
+	@webhook {
+		method POST
+		path /webhooks/github
+	}
+	handle @webhook {
+		reverse_proxy 10.0.0.12:3000
+	}
+	handle {
+		respond 404
+	}
+}
+```
+
+(b) **Separate public hostname or tunnel**, for example `https://hooks.example.com/webhooks/github` forwarded to the instance. A GitHub App created on `/setup` stores `<SOURCELENS_PUBLIC_URL>/webhooks/github`, so after creating it, change the webhook URL in the app's settings on GitHub (see the settings URLs under the requirements above). Or create the app yourself with the public webhook URL and pass it through the `SOURCELENS_GITHUB_*` variables ([GitHub App from the environment](#github-app-from-the-environment)).
+
+In case (b), Settings → GitHub in SourceLens still shows `<SOURCELENS_PUBLIC_URL>/webhooks/github` as the webhook URL, not the URL configured on GitHub. Its webhook state only reflects the configuration: "Active" whenever a webhook secret exists and `SOURCELENS_PUBLIC_URL` is not `localhost`, `127.0.0.1` or `::1`. "Last delivery" shows whether deliveries actually arrive.
+
+GitHub publishes the source address ranges of webhook deliveries under `hooks` in `https://api.github.com/meta`; use them for an allowlist on the proxy.
+
+#### Private network without webhooks
+
+If GitHub cannot reach the instance at all, SourceLens still works: use "Sync now", and every start indexes what changed. Note that an internal hostname is not `localhost`, so the app created on `/setup` asks GitHub for an active webhook at `<SOURCELENS_PUBLIC_URL>/webhooks/github`. GitHub's deliveries to it fail without effect on SourceLens. Settings → GitHub can still show the webhook as "Active", because that state reflects only the configuration; "Last delivery" stays at "No deliveries yet". To stop the failed deliveries, switch the webhook off in the GitHub App settings ("Active" under "Webhook").
 
 ### Docker Compose behind Caddy
 
@@ -364,7 +425,7 @@ Use `127.0.0.1` (not `localhost`) in `SOURCELENS_PUBLIC_URL` so the session cook
 - GitHub only (github.com). No GitLab, Bitbucket or GitHub Enterprise Server.
 - Read-only. SourceLens never writes to GitHub, and the MCP tools only read the index.
 - One branch per repository.
-- Webhooks need a public URL. Without one, use "Sync now". There is no periodic polling.
+- Indexing on push needs GitHub to reach `POST /webhooks/github`. Without that, use "Sync now". There is no periodic polling.
 - Failed index jobs are not retried automatically. The next push, a restart or "Sync now" runs the job again.
 - Members share access: every member can search all connected repositories. Only the owner manages members and embedding settings.
 - Embeddings only through the OpenAI-compatible `/embeddings` API.
