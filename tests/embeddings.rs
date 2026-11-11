@@ -1,5 +1,7 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::State;
@@ -7,19 +9,23 @@ use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use sourcelens::config::Config;
 use sourcelens::crypto::git_blob_sha1;
 use sourcelens::github::app::AppCredentials;
 use sourcelens::github::oauth::GhToken;
 use sourcelens::http::session::{create_session, SESSION_COOKIE};
-use sourcelens::index::embed::{self, EmbedError, Embedder, EmbeddingSettingsInput};
+use sourcelens::index::embed::{self, EmbeddingConfig, EmbeddingSettingsInput};
+use sourcelens::index::embedder::{EmbedError, Embedder};
 use sourcelens::index::store;
+use sourcelens::repositories::{self, Target};
 use sourcelens::search::{self, Filter, SearchRequest};
 use sourcelens::state::AppState;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+const CONNECTION_TEST_INPUT: &str = "sourcelens connection test";
 const ORIGIN: &str = "http://localhost:3000";
 
 // ── fake embedding provider ─────────────────────────────────────────────────
@@ -50,6 +56,33 @@ struct FakeState {
     max_batch: Mutex<Option<usize>>,
     /// 400 when any input contains this marker.
     reject_marker: Mutex<Option<String>>,
+    /// Raw `(status, body)` responses served before everything else.
+    raw_script: Mutex<VecDeque<(u16, String)>>,
+    /// While set, embedding requests (not the connection test) wait here for a permit.
+    gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Requests that reached the gate.
+    gated: AtomicUsize,
+    /// Latency added to every request.
+    delay: Mutex<Option<Duration>>,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+}
+
+/// Counts a request as in flight until dropped.
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl<'a> InFlight<'a> {
+    fn enter(state: &'a FakeState) -> Self {
+        let now = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        state.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        Self(&state.in_flight)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 struct Fake {
@@ -95,6 +128,38 @@ impl Fake {
     fn set_reject_marker(&self, marker: Option<&str>) {
         *self.state.reject_marker.lock().unwrap() = marker.map(str::to_string);
     }
+
+    fn script_raw(&self, status: u16, body: &str) {
+        self.state
+            .raw_script
+            .lock()
+            .unwrap()
+            .push_back((status, body.to_string()));
+    }
+
+    /// Holds every embedding request until `open_gate`.
+    fn close_gate(&self) {
+        *self.state.gate.lock().unwrap() = Some(Arc::new(tokio::sync::Semaphore::new(0)));
+    }
+
+    /// Releases the held requests and lets later ones through.
+    fn open_gate(&self) {
+        if let Some(gate) = self.state.gate.lock().unwrap().take() {
+            gate.add_permits(10_000);
+        }
+    }
+
+    fn gated(&self) -> usize {
+        self.state.gated.load(Ordering::SeqCst)
+    }
+
+    fn set_delay(&self, delay: Option<Duration>) {
+        *self.state.delay.lock().unwrap() = delay;
+    }
+
+    fn max_in_flight(&self) -> usize {
+        self.state.max_in_flight.load(Ordering::SeqCst)
+    }
 }
 
 /// Deterministic, deliberately not normalised vectors. Inputs mentioning "zebra" or "frobnicate"
@@ -123,6 +188,22 @@ async fn fake_embeddings(
     };
     let inputs = recorded.inputs();
     state.requests.lock().unwrap().push(recorded);
+    let _in_flight = InFlight::enter(&state);
+    let gate = state.gate.lock().unwrap().clone();
+    if let Some(gate) = gate {
+        if !inputs.iter().any(|i| i == CONNECTION_TEST_INPUT) {
+            state.gated.fetch_add(1, Ordering::SeqCst);
+            gate.acquire().await.unwrap().forget();
+        }
+    }
+    let delay = *state.delay.lock().unwrap();
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
+    }
+    let raw = state.raw_script.lock().unwrap().pop_front();
+    if let Some((status, body)) = raw {
+        return (StatusCode::from_u16(status).unwrap(), body).into_response();
+    }
 
     let scripted = state.script.lock().unwrap().pop_front();
     if let Some((status, retry_after)) = scripted {
@@ -175,13 +256,15 @@ fn new_state(tmp: &TempDir) -> AppState {
 
 fn settings_input(fake: &Fake) -> EmbeddingSettingsInput {
     EmbeddingSettingsInput {
-        enabled: true,
-        base_url: fake.base_url.clone(),
-        model: "fake-embed".into(),
-        request_dimensions: None,
-        query_prefix: "query: ".into(),
-        document_prefix: "doc: ".into(),
-        batch_size: 2,
+        config: EmbeddingConfig {
+            enabled: true,
+            base_url: fake.base_url.clone(),
+            model: "fake-embed".into(),
+            request_dimensions: None,
+            query_prefix: "query: ".into(),
+            document_prefix: "doc: ".into(),
+            batch_size: 2,
+        },
         api_key: None,
         clear_api_key: None,
     }
@@ -278,15 +361,27 @@ async fn index_sample(state: &AppState, repo_id: i64) {
     .await;
 }
 
-async fn insert_job(state: &AppState, repo_id: i64) -> i64 {
+/// Starts a job the way a worker claims one: the repository's queued job becomes running; without
+/// one, a running job is inserted.
+async fn start_job(state: &AppState, repo_id: i64) -> i64 {
     state
         .db
         .write(move |c| {
-            c.query_row(
-                "INSERT INTO jobs (repo_id, status, trigger, created_at) VALUES (?1, 'running', 'manual', 0) RETURNING id",
-                [repo_id],
-                |r| r.get(0),
-            )
+            let claimed: Option<i64> = c
+                .query_row(
+                    "UPDATE jobs SET status = 'running' WHERE repo_id = ?1 AND status = 'queued' RETURNING id",
+                    [repo_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match claimed {
+                Some(id) => Ok(id),
+                None => c.query_row(
+                    "INSERT INTO jobs (repo_id, status, trigger, created_at) VALUES (?1, 'running', 'manual', 0) RETURNING id",
+                    [repo_id],
+                    |r| r.get(0),
+                ),
+            }
         })
         .await
         .unwrap()
@@ -499,14 +594,14 @@ async fn disabled_embeddings_leave_the_job_untouched() {
     let state = new_state(&tmp);
     let fake = Fake::start().await;
     let repo = insert_repo(&state, "acme/api", "connected").await;
-    let job = insert_job(&state, repo).await;
+    let job = start_job(&state, repo).await;
 
     assert_eq!(embed::embed_pending(&state, repo, job).await.unwrap(), 0);
 
     let mut disabled = settings_input(&fake);
-    disabled.enabled = false;
+    disabled.config.enabled = false;
     let (saved, queued) = embed::apply_settings(&state, disabled).await.unwrap();
-    assert!(!saved.enabled);
+    assert!(!saved.config.enabled);
     assert_eq!(queued, 0);
     assert_eq!(embed::embed_pending(&state, repo, job).await.unwrap(), 0);
 
@@ -527,7 +622,7 @@ async fn embed_pending_embeds_every_chunk_in_batches() {
     let total = scalar(&state, "SELECT count(*) FROM chunks").await;
     assert!(total >= 3, "fixture produced {total} chunks");
     let before = fake.request_count();
-    let job = insert_job(&state, repo).await;
+    let job = start_job(&state, repo).await;
 
     let embedded = embed::embed_pending(&state, repo, job).await.unwrap();
 
@@ -590,10 +685,10 @@ async fn embed_pending_requests_dimensions_when_configured() {
     let repo = insert_repo(&state, "acme/api", "connected").await;
     index_sample(&state, repo).await;
     let mut input = settings_input(&fake);
-    input.request_dimensions = Some(3);
+    input.config.request_dimensions = Some(3);
     let (saved, _) = embed::apply_settings(&state, input).await.unwrap();
     assert_eq!(saved.dimensions, Some(3));
-    let job = insert_job(&state, repo).await;
+    let job = start_job(&state, repo).await;
 
     embed::embed_pending(&state, repo, job).await.unwrap();
 
@@ -620,7 +715,7 @@ async fn embed_pending_survives_rate_limits_and_splits_batches() {
     fake.script(&[(429, Some("0"))]);
     fake.set_max_batch(Some(1));
     let before = fake.request_count();
-    let job = insert_job(&state, repo).await;
+    let job = start_job(&state, repo).await;
     let embedded = embed::embed_pending(&state, repo, job).await.unwrap();
 
     assert_eq!(i64::from(embedded), total);
@@ -654,7 +749,7 @@ async fn rejected_chunk_is_marked_failed_and_the_rest_continues() {
         .unwrap();
     let total = scalar(&state, "SELECT count(*) FROM chunks").await;
     fake.set_reject_marker(Some("REJECTME"));
-    let job = insert_job(&state, repo).await;
+    let job = start_job(&state, repo).await;
 
     let embedded = embed::embed_pending(&state, repo, job).await.unwrap();
 
@@ -694,9 +789,10 @@ async fn provider_failure_fails_the_job_and_keeps_chunks_pending() {
         .await
         .unwrap();
     let total = scalar(&state, "SELECT count(*) FROM chunks").await;
-    fake.script(&[(500, Some("0")); 5]);
+    // The provider is down for every request of every concurrent batch.
+    fake.script(&[(500, Some("0")); 100]);
     let before = fake.request_count();
-    let job = insert_job(&state, repo).await;
+    let job = start_job(&state, repo).await;
 
     let err = embed::embed_pending(&state, repo, job).await.unwrap_err();
 
@@ -705,7 +801,11 @@ async fn provider_failure_fails_the_job_and_keeps_chunks_pending() {
         "{}",
         err.message
     );
-    assert_eq!(fake.request_count() - before, 5);
+    let sent = fake.request_count() - before;
+    assert!(
+        (5..=5 * IN_FLIGHT).contains(&sent),
+        "{sent} requests: one batch must use all five attempts, nothing beyond the batches in flight"
+    );
     assert_eq!(
         scalar(&state, "SELECT count(*) FROM chunks WHERE embed_state = 0").await,
         total
@@ -727,7 +827,7 @@ async fn identical_settings_keep_vectors_and_changes_reset_them() {
         .await
         .unwrap();
     assert_eq!(queued, 2);
-    let job = insert_job(&state, r1).await;
+    let job = start_job(&state, r1).await;
     embed::embed_pending(&state, r1, job).await.unwrap();
     let total = scalar(&state, "SELECT count(*) FROM chunks").await;
     assert_eq!(
@@ -741,7 +841,7 @@ async fn identical_settings_keep_vectors_and_changes_reset_them() {
         .unwrap();
     assert_eq!(queued, 0);
     let mut input = settings_input(&fake);
-    input.query_prefix = "search_query: ".into();
+    input.config.query_prefix = "search_query: ".into();
     let (_, queued) = embed::apply_settings(&state, input).await.unwrap();
     assert_eq!(queued, 0);
     assert_eq!(
@@ -755,7 +855,7 @@ async fn identical_settings_keep_vectors_and_changes_reset_them() {
 
     // Another model: table recreated, everything pending again.
     let mut input = settings_input(&fake);
-    input.model = "other-model".into();
+    input.config.model = "other-model".into();
     let (_, queued) = embed::apply_settings(&state, input.clone()).await.unwrap();
     assert_eq!(queued, 2);
     assert_eq!(scalar(&state, "SELECT count(*) FROM vec_chunks").await, 0);
@@ -765,12 +865,13 @@ async fn identical_settings_keep_vectors_and_changes_reset_them() {
     );
 
     // Another document prefix: same.
+    let job = start_job(&state, r1).await;
     embed::embed_pending(&state, r1, job).await.unwrap();
     assert_eq!(
         scalar(&state, "SELECT count(*) FROM vec_chunks").await,
         total
     );
-    input.document_prefix = "search_document: ".into();
+    input.config.document_prefix = "search_document: ".into();
     let (_, queued) = embed::apply_settings(&state, input).await.unwrap();
     assert_eq!(queued, 2);
     assert_eq!(scalar(&state, "SELECT count(*) FROM vec_chunks").await, 0);
@@ -792,7 +893,7 @@ async fn vectors_make_search_hybrid_with_semantic_only_hits() {
     embed::apply_settings(&state, settings_input(&fake))
         .await
         .unwrap();
-    let job = insert_job(&state, repo).await;
+    let job = start_job(&state, repo).await;
     embed::embed_pending(&state, repo, job).await.unwrap();
 
     let response = search::search(
@@ -1135,4 +1236,418 @@ async fn search_endpoint_scopes_to_connected_repositories() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "empty_query");
+}
+
+// ── embed phase: stop conditions and concurrency ───────────────────────────
+
+/// Waits up to five seconds for `done`.
+async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    for _ in 0..500 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// Twelve function chunks, i.e. six batches at batch size 2. Returns the chunk count.
+async fn index_many(state: &AppState, repo_id: i64) -> i64 {
+    index_files(
+        state,
+        repo_id,
+        &[("src/lib.rs", functions_source("alpha", 12))],
+    )
+    .await;
+    scalar(state, "SELECT count(*) FROM chunks").await
+}
+
+fn spawn_embed(
+    state: &AppState,
+    repo_id: i64,
+    job_id: i64,
+) -> tokio::task::JoinHandle<sourcelens::error::ApiResult<u32>> {
+    let state = state.clone();
+    tokio::spawn(async move { embed::embed_pending(&state, repo_id, job_id).await })
+}
+
+async fn finish_job(state: &AppState, job_id: i64) {
+    state
+        .db
+        .write(move |c| {
+            c.execute(
+                "UPDATE jobs SET status = 'succeeded' WHERE id = ?1",
+                [job_id],
+            )
+        })
+        .await
+        .unwrap();
+}
+
+/// The embed phase keeps four requests in flight; with six batches pending and the provider holding
+/// every request, exactly four arrive before anything completes.
+const IN_FLIGHT: usize = 4;
+
+#[tokio::test]
+async fn settings_saved_during_embedding_stop_the_running_job() {
+    let tmp = TempDir::new().unwrap();
+    let state = new_state(&tmp);
+    let fake = Fake::start().await;
+    let repo = insert_repo(&state, "acme/api", "connected").await;
+    let total = index_many(&state, repo).await;
+    embed::apply_settings(&state, settings_input(&fake))
+        .await
+        .unwrap();
+    let job = start_job(&state, repo).await;
+
+    fake.close_gate();
+    let running = spawn_embed(&state, repo, job);
+    wait_until("requests of the old settings", || fake.gated() == IN_FLIGHT).await;
+
+    // Same model and dimensions, another document prefix.
+    let mut changed = settings_input(&fake);
+    changed.config.document_prefix = "new: ".into();
+    let (_, queued) = embed::apply_settings(&state, changed).await.unwrap();
+    assert_eq!(queued, 1);
+    fake.open_gate();
+
+    assert_eq!(running.await.unwrap().unwrap(), 0);
+    assert_eq!(
+        scalar(&state, "SELECT count(*) FROM vec_chunks").await,
+        0,
+        "a vector of the old settings was stored after the change"
+    );
+    assert_eq!(
+        scalar(&state, "SELECT count(*) FROM chunks WHERE embed_state = 0").await,
+        total
+    );
+
+    // The queued `settings` job embeds everything with the new prefix.
+    finish_job(&state, job).await;
+    let next = start_job(&state, repo).await;
+    assert_ne!(next, job);
+    let trigger: String = state
+        .db
+        .read(move |c| {
+            c.query_row("SELECT trigger FROM jobs WHERE id = ?1", [next], |r| {
+                r.get(0)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(trigger, "settings");
+    let before = fake.request_count();
+    let embedded = embed::embed_pending(&state, repo, next).await.unwrap();
+    assert_eq!(i64::from(embedded), total);
+    let inputs: Vec<String> = fake.requests()[before..]
+        .iter()
+        .flat_map(Recorded::inputs)
+        .collect();
+    assert_eq!(inputs.len() as i64, total);
+    assert!(inputs.iter().all(|i| i.starts_with("new: ")), "{inputs:?}");
+    assert_eq!(
+        scalar(&state, "SELECT count(*) FROM vec_chunks").await,
+        total
+    );
+}
+
+#[tokio::test]
+async fn disconnect_during_embedding_fails_the_job_and_stops_requests() {
+    let tmp = TempDir::new().unwrap();
+    let state = new_state(&tmp);
+    let fake = Fake::start().await;
+    let repo = insert_repo(&state, "acme/api", "connected").await;
+    let total = index_many(&state, repo).await;
+    embed::apply_settings(&state, settings_input(&fake))
+        .await
+        .unwrap();
+    let job = start_job(&state, repo).await;
+
+    fake.close_gate();
+    let before = fake.request_count();
+    let running = spawn_embed(&state, repo, job);
+    wait_until("embedding requests", || fake.gated() == IN_FLIGHT).await;
+    state
+        .db
+        .write(move |c| repositories::disconnect(c, Target::Id(repo), "Access removed on GitHub"))
+        .await
+        .unwrap();
+    fake.open_gate();
+
+    let err = running.await.unwrap().unwrap_err();
+    assert_eq!(err.message, "Repository was disconnected.");
+    let sent = fake.request_count();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        fake.request_count(),
+        sent,
+        "the provider was called after the job failed"
+    );
+    let batches = (total + 1) / 2;
+    assert!(
+        ((sent - before) as i64) < batches,
+        "every batch was requested"
+    );
+    assert_eq!(scalar(&state, "SELECT count(*) FROM vec_chunks").await, 0);
+}
+
+#[tokio::test]
+async fn queued_job_makes_the_embed_phase_hand_over() {
+    let tmp = TempDir::new().unwrap();
+    let state = new_state(&tmp);
+    let fake = Fake::start().await;
+    let repo = insert_repo(&state, "acme/api", "connected").await;
+    let total = index_many(&state, repo).await;
+    embed::apply_settings(&state, settings_input(&fake))
+        .await
+        .unwrap();
+    let job = start_job(&state, repo).await;
+
+    fake.close_gate();
+    let running = spawn_embed(&state, repo, job);
+    wait_until("embedding requests", || fake.gated() == IN_FLIGHT).await;
+    // A push arrives.
+    state
+        .db
+        .write(move |c| {
+            c.execute(
+                "INSERT INTO jobs (repo_id, status, trigger, created_at) VALUES (?1, 'queued', 'webhook', 0)",
+                [repo],
+            )
+        })
+        .await
+        .unwrap();
+    fake.open_gate();
+
+    let embedded = i64::from(running.await.unwrap().unwrap());
+    assert!(embedded < total, "the phase did not return early");
+    assert_eq!(
+        scalar(&state, "SELECT count(*) FROM chunks WHERE embed_state = 0").await,
+        total - embedded
+    );
+    assert_eq!(
+        scalar(&state, "SELECT count(*) FROM vec_chunks").await,
+        embedded
+    );
+}
+
+#[tokio::test]
+async fn batches_run_concurrently_and_each_chunk_is_embedded_once() {
+    let tmp = TempDir::new().unwrap();
+    let state = new_state(&tmp);
+    let fake = Fake::start().await;
+    let repo = insert_repo(&state, "acme/api", "connected").await;
+    let total = index_many(&state, repo).await;
+    embed::apply_settings(&state, settings_input(&fake))
+        .await
+        .unwrap();
+    let job = start_job(&state, repo).await;
+    fake.set_delay(Some(Duration::from_millis(50)));
+    let before = fake.request_count();
+
+    let embedded = embed::embed_pending(&state, repo, job).await.unwrap();
+
+    assert_eq!(i64::from(embedded), total);
+    assert!(fake.max_in_flight() > 1, "requests were sequential");
+    let inputs: Vec<String> = fake.requests()[before..]
+        .iter()
+        .flat_map(Recorded::inputs)
+        .collect();
+    assert_eq!(inputs.len() as i64, total);
+    assert_eq!(inputs.iter().collect::<HashSet<_>>().len() as i64, total);
+    assert_eq!(
+        scalar(&state, "SELECT count(*) FROM vec_chunks").await,
+        total
+    );
+    assert_eq!(
+        scalar(&state, "SELECT count(*) FROM chunks WHERE embed_state = 1").await,
+        total
+    );
+}
+
+// ── saved API key and provider errors ──────────────────────────────────────
+
+#[tokio::test]
+async fn saved_api_key_is_only_sent_to_its_base_url() {
+    let tmp = TempDir::new().unwrap();
+    let state = new_state(&tmp);
+    let saved_provider = Fake::start().await;
+    let other_provider = Fake::start().await;
+    let app = sourcelens::http::router(state.clone());
+    let owner = session_for(&state, "alex", "owner").await;
+
+    let mut body = settings_body(&saved_provider);
+    body["apiKey"] = json!("sk-secret-123");
+    let (status, _, text) = call(&app, "PUT", "/api/settings/embeddings", &owner, Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+
+    // The saved base URL (a trailing slash does not matter) keeps using the saved key.
+    let mut same = settings_body(&saved_provider);
+    same["baseUrl"] = json!(format!("{}/", saved_provider.base_url));
+    let (status, body, _) = call(
+        &app,
+        "POST",
+        "/api/settings/embeddings/test",
+        &owner,
+        Some(same),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+    assert_eq!(
+        saved_provider
+            .requests()
+            .last()
+            .unwrap()
+            .authorization
+            .as_deref(),
+        Some("Bearer sk-secret-123")
+    );
+
+    // A new base URL without a key is refused before any request is sent.
+    for (method, path) in [
+        ("POST", "/api/settings/embeddings/test"),
+        ("PUT", "/api/settings/embeddings"),
+    ] {
+        let (status, body, _) = call(
+            &app,
+            method,
+            path,
+            &owner,
+            Some(settings_body(&other_provider)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{method} {path}");
+        assert_eq!(body["error"]["code"], "api_key_required");
+    }
+    assert_eq!(other_provider.request_count(), 0);
+
+    // With its own key the new base URL is accepted.
+    let mut with_key = settings_body(&other_provider);
+    with_key["apiKey"] = json!("sk-other");
+    let (status, _, text) = call(
+        &app,
+        "PUT",
+        "/api/settings/embeddings",
+        &owner,
+        Some(with_key),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        other_provider
+            .requests()
+            .last()
+            .unwrap()
+            .authorization
+            .as_deref(),
+        Some("Bearer sk-other")
+    );
+}
+
+#[tokio::test]
+async fn provider_error_bodies_are_not_echoed() {
+    let tmp = TempDir::new().unwrap();
+    let state = new_state(&tmp);
+    let fake = Fake::start().await;
+    let app = sourcelens::http::router(state.clone());
+    let owner = session_for(&state, "alex", "owner").await;
+
+    fake.script_raw(404, "<html>admin console of 10.0.0.7</html>");
+    let (_, body, _) = call(
+        &app,
+        "POST",
+        "/api/settings/embeddings/test",
+        &owner,
+        Some(settings_body(&fake)),
+    )
+    .await;
+    assert_eq!(body["ok"], false);
+    let error = body["error"].as_str().unwrap();
+    assert!(error.contains("404"), "{error}");
+    assert!(!error.contains("10.0.0.7"), "{error}");
+
+    fake.script_raw(
+        401,
+        r#"{"error":{"message":"invalid api key"},"detail":"trace id 98765"}"#,
+    );
+    let (_, body, _) = call(
+        &app,
+        "POST",
+        "/api/settings/embeddings/test",
+        &owner,
+        Some(settings_body(&fake)),
+    )
+    .await;
+    assert_eq!(body["ok"], false);
+    let error = body["error"].as_str().unwrap();
+    assert!(
+        error.contains("401") && error.contains("invalid api key"),
+        "{error}"
+    );
+    assert!(!error.contains("98765"), "{error}");
+}
+
+// ── HTTP: /api/search/languages and the search rate limit ──────────────────
+
+#[tokio::test]
+async fn languages_endpoint_lists_connected_repositories_only() {
+    let tmp = TempDir::new().unwrap();
+    let state = new_state(&tmp);
+    let app = sourcelens::http::router(state.clone());
+    let member = session_for(&state, "sam", "member").await;
+    let r1 = insert_repo(&state, "acme/api", "connected").await;
+    let r2 = insert_repo(&state, "acme/old", "disconnected").await;
+    index_sample(&state, r1).await;
+    index_files(
+        &state,
+        r2,
+        &[("main.go", "package main\n\nfunc main() {}\n".to_string())],
+    )
+    .await;
+
+    let (status, body, text) = call(&app, "GET", "/api/search/languages", &member, None).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(body, json!({ "languages": ["python", "rust"] }));
+}
+
+#[tokio::test]
+async fn search_is_rate_limited_per_user() {
+    let tmp = TempDir::new().unwrap();
+    let state = new_state(&tmp);
+    let app = sourcelens::http::router(state.clone());
+    let member = session_for(&state, "sam", "member").await;
+
+    let mut accepted = 0;
+    let mut limited = None;
+    for _ in 0..200 {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/search")
+            .header("cookie", &member)
+            .header("origin", ORIGIN)
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "query": "frobnicate" }).to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            limited = Some(response);
+            break;
+        }
+        assert_eq!(response.status(), StatusCode::OK);
+        accepted += 1;
+    }
+    let response = limited.expect("searches were never rate limited");
+    assert!(accepted >= 20, "limited after {accepted} searches");
+    let retry_after: u64 = response.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(retry_after >= 1);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["code"], "rate_limited");
 }

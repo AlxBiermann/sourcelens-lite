@@ -1,18 +1,23 @@
 use axum::extract::State;
-use axum::routing::post;
+use axum::http::header::RETRY_AFTER;
+use axum::http::{HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult};
 use crate::http::session::AuthUser;
 use crate::http::Body;
-use crate::repositories;
+use crate::repositories::{self, CONNECTED_IDS};
 use crate::search::{self, Filter, SearchHit, SearchRequest};
 use crate::state::AppState;
 
-/// `POST /api/search`.
+/// `POST /api/search`, `GET /api/search/languages`.
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/search", post(search_handler))
+    Router::new()
+        .route("/api/search", post(search_handler))
+        .route("/api/search/languages", get(languages))
 }
 
 #[derive(Deserialize)]
@@ -36,9 +41,33 @@ struct SearchResult {
 
 async fn search_handler(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Body(body): Body<SearchBody>,
-) -> ApiResult<Json<SearchResult>> {
+) -> Response {
+    if let Err(retry_after) = state.search_rate.check(user.id) {
+        return rate_limited(retry_after);
+    }
+    match run_search(&state, body).await {
+        Ok(result) => Json(result).into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+/// 429 `rate_limited` with `Retry-After`.
+fn rate_limited(retry_after: u64) -> Response {
+    let mut response = ApiError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limited",
+        format!("Too many searches. Try again in {retry_after} s."),
+    )
+    .into_response();
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from(retry_after));
+    response
+}
+
+async fn run_search(state: &AppState, body: SearchBody) -> ApiResult<SearchResult> {
     let connected = state.db.read(repositories::connected_ids).await?;
     let repo_ids = match body.repository_ids {
         Some(wanted) => connected
@@ -49,7 +78,7 @@ async fn search_handler(
     };
     let filter = Filter::new(repo_ids, &body.languages, body.path_prefix.as_deref())?;
     let response = search::search(
-        &state,
+        state,
         SearchRequest {
             query: body.query,
             filter,
@@ -57,9 +86,34 @@ async fn search_handler(
         },
     )
     .await?;
-    Ok(Json(SearchResult {
+    Ok(SearchResult {
         mode: response.mode,
         terms: response.terms,
         results: response.hits,
-    }))
+    })
+}
+
+#[derive(Serialize)]
+struct Languages {
+    languages: Vec<String>,
+}
+
+/// Languages of the indexed files of connected repositories, sorted.
+async fn languages(State(state): State<AppState>, _user: AuthUser) -> ApiResult<Json<Languages>> {
+    let languages = state
+        .db
+        .read(|conn| {
+            conn.prepare_cached(&format!(
+                "SELECT DISTINCT f.language
+                 FROM files f
+                 WHERE f.language IS NOT NULL
+                   AND f.skip_reason IS NULL
+                   AND f.repo_id IN ({CONNECTED_IDS})
+                 ORDER BY f.language"
+            ))?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()
+        })
+        .await?;
+    Ok(Json(Languages { languages }))
 }
