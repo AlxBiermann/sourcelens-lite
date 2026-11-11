@@ -96,14 +96,28 @@ pub async fn run_job(state: &AppState, job: ClaimedJob) -> Result<JobOutcome, Ap
 
     let head = match &job.target_commit {
         Some(commit) => commit.clone(),
-        None => api::branch_head(
-            &state.github,
-            &token,
-            &repo.full_name,
-            &repo.effective_branch,
-        )
-        .await
-        .map_err(|err| forget_rejected_token(state, &repo, err))?,
+        None => {
+            let head = api::branch_head(
+                &state.github,
+                &token,
+                &repo.full_name,
+                &repo.effective_branch,
+            )
+            .await
+            .map_err(|err| forget_rejected_token(state, &repo, err))?;
+            // The Activity table shows which commit a manual, connect or startup job worked on.
+            let (job_id, commit) = (job.id, head.clone());
+            state
+                .db
+                .write(move |conn| {
+                    conn.execute(
+                        "UPDATE jobs SET target_commit = ?2 WHERE id = ?1",
+                        rusqlite::params![job_id, commit],
+                    )
+                })
+                .await?;
+            head
+        }
     };
     let force = job.force || repo.chunker_version != CHUNKER_VERSION;
 

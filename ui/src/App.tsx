@@ -35,14 +35,14 @@ export function App() {
   if (!state) {
     if (!error) return null;
     return (
-      <div className="sl-marker-page">
-        <div className="sl-marker-content">
-          <h1 className="sl-marker-wordmark">SourceLens</h1>
-          <p className="sl-marker-error" role="alert">
+      <div className="sl-entry-page">
+        <div className="sl-entry-content">
+          <h1 className="sl-entry-wordmark">SourceLens</h1>
+          <p className="sl-notice sl-notice-error" role="alert">
             {error.message}
           </p>
           <div className="sl-actions">
-            <button type="button" className="sl-button sl-button-ink" onClick={() => void reload()}>
+            <button type="button" className="sl-button sl-button-primary" onClick={() => void reload()}>
               Try again
             </button>
           </div>

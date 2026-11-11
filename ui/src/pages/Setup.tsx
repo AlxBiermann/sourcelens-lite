@@ -99,20 +99,20 @@ export function Setup() {
   const signInHref = `/auth/github/login?setup_token=${encodeURIComponent(token.trim())}`;
 
   return (
-    <div className="sl-marker-page">
-      <div className="sl-marker-top">
+    <div className="sl-entry-page">
+      <div className="sl-entry-top">
         <ThemeToggle />
       </div>
-      <div className="sl-marker-content">
-        <h1 className="sl-marker-wordmark">SourceLens</h1>
-        <p className="sl-marker-lead">Three steps connect this instance to GitHub and make you its owner.</p>
+      <div className="sl-entry-content">
+        <h1 className="sl-entry-wordmark">SourceLens</h1>
+        <p className="sl-entry-lead">Three steps connect this instance to GitHub and make you its owner.</p>
         {error && ERRORS[error] ? (
-          <p className="sl-marker-error" role="alert">
+          <p className="sl-notice sl-notice-error" role="alert">
             {ERRORS[error]}
           </p>
         ) : null}
         {formError ? (
-          <p className="sl-marker-error" role="alert">
+          <p className="sl-notice sl-notice-error" role="alert">
             {formError}
           </p>
         ) : null}
@@ -129,7 +129,7 @@ export function Setup() {
                   {(props) => <input {...props} className="sl-input" value={organization} onChange={(e) => setOrganization(e.target.value)} autoComplete="off" spellCheck={false} />}
                 </Field>
                 <div className="sl-actions">
-                  <button type="submit" className="sl-button sl-button-ink" disabled={busy || !token.trim()}>
+                  <button type="submit" className="sl-button sl-button-primary" disabled={busy || !token.trim()}>
                     Create GitHub App
                   </button>
                 </div>
@@ -140,7 +140,7 @@ export function Setup() {
             <p className="sl-prose">Choose the repositories SourceLens may read. You can change this later on GitHub.</p>
             {appConfigured && installUrl ? (
               <div className="sl-actions">
-                <a className={current === 2 ? 'sl-button sl-button-ink' : 'sl-button sl-button-secondary'} href={installUrl} target="_blank" rel="noreferrer">
+                <a className={current === 2 ? 'sl-button sl-button-primary' : 'sl-button sl-button-secondary'} href={installUrl} target="_blank" rel="noreferrer">
                   Install on GitHub
                 </a>
               </div>
@@ -153,7 +153,7 @@ export function Setup() {
                 {tokenField}
                 <div className="sl-actions">
                   {token.trim() ? (
-                    <a className={current === 3 ? 'sl-button sl-button-ink' : 'sl-button sl-button-secondary'} href={signInHref} onClick={() => rememberToken(token.trim())}>
+                    <a className={current === 3 ? 'sl-button sl-button-primary' : 'sl-button sl-button-secondary'} href={signInHref} onClick={() => rememberToken(token.trim())}>
                       Sign in with GitHub
                     </a>
                   ) : (

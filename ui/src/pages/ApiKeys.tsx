@@ -68,7 +68,7 @@ function CreatedKey({ created, publicUrl }: { created: Created; publicUrl: strin
     <div className="sl-stack">
       <div className="sl-secret">
         <code className="sl-secret-value">{created.secret}</code>
-        <CopyButton text={created.secret} label="Copy key" className="sl-button sl-button-ink sl-button-small" />
+        <CopyButton text={created.secret} label="Copy key" className="sl-button sl-button-primary sl-button-small" />
       </div>
       <div className="sl-stack-tight">
         <div className="sl-tabs" role="tablist" aria-label="Client configuration">
@@ -187,7 +187,7 @@ export function ApiKeys() {
 
   return (
     <div className="sl-page">
-      <PageHeader title="API keys" action={createButton} />
+      <PageHeader title="API keys" action={keys.data?.length === 0 ? undefined : createButton} />
       <p className="sl-prose sl-muted">Agents use API keys to search your repositories over MCP. Every key is read-only.</p>
       {keys.error && !keys.data ? <Notice tone="error">{keys.error.message}</Notice> : null}
       {keys.loading && !keys.data ? <Loading /> : null}
@@ -248,7 +248,7 @@ export function ApiKeys() {
         wide={created !== null}
         actions={
           created ? (
-            <button type="button" className="sl-button sl-button-primary" onClick={close}>
+            <button type="button" className="sl-button sl-button-secondary" onClick={close}>
               Done
             </button>
           ) : (

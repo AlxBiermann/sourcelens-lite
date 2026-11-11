@@ -420,6 +420,11 @@ async fn first_index_records_files_counts_and_skips() {
         .query("SELECT indexed_commit FROM repositories WHERE id = ?1")
         .await;
     assert_eq!(commit, Some("1".repeat(40)));
+    // A job without a pushed target records the branch head it resolved (shown in the Activity table).
+    let job_commit: Option<String> = env
+        .query("SELECT target_commit FROM jobs WHERE repo_id = ?1 ORDER BY id DESC LIMIT 1")
+        .await;
+    assert_eq!(job_commit, Some("1".repeat(40)));
     let file_count: i64 = env
         .query("SELECT file_count FROM repositories WHERE id = ?1")
         .await;

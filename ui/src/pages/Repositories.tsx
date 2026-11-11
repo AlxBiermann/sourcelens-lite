@@ -46,7 +46,7 @@ export function Repositories() {
 
   return (
     <div className="sl-page">
-      <PageHeader title="Repositories" action={addButton} />
+      <PageHeader title="Repositories" action={repos.data?.length === 0 ? undefined : addButton} />
       {github.data && !github.data.webhookActive ? <Notice>GitHub cannot reach this address, so pushes are not picked up automatically. Use Sync now.</Notice> : null}
       {repos.error && !repos.data ? <Notice tone="error">{repos.error.message}</Notice> : null}
       {repos.loading && !repos.data ? <Loading /> : null}

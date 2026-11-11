@@ -24,21 +24,16 @@ function detail(repo: Repository, status: RepoStatus): ReactNode {
   }
 }
 
-/** The ink copy is a decorative duplicate drawn in black over the yellow progress fill. */
-function Cells({ repo, status, ink }: { repo: Repository; status: RepoStatus; ink?: boolean }) {
+function Cells({ repo, status }: { repo: Repository; status: RepoStatus }) {
   return (
     <>
       <span className="sl-row-status">
         <StatusBlock status={status} />
       </span>
       <span className="sl-row-name">
-        {ink ? (
-          <span>{repo.fullName}</span>
-        ) : (
-          <Link className="sl-row-link" to={`/repositories/${repo.id}`}>
-            {repo.fullName}
-          </Link>
-        )}
+        <Link className="sl-row-link" to={`/repositories/${repo.id}`}>
+          {repo.fullName}
+        </Link>
         {repo.private ? <span className="sl-private">Private</span> : null}
       </span>
       <span className="sl-row-meta">
@@ -66,14 +61,11 @@ export function RepoRow({ repo, embeddingsOn, onSync, syncing }: { repo: Reposit
             </button>
           ) : null}
         </span>
-        {progress === null ? null : (
-          <span className="sl-visually-hidden" role="progressbar" aria-label={`Indexing ${repo.fullName}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progress)} />
-        )}
       </div>
       {progress === null ? null : (
-        <div className="sl-row-grid sl-row-fill" aria-hidden="true">
-          <Cells repo={repo} status={status} ink />
-        </div>
+        <span className="sl-row-bar" role="progressbar" aria-label={`Indexing ${repo.fullName}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progress)}>
+          <span className="sl-progress-fill" />
+        </span>
       )}
     </li>
   );

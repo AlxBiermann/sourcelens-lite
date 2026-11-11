@@ -93,7 +93,7 @@ export function AddRepositories({ open, onClose, onConnected }: { open: boolean;
                       <span className="sl-pick-branch">{repo.defaultBranch}</span>
                       <button
                         type="button"
-                        className={isConnected ? 'sl-button sl-button-quiet sl-button-small' : 'sl-button sl-button-primary sl-button-small'}
+                        className={isConnected ? 'sl-button sl-button-quiet sl-button-small' : 'sl-button sl-button-secondary sl-button-small'}
                         disabled={isConnected || pending !== null}
                         onClick={() => void connect(installation.installationId, repo.fullName)}
                       >
