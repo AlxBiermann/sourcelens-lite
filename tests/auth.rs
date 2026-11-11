@@ -11,6 +11,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde_json::{json, Value};
 use sourcelens::config::Config;
+use sourcelens::error::GitHubFailure;
 use sourcelens::github::app::{AppCredentials, GitHub};
 use sourcelens::github::oauth::{resolve_user, GhToken, GhUser, Resolution};
 use sourcelens::http;
@@ -91,7 +92,7 @@ async fn insert_user(state: &AppState, login: &str, role: &str, github_id: Optio
                 "INSERT INTO users (github_id, login, role, created_at) VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![github_id, login, role, now()],
             )?;
-            Ok(c.last_insert_rowid())
+            Ok::<_, rusqlite::Error>(c.last_insert_rowid())
         })
         .await
         .unwrap()
@@ -695,6 +696,77 @@ async fn members_cannot_manage_members_and_removal_ends_sessions() {
     assert_eq!(body["user"], Value::Null);
 }
 
+// ── Error format for bad input ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn malformed_bodies_and_path_ids_answer_in_the_api_error_format() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = new_state(&tmp, |_| {});
+    let owner = insert_user(&state, "octocat", "owner", Some(1)).await;
+    let cookie = session_for(&state, owner).await;
+
+    let (status, _, body) = call(
+        &state,
+        request(
+            "POST",
+            "/api/members",
+            Some(&cookie),
+            Some(json!({ "login": 42 })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(&body), "invalid_body");
+    assert!(!body["error"]["message"].as_str().unwrap_or("").is_empty());
+
+    let (status, _, body) = call(
+        &state,
+        request("DELETE", "/api/members/abc", Some(&cookie), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error_code(&body), "not_found");
+    assert!(!body["error"]["message"].as_str().unwrap_or("").is_empty());
+}
+
+#[tokio::test]
+async fn search_rejects_unknown_languages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = new_state(&tmp, |_| {});
+    let owner = insert_user(&state, "octocat", "owner", Some(1)).await;
+    let cookie = session_for(&state, owner).await;
+
+    let (status, _, body) = call(
+        &state,
+        request(
+            "POST",
+            "/api/search",
+            Some(&cookie),
+            Some(json!({ "query": "parser", "languages": ["klingon"] })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_code(&body), "unknown_language");
+    let message = body["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("klingon") && message.contains("rust"),
+        "{message}"
+    );
+
+    let (status, _, body) = call(
+        &state,
+        request(
+            "POST",
+            "/api/search",
+            Some(&cookie),
+            Some(json!({ "query": "parser", "languages": ["Rust", "golang"] })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 // ── App JWT ───────────────────────────────────────────────────────────────────
 
 #[test]
@@ -820,7 +892,7 @@ async fn send_maps_github_responses() {
         .await
         .unwrap_err();
     assert_eq!(err.code, "github_error");
-    assert_eq!(err.upstream_status, Some(404));
+    assert_eq!(err.github, Some(GitHubFailure::Status(404)));
 
     let err = gh
         .send(|| gh.http().get(format!("{base}/limited")))
@@ -828,7 +900,7 @@ async fn send_maps_github_responses() {
         .unwrap_err();
     assert_eq!(err.code, "github_rate_limited");
     assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(err.upstream_status, Some(403));
+    assert_eq!(err.github, Some(GitHubFailure::RateLimited));
 
     let response = gh
         .send(|| gh.http().get(format!("{base}/flaky")))

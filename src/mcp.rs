@@ -1,6 +1,7 @@
 //! Read-only MCP server: stateless Streamable HTTP with JSON responses only.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -11,11 +12,12 @@ use axum::{Json, Router};
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Map, Value};
 
-use crate::error::ApiError;
-use crate::http::keys::{self, KeyScope};
-use crate::index::languages;
+use crate::crypto::sha256_hex;
+use crate::error::{ApiError, ApiResult};
+use crate::http::keys::KEY_PREFIX;
+use crate::repositories::{self, RepoRow, CONNECTED_IDS};
 use crate::search::{self, symbols, Filter, SearchHit, SearchRequest};
-use crate::state::AppState;
+use crate::state::{lock, now, AppState};
 
 const SUPPORTED_VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "2025-03-26"];
 const LATEST_VERSION: &str = SUPPORTED_VERSIONS[0];
@@ -34,6 +36,10 @@ const SEARCH_TEXT_BUDGET: usize = 24_000;
 const SEARCH_PREVIEW_LINES: usize = 6;
 const GET_CODE_DEFAULT_LINES: usize = 400;
 const GET_CODE_MAX_LINES: usize = 800;
+const FIND_SYMBOL_DEFAULT: usize = 20;
+const FIND_SYMBOL_MAX: usize = 50;
+/// `api_keys.last_used_at` is written at most this often per key.
+const TOUCH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// `/mcp` (POST; GET/DELETE → 405).
 pub fn routes() -> Router<AppState> {
@@ -75,11 +81,10 @@ async fn handle(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
             let (scheme, token) = v.trim().split_once(' ')?;
             scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
         });
-    let scope = match bearer {
-        Some(token) => keys::authenticate(&state, token).await,
-        None => Err(ApiError::unauthorized("invalid_api_key", "")),
+    let Some(secret) = bearer else {
+        return unauthorized();
     };
-    let scope = match scope {
+    let scope = match authenticate(&state, secret).await {
         Ok(scope) => scope,
         Err(err) if err.status == StatusCode::UNAUTHORIZED => return unauthorized(),
         Err(err) => return rpc_error(err.status, Value::Null, INTERNAL_ERROR, &err.message),
@@ -176,6 +181,86 @@ fn unauthorized() -> Response {
     response
 }
 
+/// What an API key may read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyScope {
+    pub key_id: i64,
+    /// Connected repositories in the key's scope, ascending.
+    pub repo_ids: Vec<i64>,
+}
+
+/// Resolves an API key secret (`sl_…`) to the connected repositories it may read.
+pub async fn authenticate(state: &AppState, secret: &str) -> ApiResult<KeyScope> {
+    let secret = secret.trim();
+    if !secret.starts_with(KEY_PREFIX) {
+        return Err(invalid_key());
+    }
+    let key_hash = sha256_hex(secret.as_bytes());
+    let found = state
+        .db
+        .read(move |conn| {
+            let row: Option<(i64, bool, Option<i64>)> = conn
+                .query_row(
+                    "SELECT id, all_repos, expires_at FROM api_keys WHERE key_hash = ?1",
+                    [&key_hash],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let Some((key_id, all_repos, expires_at)) = row else {
+                return Ok(None);
+            };
+            if expires_at.is_some_and(|at| at <= now()) {
+                return Ok(None);
+            }
+            let repo_ids = if all_repos {
+                repositories::connected_ids(conn)?
+            } else {
+                conn.prepare(&format!(
+                    "SELECT repo_id FROM api_key_repos
+                     WHERE key_id = ?1 AND repo_id IN ({CONNECTED_IDS}) ORDER BY repo_id"
+                ))?
+                .query_map([key_id], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<i64>>>()?
+            };
+            Ok::<_, rusqlite::Error>(Some(KeyScope { key_id, repo_ids }))
+        })
+        .await?;
+    let scope = found.ok_or_else(invalid_key)?;
+    touch(state, scope.key_id).await?;
+    Ok(scope)
+}
+
+/// Writes `last_used_at` at most once per [`TOUCH_INTERVAL`] per key.
+async fn touch(state: &AppState, key_id: i64) -> ApiResult<()> {
+    let due = {
+        let mut touched = lock(&state.key_touch);
+        let now = Instant::now();
+        let due = touched
+            .get(&key_id)
+            .is_none_or(|last| now.duration_since(*last) >= TOUCH_INTERVAL);
+        if due {
+            touched.insert(key_id, now);
+        }
+        due
+    };
+    if due {
+        state
+            .db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE api_keys SET last_used_at = ?1 WHERE id = ?2",
+                    params![now(), key_id],
+                )
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+fn invalid_key() -> ApiError {
+    ApiError::unauthorized("invalid_api_key", "Invalid, expired or revoked API key.")
+}
+
 fn initialize(params: &Value) -> Value {
     let requested = params.get("protocolVersion").and_then(Value::as_str);
     let version = requested
@@ -226,7 +311,7 @@ fn tool_definitions() -> Value {
                 "repositories": repositories,
                 "languages": { "type": "array", "items": { "type": "string" }, "description": "Language names, e.g. rust, typescript." },
                 "pathPrefix": { "type": "string", "description": "Only files whose path starts with this prefix." },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 20, "default": 8 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": search::MAX_LIMIT, "default": search::DEFAULT_LIMIT },
             }),
             &["query"],
         ),
@@ -254,7 +339,7 @@ fn tool_definitions() -> Value {
                 "name": { "type": "string", "description": "Symbol name, optionally qualified (Type.method, mod::fn)." },
                 "repositories": repositories,
                 "kind": { "type": "string", "description": "Symbol kind, e.g. function, method, class, struct." },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": FIND_SYMBOL_MAX, "default": FIND_SYMBOL_DEFAULT },
             }),
             &["name"],
         ),
@@ -389,53 +474,26 @@ impl<'a> Args<'a> {
             .ok_or_else(|| ToolError::Params(format!("Argument \"{name}\" must be an integer")))
     }
 
-    fn limit(&self, name: &str, default: i64, max: i64) -> Result<usize, ToolError> {
-        let limit = self.integer(name)?.unwrap_or(default).clamp(1, max);
-        Ok(usize::try_from(limit).unwrap_or(1))
+    /// The integer argument `name` clamped to `1..=max`, `default` when absent.
+    fn limit(&self, name: &str, default: usize, max: usize) -> Result<usize, ToolError> {
+        let limit = match self.integer(name)? {
+            Some(n) => usize::try_from(n.max(1)).unwrap_or(usize::MAX),
+            None => default,
+        };
+        Ok(limit.clamp(1, max))
     }
 }
 
-struct ScopeRepo {
-    id: i64,
-    full_name: String,
-    branch: String,
-    indexed_commit: Option<String>,
-    indexed_at: Option<i64>,
-    file_count: i64,
-}
-
 /// Connected repositories of the key's scope, ordered by name.
-async fn scope_repositories(
-    state: &AppState,
-    scope: &KeyScope,
-) -> Result<Vec<ScopeRepo>, ToolError> {
-    let all = state
+async fn scope_repositories(state: &AppState, scope: &KeyScope) -> Result<Vec<RepoRow>, ToolError> {
+    let ids = scope.repo_ids.clone();
+    Ok(state
         .db
-        .read(|conn| {
-            conn.prepare(
-                "SELECT id, full_name, COALESCE(branch, default_branch), indexed_commit, indexed_at, file_count
-                 FROM repositories WHERE state = 'connected' ORDER BY full_name",
-            )?
-            .query_map([], |r| {
-                Ok(ScopeRepo {
-                    id: r.get(0)?,
-                    full_name: r.get(1)?,
-                    branch: r.get(2)?,
-                    indexed_commit: r.get(3)?,
-                    indexed_at: r.get(4)?,
-                    file_count: r.get(5)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .await?;
-    Ok(all
-        .into_iter()
-        .filter(|repo| scope.repo_ids.contains(&repo.id))
-        .collect())
+        .read(move |conn| repositories::connected_in(conn, &ids))
+        .await?)
 }
 
-fn resolve<'r>(repos: &'r [ScopeRepo], name: &str) -> Result<&'r ScopeRepo, ToolError> {
+fn resolve<'r>(repos: &'r [RepoRow], name: &str) -> Result<&'r RepoRow, ToolError> {
     let name = name.trim();
     repos
         .iter()
@@ -457,7 +515,7 @@ fn resolve<'r>(repos: &'r [ScopeRepo], name: &str) -> Result<&'r ScopeRepo, Tool
 }
 
 /// Repository ids for an optional `repositories` argument; empty means the whole scope.
-fn narrow(repos: &[ScopeRepo], names: &[&str]) -> Result<Vec<i64>, ToolError> {
+fn narrow(repos: &[RepoRow], names: &[&str]) -> Result<Vec<i64>, ToolError> {
     if names.is_empty() {
         return Ok(repos.iter().map(|repo| repo.id).collect());
     }
@@ -493,11 +551,12 @@ async fn list_repositories(
         };
         lines.push(format!(
             "{}  branch {}  {index_state}",
-            repo.full_name, repo.branch
+            repo.full_name,
+            repo.effective_branch()
         ));
         structured.push(json!({
             "name": repo.full_name,
-            "branch": repo.branch,
+            "branch": repo.effective_branch(),
             "indexedCommit": repo.indexed_commit,
             "indexedAt": repo.indexed_at,
             "fileCount": repo.file_count,
@@ -521,19 +580,9 @@ async fn search_code(
 ) -> Result<ToolOutput, ToolError> {
     let query = args.string("query")?;
     let repository_names = args.strings("repositories")?;
-    let languages = args
-        .strings("languages")?
-        .into_iter()
-        .map(|name| {
-            languages::language_by_name(name)
-                .map_or_else(|| name.trim().to_ascii_lowercase(), |l| l.name.to_string())
-        })
-        .collect();
-    let path_prefix = args
-        .opt_string("pathPrefix")?
-        .map(|p| p.trim().trim_start_matches('/').to_string())
-        .filter(|p| !p.is_empty());
-    let limit = args.limit("limit", 8, 20)?;
+    let languages = args.strings("languages")?;
+    let path_prefix = args.opt_string("pathPrefix")?;
+    let limit = args.limit("limit", search::DEFAULT_LIMIT, search::MAX_LIMIT)?;
 
     let repos = scope_repositories(state, scope).await?;
     let repo_ids = narrow(&repos, &repository_names)?;
@@ -541,12 +590,8 @@ async fn search_code(
         state,
         SearchRequest {
             query: query.to_string(),
-            filter: Filter {
-                repo_ids,
-                languages,
-                path_prefix,
-            },
-            limit,
+            filter: Filter::new(repo_ids, languages, path_prefix)?,
+            limit: Some(limit),
         },
     )
     .await?;
@@ -614,7 +659,7 @@ struct FileRow {
 /// Loads a file of a repository in scope, or the `isError` text that tells the agent what to do.
 async fn load_file(
     state: &AppState,
-    repo: &ScopeRepo,
+    repo: &RepoRow,
     path: &str,
     with_content: bool,
 ) -> Result<FileRow, ToolError> {
@@ -820,7 +865,7 @@ async fn find_symbol(
         .opt_string("kind")?
         .map(|k| k.trim().to_ascii_lowercase())
         .filter(|k| !k.is_empty());
-    let limit = args.limit("limit", 20, 50)?;
+    let limit = args.limit("limit", FIND_SYMBOL_DEFAULT, FIND_SYMBOL_MAX)?;
     let repos = scope_repositories(state, scope).await?;
     let repo_ids = narrow(&repos, &repository_names)?;
     if name.is_empty() {
@@ -851,7 +896,7 @@ async fn find_symbol(
                     };
                     found.push((row, path));
                 }
-                Ok(found)
+                Ok::<_, rusqlite::Error>(found)
             })
             .await?
     };

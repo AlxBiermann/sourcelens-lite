@@ -2,17 +2,18 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read};
 use std::path::{Component, Path, PathBuf};
 
-use axum::http::StatusCode;
 use futures_util::{StreamExt, TryStreamExt};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 
 use crate::crypto::git_blob_sha1;
 use crate::db::Db;
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiResult, GitHubFailure};
 use crate::github::api::{self, RawTreeEntry};
 use crate::index::chunker::CHUNKER_VERSION;
 use crate::index::store::{self, PreparedFile, TreeEntry};
 use crate::index::{embed, select};
+use crate::model::{JobPhase, RepoState, SkipReason, Trigger};
+use crate::repositories::{self, RepoRow, Target};
 use crate::state::{now, AppState};
 
 /// More changed files than this are fetched as one tarball instead of single blobs.
@@ -25,31 +26,21 @@ const NO_ACCESS_REASON: &str = "GitHub App has no access";
 
 /// A job row claimed by a worker.
 #[derive(Debug, Clone)]
-pub struct ClaimedJob {
+pub(crate) struct ClaimedJob {
     pub id: i64,
     pub repo_id: i64,
-    pub trigger: String,
+    pub trigger: Trigger,
     pub target_commit: Option<String>,
     pub force: bool,
 }
 
 /// What a finished job changed.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct JobOutcome {
+pub(crate) struct JobOutcome {
     pub files_changed: u32,
     pub files_deleted: u32,
     pub files_skipped: u32,
     pub embedded: u32,
-}
-
-struct Repo {
-    id: i64,
-    full_name: String,
-    installation_id: u64,
-    effective_branch: String,
-    state: String,
-    indexed_commit: Option<String>,
-    chunker_version: i64,
 }
 
 /// File counters of the job, written to its row after every batch.
@@ -85,11 +76,14 @@ impl Drop for TempFile {
     }
 }
 
-pub async fn run_job(state: &AppState, job: ClaimedJob) -> Result<JobOutcome, ApiError> {
-    let mut repo = load_repo(&state.db, job.repo_id)
+pub(crate) async fn run_job(state: &AppState, job: ClaimedJob) -> Result<JobOutcome, ApiError> {
+    let repo_id = job.repo_id;
+    let mut repo = state
+        .db
+        .read(move |conn| repositories::get(conn, repo_id))
         .await?
         .ok_or_else(disconnected)?;
-    if repo.state != "connected" {
+    if repo.state != RepoState::Connected {
         return Err(disconnected());
     }
     let token = access_token(state, &mut repo).await?;
@@ -101,7 +95,7 @@ pub async fn run_job(state: &AppState, job: ClaimedJob) -> Result<JobOutcome, Ap
                 &state.github,
                 &token,
                 &repo.full_name,
-                &repo.effective_branch,
+                repo.effective_branch(),
             )
             .await
             .map_err(|err| forget_rejected_token(state, &repo, err))?;
@@ -134,7 +128,7 @@ pub async fn run_job(state: &AppState, job: ClaimedJob) -> Result<JobOutcome, Ap
 async fn index_commit(
     state: &AppState,
     job: &ClaimedJob,
-    repo: &Repo,
+    repo: &RepoRow,
     token: &str,
     head: &str,
     force: bool,
@@ -143,7 +137,12 @@ async fn index_commit(
     let (job_id, repo_id) = (job.id, repo.id);
     state
         .db
-        .write(move |conn| conn.execute("UPDATE jobs SET phase = 'index' WHERE id = ?1", [job_id]))
+        .write(move |conn| {
+            conn.execute(
+                "UPDATE jobs SET phase = ?2 WHERE id = ?1",
+                params![job_id, JobPhase::Index],
+            )
+        })
         .await?;
 
     let (raw_tree, truncated) = api::tree(&state.github, token, &repo.full_name, head).await?;
@@ -177,10 +176,10 @@ async fn index_commit(
             .collect();
         let plan = store::plan_diff(&existing, &eligible, force);
         let progress = Progress {
-            total: count(plan.fetch.len()),
+            total: saturating_u32(plan.fetch.len()),
             ..Progress::default()
         };
-        write_progress_async(&state.db, job_id, progress).await?;
+        store_progress(&state.db, job_id, progress).await?;
         let progress = if plan.fetch.len() <= TARBALL_THRESHOLD {
             index_from_blobs(state, job_id, repo, token, plan.fetch, progress).await?
         } else {
@@ -208,9 +207,9 @@ async fn index_commit(
     let indexed_at = now();
     let deleted = state
         .db
-        .write(move |conn| {
-            if !repo_connected(conn, repo_id)? {
-                return Ok(None);
+        .write(move |conn| -> ApiResult<u32> {
+            if !repositories::is_connected(conn, repo_id)? {
+                return Err(disconnected());
             }
             let deleted = if delete.is_empty() {
                 0
@@ -221,17 +220,10 @@ async fn index_commit(
                 "UPDATE jobs SET files_deleted = ?2 WHERE id = ?1",
                 params![job_id, deleted],
             )?;
-            conn.execute(
-                "UPDATE repositories SET indexed_commit = ?2, indexed_at = ?3, chunker_version = ?4,
-                   file_count = (SELECT count(*) FROM files WHERE repo_id = ?1 AND skip_reason IS NULL),
-                   chunk_count = (SELECT count(*) FROM chunks WHERE repo_id = ?1)
-                 WHERE id = ?1",
-                params![repo_id, head, indexed_at, CHUNKER_VERSION],
-            )?;
-            Ok(Some(deleted))
+            repositories::record_index(conn, repo_id, &head, indexed_at, CHUNKER_VERSION)?;
+            Ok(deleted)
         })
-        .await?
-        .ok_or_else(disconnected)?;
+        .await?;
 
     outcome.files_changed = progress.changed;
     outcome.files_skipped = progress.skipped;
@@ -243,7 +235,7 @@ async fn index_commit(
 async fn index_from_blobs(
     state: &AppState,
     job_id: i64,
-    repo: &Repo,
+    repo: &RepoRow,
     token: &str,
     fetch: Vec<TreeEntry>,
     mut progress: Progress,
@@ -265,11 +257,10 @@ async fn index_from_blobs(
             .try_collect()
             .await?;
         let repo_id = repo.id;
-        let applied = state
+        progress = state
             .db
             .write(move |conn| apply_batch(conn, job_id, repo_id, &files, progress))
             .await?;
-        progress = applied.ok_or_else(disconnected)?;
     }
     Ok(progress)
 }
@@ -279,7 +270,7 @@ async fn index_from_blobs(
 async fn index_from_archive(
     state: &AppState,
     job_id: i64,
-    repo: &Repo,
+    repo: &RepoRow,
     token: &str,
     head: &str,
     selection: Selection,
@@ -366,7 +357,7 @@ fn read_archive(
                     &entry.path,
                     "",
                     entry.size,
-                    "not_in_archive",
+                    SkipReason::NotInArchive,
                 ));
                 if batch.len() >= BATCH_SIZE {
                     progress = flush_blocking(db, job_id, repo_id, &batch, progress)?;
@@ -397,8 +388,7 @@ fn flush_blocking(
     batch: &[PreparedFile],
     progress: Progress,
 ) -> ApiResult<Progress> {
-    db.write_blocking(|conn| apply_batch(conn, job_id, repo_id, batch, progress))?
-        .ok_or_else(disconnected)
+    db.write_blocking(|conn| apply_batch(conn, job_id, repo_id, batch, progress))
 }
 
 /// Applies one batch under the writer lock unless the repository left the `connected` state.
@@ -408,16 +398,16 @@ fn apply_batch(
     repo_id: i64,
     files: &[PreparedFile],
     mut progress: Progress,
-) -> rusqlite::Result<Option<Progress>> {
-    if !repo_connected(conn, repo_id)? {
-        return Ok(None);
+) -> ApiResult<Progress> {
+    if !repositories::is_connected(conn, repo_id)? {
+        return Err(disconnected());
     }
     let stats = store::apply_files(conn, repo_id, files)?;
-    progress.done += count(files.len());
+    progress.done += saturating_u32(files.len());
     progress.changed += stats.indexed;
     progress.skipped += stats.skipped;
     write_progress(conn, job_id, progress)?;
-    Ok(Some(progress))
+    Ok(progress)
 }
 
 fn write_progress(conn: &Connection, job_id: i64, progress: Progress) -> rusqlite::Result<()> {
@@ -434,25 +424,17 @@ fn write_progress(conn: &Connection, job_id: i64, progress: Progress) -> rusqlit
     Ok(())
 }
 
-async fn write_progress_async(db: &Db, job_id: i64, progress: Progress) -> ApiResult<()> {
+async fn store_progress(db: &Db, job_id: i64, progress: Progress) -> ApiResult<()> {
     db.write(move |conn| write_progress(conn, job_id, progress))
         .await?;
     Ok(())
 }
 
-fn repo_connected(conn: &Connection, repo_id: i64) -> rusqlite::Result<bool> {
-    let state: Option<String> = conn
-        .query_row(
-            "SELECT state FROM repositories WHERE id = ?1",
-            [repo_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(state.as_deref() == Some("connected"))
-}
-
 async fn ensure_connected(db: &Db, repo_id: i64) -> ApiResult<()> {
-    if db.read(move |conn| repo_connected(conn, repo_id)).await? {
+    if db
+        .read(move |conn| repositories::is_connected(conn, repo_id))
+        .await?
+    {
         Ok(())
     } else {
         Err(disconnected())
@@ -461,25 +443,19 @@ async fn ensure_connected(db: &Db, repo_id: i64) -> ApiResult<()> {
 
 /// Installation token; on 401/404 the installation is looked up again once, and without access
 /// the repository becomes `disconnected`.
-async fn access_token(state: &AppState, repo: &mut Repo) -> ApiResult<String> {
+async fn access_token(state: &AppState, repo: &mut RepoRow) -> ApiResult<String> {
     match state.github.installation_token(repo.installation_id).await {
         Ok(token) => return Ok(token),
-        Err(err) if matches!(err.upstream_status, Some(401 | 404)) => {}
+        Err(err) if matches!(err.github, Some(GitHubFailure::Status(401 | 404))) => {}
         Err(err) => return Err(err),
     }
     state.github.forget_installation_token(repo.installation_id);
     let retried = match state.github.repo_installation(&repo.full_name).await {
         Ok(installation_id) => {
             let repo_id = repo.id;
-            let stored = i64::try_from(installation_id).map_err(ApiError::internal)?;
             state
                 .db
-                .write(move |conn| {
-                    conn.execute(
-                        "UPDATE repositories SET installation_id = ?2 WHERE id = ?1",
-                        params![repo_id, stored],
-                    )
-                })
+                .write(move |conn| repositories::set_installation(conn, repo_id, installation_id))
                 .await?;
             repo.installation_id = installation_id;
             state.github.installation_token(installation_id).await
@@ -493,11 +469,7 @@ async fn access_token(state: &AppState, repo: &mut Repo) -> ApiResult<String> {
             state
                 .db
                 .write(move |conn| {
-                    conn.execute(
-                        "UPDATE repositories SET state = 'disconnected', state_reason = ?2
-                         WHERE id = ?1 AND state = 'connected'",
-                        params![repo_id, NO_ACCESS_REASON],
-                    )
+                    repositories::disconnect(conn, Target::Id(repo_id), NO_ACCESS_REASON)
                 })
                 .await?;
             Err(ApiError::forbidden(
@@ -510,53 +482,15 @@ async fn access_token(state: &AppState, repo: &mut Repo) -> ApiResult<String> {
 }
 
 fn is_access_denied(err: &ApiError) -> bool {
-    err.code != "github_rate_limited" && matches!(err.upstream_status, Some(401 | 403 | 404))
+    matches!(err.github, Some(GitHubFailure::Status(401 | 403 | 404)))
 }
 
 /// Drops a cached installation token GitHub no longer accepts, so the next job requests a new one.
-fn forget_rejected_token(state: &AppState, repo: &Repo, err: ApiError) -> ApiError {
-    if err.upstream_status == Some(401) {
+fn forget_rejected_token(state: &AppState, repo: &RepoRow, err: ApiError) -> ApiError {
+    if err.github == Some(GitHubFailure::Status(401)) {
         state.github.forget_installation_token(repo.installation_id);
     }
     err
-}
-
-async fn load_repo(db: &Db, repo_id: i64) -> ApiResult<Option<Repo>> {
-    let repo = db
-        .read(move |conn| {
-            conn.query_row(
-                "SELECT id, full_name, installation_id, COALESCE(branch, default_branch), state,
-                        indexed_commit, chunker_version
-                 FROM repositories WHERE id = ?1",
-                [repo_id],
-                |row| {
-                    Ok(Repo {
-                        id: row.get(0)?,
-                        full_name: row.get(1)?,
-                        installation_id: column_u64(row, 2)?,
-                        effective_branch: row.get(3)?,
-                        state: row.get(4)?,
-                        indexed_commit: row.get(5)?,
-                        chunker_version: row.get(6)?,
-                    })
-                },
-            )
-            .optional()
-        })
-        .await?;
-    Ok(repo)
-}
-
-/// Reads a non-negative INTEGER column (GitHub ids) as `u64`.
-pub(crate) fn column_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
-    let value: i64 = row.get(index)?;
-    u64::try_from(value).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(
-            index,
-            rusqlite::types::Type::Integer,
-            Box::new(err),
-        )
-    })
 }
 
 /// Regular or executable blobs (no symlinks or submodules) on allowed paths within the size limit.
@@ -591,8 +525,7 @@ fn read_entry(entry: &mut impl Read, max_bytes: u64) -> ApiResult<Vec<u8>> {
 }
 
 fn archive_error(err: std::io::Error) -> ApiError {
-    ApiError::new(
-        StatusCode::BAD_GATEWAY,
+    ApiError::bad_gateway(
         "archive_unreadable",
         format!("Reading the repository archive failed: {err}"),
     )
@@ -602,7 +535,7 @@ fn disconnected() -> ApiError {
     ApiError::conflict("repository_disconnected", "Repository was disconnected.")
 }
 
-fn count(n: usize) -> u32 {
+fn saturating_u32(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 

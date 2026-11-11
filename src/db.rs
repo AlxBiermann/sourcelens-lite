@@ -1,8 +1,12 @@
 use std::ffi::{c_char, c_int};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, Once};
+use std::sync::{Arc, Mutex, Once};
 
-use rusqlite::{ffi, Connection};
+use rusqlite::types::ValueRef;
+use rusqlite::{ffi, params, Connection, OptionalExtension, ToSql};
+
+use crate::model::Role;
+use crate::state::{lock, now};
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
 const SCHEMA_VERSION: i64 = 1;
@@ -40,10 +44,15 @@ impl Db {
         })
     }
 
-    pub async fn read<T: Send + 'static>(
+    /// Runs `f` on a reader connection in a blocking task.
+    pub async fn read<T, E>(
         &self,
-        f: impl FnOnce(&Connection) -> rusqlite::Result<T> + Send + 'static,
-    ) -> rusqlite::Result<T> {
+        f: impl FnOnce(&Connection) -> Result<T, E> + Send + 'static,
+    ) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: From<rusqlite::Error> + Send + 'static,
+    {
         let db = self.clone();
         run_blocking(move || {
             let pooled = lock(&db.readers).pop();
@@ -58,45 +67,119 @@ impl Db {
         .await
     }
 
-    pub async fn write<T: Send + 'static>(
+    /// Runs `f` on the writer connection in a blocking task. Returning `Err` from inside an open
+    /// transaction drops it, which rolls it back.
+    pub async fn write<T, E>(
         &self,
-        f: impl FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,
-    ) -> rusqlite::Result<T> {
+        f: impl FnOnce(&mut Connection) -> Result<T, E> + Send + 'static,
+    ) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: From<rusqlite::Error> + Send + 'static,
+    {
         let db = self.clone();
         run_blocking(move || db.write_blocking(f)).await
     }
 
     /// Runs `f` on the writer connection on the current thread; use inside `spawn_blocking`.
-    pub fn write_blocking<T>(
+    pub fn write_blocking<T, E>(
         &self,
-        f: impl FnOnce(&mut Connection) -> rusqlite::Result<T>,
-    ) -> rusqlite::Result<T> {
+        f: impl FnOnce(&mut Connection) -> Result<T, E>,
+    ) -> Result<T, E> {
         let mut conn = lock(&self.writer);
         f(&mut conn)
     }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
-async fn run_blocking<T: Send + 'static>(
-    f: impl FnOnce() -> rusqlite::Result<T> + Send + 'static,
-) -> rusqlite::Result<T> {
+async fn run_blocking<T, E>(f: impl FnOnce() -> Result<T, E> + Send + 'static) -> Result<T, E>
+where
+    T: Send + 'static,
+    E: From<rusqlite::Error> + Send + 'static,
+{
     match tokio::task::spawn_blocking(f).await {
         Ok(result) => result,
         Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
-        Err(err) => Err(rusqlite::Error::SqliteFailure(
+        Err(err) => Err(E::from(rusqlite::Error::SqliteFailure(
             ffi::Error::new(ffi::SQLITE_INTERRUPT),
             Some(format!("database task was cancelled: {err}")),
-        )),
+        ))),
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Value of `settings[key]` as bytes (stored as BLOB or TEXT).
+pub fn get_setting(conn: &Connection, key: &str) -> rusqlite::Result<Option<Vec<u8>>> {
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+        Ok(match row.get_ref(0)? {
+            ValueRef::Blob(bytes) | ValueRef::Text(bytes) => Some(bytes.to_vec()),
+            _ => None,
+        })
+    })
+    .optional()
+    .map(Option::flatten)
+}
+
+pub fn put_setting(conn: &Connection, key: &str, value: impl ToSql) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![key, value, now()],
+    )?;
+    Ok(())
+}
+
+pub fn delete_setting(conn: &Connection, key: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM settings WHERE key = ?1", [key])?;
+    Ok(())
+}
+
+/// Whether the instance has an owner (setup is finished).
+pub fn owner_exists(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM users WHERE role = ?1)",
+        [Role::Owner],
+        |row| row.get(0),
+    )
+}
+
+/// Small helpers for building statements and reading rows.
+pub mod sql {
+    use rusqlite::types::{Type, ValueRef};
+    use rusqlite::Row;
+
+    /// `?, ?, …` for an `IN (…)` list of `count` values.
+    pub fn placeholders(count: usize) -> String {
+        vec!["?"; count].join(", ")
+    }
+
+    /// Escapes `\`, `%` and `_` for `LIKE … ESCAPE '\'`.
+    pub fn escape_like(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        for c in text.chars() {
+            if matches!(c, '\\' | '%' | '_') {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    /// Reads a non-negative INTEGER column (GitHub ids) as `u64`.
+    pub fn column_u64(row: &Row<'_>, index: usize) -> rusqlite::Result<u64> {
+        let value: i64 = row.get(index)?;
+        u64::try_from(value).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(index, Type::Integer, Box::new(err))
+        })
+    }
+
+    /// A TEXT or BLOB column as a `String`, replacing invalid UTF-8; empty for NULL.
+    pub fn text_column(row: &Row<'_>, index: usize) -> rusqlite::Result<String> {
+        Ok(match row.get_ref(index)? {
+            ValueRef::Blob(bytes) | ValueRef::Text(bytes) => {
+                String::from_utf8_lossy(bytes).into_owned()
+            }
+            _ => String::new(),
+        })
+    }
 }
 
 fn register_sqlite_vec() {

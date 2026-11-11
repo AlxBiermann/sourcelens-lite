@@ -26,7 +26,7 @@ async fn migration_applies_and_sqlite_vec_is_loaded() {
                 [],
                 |r| r.get(0),
             )?;
-            Ok((version, vec_version, tables))
+            Ok::<_, rusqlite::Error>((version, vec_version, tables))
         })
         .await
         .unwrap();
@@ -77,7 +77,7 @@ async fn vec0_partitioned_knn_orders_by_distance() {
                     Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
+            Ok::<_, rusqlite::Error>(rows)
         })
         .await
         .unwrap();
@@ -104,7 +104,7 @@ async fn contentless_fts_supports_delete_by_rowid() {
             conn.execute("DELETE FROM chunks_fts WHERE rowid = ?1", [10_i64])?;
             let after = count(conn, "getuserbyid")?;
             let other = count(conn, "orders")?;
-            Ok((before, after, other))
+            Ok::<_, rusqlite::Error>((before, after, other))
         })
         .await
         .unwrap();

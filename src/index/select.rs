@@ -1,5 +1,7 @@
 //! Which repository files are worth indexing.
 
+use crate::model::SkipReason;
+
 const VENDORED_PATH_SEGMENTS: &[&str] = &[
     "node_modules",
     "bower_components",
@@ -70,17 +72,17 @@ pub fn path_allowed(path: &str) -> bool {
         .any(|suffix| file_name.ends_with(suffix))
 }
 
-/// `"binary"`, `"minified"` or `"generated"` when the content should not be indexed.
-pub fn content_skip_reason(bytes: &[u8]) -> Option<&'static str> {
+/// Why the content should not be indexed: binary, minified or generated.
+pub fn content_skip_reason(bytes: &[u8]) -> Option<SkipReason> {
     let sniff = &bytes[..bytes.len().min(BINARY_SNIFF_BYTES)];
     if sniff.contains(&0) {
-        return Some("binary");
+        return Some(SkipReason::Binary);
     }
     if bytes.len() >= MINIFIED_MIN_FILE_BYTES {
         let newlines = bytes.iter().filter(|&&b| b == b'\n').count();
         let line_count = newlines + usize::from(bytes.last() != Some(&b'\n'));
         if bytes.len() / line_count.max(1) > MINIFIED_MIN_AVERAGE_LINE_BYTES {
-            return Some("minified");
+            return Some(SkipReason::Minified);
         }
     }
     let generated = bytes
@@ -90,7 +92,7 @@ pub fn content_skip_reason(bytes: &[u8]) -> Option<&'static str> {
             contains(line, b"@generated")
                 || (contains(line, b"Code generated") && contains(line, b"DO NOT EDIT"))
         });
-    generated.then_some("generated")
+    generated.then_some(SkipReason::Generated)
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {

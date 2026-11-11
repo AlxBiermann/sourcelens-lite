@@ -6,5 +6,8 @@ pub mod github;
 pub mod http;
 pub mod index;
 pub mod mcp;
+pub mod model;
+pub mod rate;
+pub mod repositories;
 pub mod search;
 pub mod state;

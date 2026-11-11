@@ -1,7 +1,7 @@
 use sourcelens::config::Config;
-use sourcelens::index::store;
+use sourcelens::index::store::{self, camel_parts};
 use sourcelens::search::fuse::fuse;
-use sourcelens::search::query::{camel_parts, plan};
+use sourcelens::search::query::plan;
 use sourcelens::search::{self, symbols, Filter, SearchRequest, SearchResponse};
 use sourcelens::state::AppState;
 
@@ -33,7 +33,7 @@ async fn fixture() -> Fixture {
                 store::prepare_file("app/orders.py", "o1", ORDERS_PY.as_bytes()),
             ];
             store::apply_files(conn, repo_id, &files)?;
-            Ok(repo_id)
+            Ok::<_, rusqlite::Error>(repo_id)
         })
         .await
         .unwrap();
@@ -57,7 +57,7 @@ impl Fixture {
             SearchRequest {
                 query: query.to_string(),
                 filter,
-                limit: 8,
+                limit: Some(8),
             },
         )
         .await
@@ -123,7 +123,7 @@ async fn symbol_lookup_buckets() {
         .state
         .db
         .read(move |conn| {
-            Ok((
+            Ok::<_, rusqlite::Error>((
                 symbols::lookup(conn, &[repo], "getUserById", None, 10)?,
                 symbols::lookup(conn, &[repo], "GETUSERBYID", None, 10)?,
                 symbols::lookup(conn, &[repo], "listActive", None, 10)?,
@@ -214,7 +214,7 @@ async fn empty_query_is_rejected() {
         SearchRequest {
             query: "  ? ! ".to_string(),
             filter: fx.scope(),
-            limit: 8,
+            limit: Some(8),
         },
     )
     .await
@@ -243,7 +243,7 @@ async fn hits_are_capped_per_file_and_by_limit() {
                 repo,
                 &[store::prepare_file("src/widgets.ts", "w", many.as_bytes())],
             )?;
-            Ok(())
+            Ok::<_, rusqlite::Error>(())
         })
         .await
         .unwrap();
@@ -252,7 +252,7 @@ async fn hits_are_capped_per_file_and_by_limit() {
         SearchRequest {
             query: "widget".to_string(),
             filter: fx.scope(),
-            limit: 50,
+            limit: Some(50),
         },
     )
     .await
@@ -264,6 +264,20 @@ async fn hits_are_capped_per_file_and_by_limit() {
         .count();
     assert_eq!(in_file, 3, "hits from one file are capped at three");
     assert!(response.hits.len() <= 20);
+}
+
+#[test]
+fn filter_normalises_languages_and_rejects_unknown_ones() {
+    let filter = Filter::new(vec![1], ["Rust", " golang ", "", "rust"], Some(" /src/ ")).unwrap();
+    assert_eq!(filter.languages, ["rust", "go"]);
+    assert_eq!(filter.path_prefix.as_deref(), Some("src/"));
+    let empty_prefix = Filter::new(vec![1], Vec::<String>::new(), Some(" / ")).unwrap();
+    assert_eq!(empty_prefix.path_prefix, None);
+
+    let err = Filter::new(vec![1], ["klingon"], None).unwrap_err();
+    assert_eq!(err.code, "unknown_language");
+    assert_eq!(err.status.as_u16(), 422);
+    assert!(err.message.contains("\"klingon\""), "{}", err.message);
 }
 
 #[test]

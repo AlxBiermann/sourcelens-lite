@@ -11,8 +11,16 @@ pub struct ApiError {
     pub status: StatusCode,
     pub code: &'static str,
     pub message: String,
-    /// HTTP status of an upstream (GitHub) response that caused this error.
-    pub upstream_status: Option<u16>,
+    /// How GitHub answered when a GitHub call caused this error.
+    pub github: Option<GitHubFailure>,
+}
+
+/// GitHub's answer behind an [`ApiError`], so callers can tell missing access from rate limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitHubFailure {
+    /// A non-2xx status that is not a rate limit.
+    Status(u16),
+    RateLimited,
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
@@ -23,7 +31,7 @@ impl ApiError {
             status,
             code,
             message: message.into(),
-            upstream_status: None,
+            github: None,
         }
     }
 
@@ -51,6 +59,10 @@ impl ApiError {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, code, message)
     }
 
+    pub fn bad_gateway(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_GATEWAY, code, message)
+    }
+
     pub fn internal(cause: impl fmt::Display) -> Self {
         tracing::error!("internal error: {cause}");
         Self::new(
@@ -58,6 +70,12 @@ impl ApiError {
             "internal",
             "Internal error.",
         )
+    }
+
+    /// The same error, marked with GitHub's answer.
+    pub fn with_github(mut self, github: Option<GitHubFailure>) -> Self {
+        self.github = github;
+        self
     }
 }
 

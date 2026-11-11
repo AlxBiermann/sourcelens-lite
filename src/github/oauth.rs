@@ -3,16 +3,14 @@ use reqwest::Url;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
-use crate::db::Db;
+use crate::db::{self, Db};
 use crate::error::{ApiError, ApiResult};
-use crate::github::app::AppCredentials;
-use crate::http::session::AuthUser;
+use crate::github::app::{AppCredentials, GitHub};
+use crate::model::Role;
 use crate::state::{now, AppState};
 
 const AUTHORIZE_URL: &str = "https://github.com/login/oauth/authorize";
 const ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
-/// Refresh this many seconds before the access token expires.
-const REFRESH_MARGIN: i64 = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,12 +38,8 @@ pub enum Resolution {
     SetupRequired,
 }
 
-pub fn callback_url(state: &AppState) -> String {
-    format!("{}/auth/github/callback", state.cfg.public_url)
-}
-
 pub fn authorize_url(state: &AppState, creds: &AppCredentials, oauth_state: &str) -> String {
-    let redirect = callback_url(state);
+    let redirect = state.cfg.callback_url();
     match Url::parse_with_params(
         AUTHORIZE_URL,
         [
@@ -69,7 +63,7 @@ pub async fn exchange_code(
         "client_id": creds.client_id,
         "client_secret": creds.client_secret,
         "code": code,
-        "redirect_uri": callback_url(state),
+        "redirect_uri": state.cfg.callback_url(),
     });
     token_request(state, &body).await
 }
@@ -80,7 +74,7 @@ pub async fn fetch_user(state: &AppState, access_token: &str) -> ApiResult<GhUse
         .github
         .send(|| state.http.get(&url).bearer_auth(access_token))
         .await?;
-    response.json().await.map_err(ApiError::internal)
+    GitHub::json(response, &url).await
 }
 
 /// Applies the four sign-in rules in one transaction: known `github_id` → update profile; invited login →
@@ -124,17 +118,13 @@ pub async fn resolve_user(db: &Db, user: &GhUser, claim: bool) -> ApiResult<Reso
                     )?;
                     Resolution::User(id)
                 } else {
-                    let owner_exists: bool = tx.query_row(
-                        "SELECT EXISTS (SELECT 1 FROM users WHERE role = 'owner')",
-                        [],
-                        |row| row.get(0),
-                    )?;
+                    let owner_exists = db::owner_exists(&tx)?;
                     match (owner_exists, claim) {
                         (false, true) => {
                             tx.execute(
                                 "INSERT INTO users (github_id, login, name, avatar_url, role, created_at, last_login_at)
-                                 VALUES (?1, ?2, ?3, ?4, 'owner', ?5, ?5)",
-                                params![user.id, user.login, user.name, user.avatar_url, ts],
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                                params![user.id, user.login, user.name, user.avatar_url, Role::Owner, ts],
                             )?;
                             Resolution::User(tx.last_insert_rowid())
                         }
@@ -144,68 +134,25 @@ pub async fn resolve_user(db: &Db, user: &GhUser, claim: bool) -> ApiResult<Reso
                 }
             };
             tx.commit()?;
-            Ok(resolution)
+            Ok::<_, rusqlite::Error>(resolution)
         })
         .await?;
     Ok(resolution)
 }
 
-/// The signed-in user's GitHub token, refreshed when it expires within a minute.
-pub async fn user_token(state: &AppState, user: &AuthUser) -> ApiResult<String> {
-    let hash = user.session_hash.clone();
-    let sealed: Option<Vec<u8>> = state
-        .db
-        .read(move |conn| {
-            conn.query_row(
-                "SELECT gh_token FROM sessions WHERE id_hash = ?1",
-                [hash],
-                |row| row.get(0),
-            )
-            .optional()
-        })
-        .await?;
-    let token = sealed
-        .and_then(|sealed| state.key.open(&sealed))
-        .and_then(|plain| serde_json::from_slice::<GhToken>(&plain).ok());
-    let Some(token) = token else {
-        return Err(reauth_required(state, user).await);
-    };
-    if token.expires_at.saturating_sub(REFRESH_MARGIN) >= now() {
-        return Ok(token.access_token);
-    }
-    let Some(refresh_token) = token.refresh_token else {
-        return Err(reauth_required(state, user).await);
-    };
-    let Some(creds) = state.github.credentials().await? else {
-        return Err(reauth_required(state, user).await);
-    };
+/// Exchanges a refresh token for a new user token.
+pub async fn refresh_token(
+    state: &AppState,
+    creds: &AppCredentials,
+    refresh_token: &str,
+) -> ApiResult<GhToken> {
     let body = serde_json::json!({
         "client_id": creds.client_id,
         "client_secret": creds.client_secret,
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
     });
-    let refreshed = match token_request(state, &body).await {
-        Ok(refreshed) => refreshed,
-        Err(err) => {
-            tracing::warn!(user = %user.login, "GitHub token refresh failed: {err}");
-            return Err(reauth_required(state, user).await);
-        }
-    };
-    let sealed = state
-        .key
-        .seal(&serde_json::to_vec(&refreshed).map_err(ApiError::internal)?);
-    let hash = user.session_hash.clone();
-    state
-        .db
-        .write(move |conn| {
-            conn.execute(
-                "UPDATE sessions SET gh_token = ?1 WHERE id_hash = ?2",
-                params![sealed, hash],
-            )
-        })
-        .await?;
-    Ok(refreshed.access_token)
+    token_request(state, &body).await
 }
 
 /// `POST https://github.com/login/oauth/access_token`; GitHub reports OAuth failures as 200 with an `error` field.
@@ -228,14 +175,13 @@ async fn token_request(state: &AppState, body: &serde_json::Value) -> ApiResult<
                 .json(body)
         })
         .await?;
-    let parsed: TokenResponse = response.json().await.map_err(ApiError::internal)?;
+    let parsed: TokenResponse = GitHub::json(response, ACCESS_TOKEN_URL).await?;
     let Some(access_token) = parsed.access_token.filter(|t| !t.is_empty()) else {
         let reason = parsed
             .error_description
             .or(parsed.error)
             .unwrap_or_else(|| "no access token returned".to_string());
-        return Err(ApiError::new(
-            axum::http::StatusCode::BAD_GATEWAY,
+        return Err(ApiError::bad_gateway(
             "github_error",
             format!("GitHub rejected the sign-in: {reason}"),
         ));
@@ -249,16 +195,4 @@ async fn token_request(state: &AppState, body: &serde_json::Value) -> ApiResult<
         refresh_token: parsed.refresh_token.filter(|t| !t.is_empty()),
         expires_at,
     })
-}
-
-async fn reauth_required(state: &AppState, user: &AuthUser) -> ApiError {
-    let hash = user.session_hash.clone();
-    if let Err(err) = state
-        .db
-        .write(move |conn| conn.execute("DELETE FROM sessions WHERE id_hash = ?1", [hash]))
-        .await
-    {
-        tracing::error!("cannot delete session: {err}");
-    }
-    ApiError::unauthorized("github_reauth_required", "Sign in with GitHub again.")
 }

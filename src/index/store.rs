@@ -2,12 +2,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::crypto::sha256_hex;
 use crate::index::chunker::{chunk_file, Chunk, Symbol};
 use crate::index::{languages, select};
-use crate::search::query::camel_parts;
+use crate::model::{SkipReason, EMBED_DONE, EMBED_PENDING};
+use crate::repositories;
 
 /// Files deleted per transaction when a whole repository is purged.
 const PURGE_BATCH_FILES: i64 = 200;
@@ -51,7 +52,7 @@ pub enum FileOutcome {
         chunks: Vec<Chunk>,
         symbols: Vec<Symbol>,
     },
-    Skipped(&'static str),
+    Skipped(SkipReason),
 }
 
 #[derive(Debug, Clone)]
@@ -86,7 +87,7 @@ pub fn prepare_file(path: &str, blob_sha: &str, bytes: &[u8]) -> PreparedFile {
     }
 }
 
-pub fn skipped(path: &str, blob_sha: &str, size: u64, reason: &'static str) -> PreparedFile {
+pub fn skipped(path: &str, blob_sha: &str, size: u64, reason: SkipReason) -> PreparedFile {
     PreparedFile {
         path: path.to_string(),
         blob_sha: blob_sha.to_string(),
@@ -99,7 +100,6 @@ pub fn skipped(path: &str, blob_sha: &str, size: u64, reason: &'static str) -> P
 pub struct ApplyStats {
     pub indexed: u32,
     pub skipped: u32,
-    pub chunks: u32,
 }
 
 /// Indexed paths of a repository with their blob SHA.
@@ -123,14 +123,7 @@ pub fn apply_files(
     let has_vec = vec_table_exists(&tx)?;
     let mut stats = ApplyStats::default();
     for file in files {
-        let existing: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM files WHERE repo_id = ?1 AND path = ?2",
-                params![repo_id, file.path],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let preserved = match existing {
+        let preserved = match file_id(&tx, repo_id, &file.path)? {
             Some(file_id) => delete_file_rows(&tx, file_id, has_vec)?,
             None => HashMap::new(),
         };
@@ -185,7 +178,6 @@ pub fn apply_files(
                 )?;
                 insert_symbols(&tx, repo_id, file_id, symbols)?;
                 stats.indexed += 1;
-                stats.chunks += u32::try_from(chunks.len()).unwrap_or(u32::MAX);
             }
         }
     }
@@ -225,7 +217,11 @@ fn insert_chunks(
                 i64::try_from(chunk.start_byte).unwrap_or(i64::MAX),
                 i64::try_from(chunk.end_byte).unwrap_or(i64::MAX),
                 embed_hash,
-                i64::from(vector.is_some()),
+                if vector.is_some() {
+                    EMBED_DONE
+                } else {
+                    EMBED_PENDING
+                },
             ],
             |row| row.get(0),
         )?;
@@ -237,10 +233,7 @@ fn insert_chunks(
             idents_column(body)
         ])?;
         if let Some(vector) = vector {
-            conn.prepare_cached(
-                "INSERT INTO vec_chunks (chunk_id, repo_id, embedding) VALUES (?1, ?2, ?3)",
-            )?
-            .execute(params![chunk_id, repo_id, vector])?;
+            put_vector(conn, chunk_id, repo_id, vector)?;
         }
     }
     Ok(())
@@ -359,6 +352,21 @@ fn delete_file_rows(
     Ok(preserved)
 }
 
+/// The `files` row id of `path`.
+fn file_id(conn: &Connection, repo_id: i64, path: &str) -> rusqlite::Result<Option<i64>> {
+    conn.prepare_cached("SELECT id FROM files WHERE repo_id = ?1 AND path = ?2")?
+        .query_row(params![repo_id, path], |row| row.get(0))
+        .optional()
+}
+
+/// Deletes a file with all of its rows.
+fn delete_file(tx: &Transaction<'_>, file_id: i64, has_vec: bool) -> rusqlite::Result<()> {
+    delete_file_rows(tx, file_id, has_vec)?;
+    tx.prepare_cached("DELETE FROM files WHERE id = ?1")?
+        .execute([file_id])?;
+    Ok(())
+}
+
 /// Removes the given paths of a repository; returns the number of deleted files.
 pub fn delete_paths(
     conn: &mut Connection,
@@ -369,16 +377,8 @@ pub fn delete_paths(
     let has_vec = vec_table_exists(&tx)?;
     let mut deleted = 0;
     for path in paths {
-        let file_id: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM files WHERE repo_id = ?1 AND path = ?2",
-                params![repo_id, path],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(file_id) = file_id {
-            delete_file_rows(&tx, file_id, has_vec)?;
-            tx.execute("DELETE FROM files WHERE id = ?1", [file_id])?;
+        if let Some(file_id) = file_id(&tx, repo_id, path)? {
+            delete_file(&tx, file_id, has_vec)?;
             deleted += 1;
         }
     }
@@ -386,26 +386,24 @@ pub fn delete_paths(
     Ok(deleted)
 }
 
-/// Deletes all index rows of a repository in batches, then the repository row itself.
-pub fn purge_repository(conn: &mut Connection, repo_id: i64) -> rusqlite::Result<()> {
-    loop {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let has_vec = vec_table_exists(&tx)?;
-        let file_ids: Vec<i64> = {
-            let mut stmt = tx.prepare("SELECT id FROM files WHERE repo_id = ?1 LIMIT ?2")?;
-            let rows = stmt.query_map(params![repo_id, PURGE_BATCH_FILES], |row| row.get(0))?;
-            rows.collect::<rusqlite::Result<_>>()?
-        };
-        if file_ids.is_empty() {
-            tx.execute("DELETE FROM repositories WHERE id = ?1", [repo_id])?;
-            return tx.commit();
-        }
-        for file_id in file_ids {
-            delete_file_rows(&tx, file_id, has_vec)?;
-            tx.execute("DELETE FROM files WHERE id = ?1", [file_id])?;
-        }
-        tx.commit()?;
+/// Deletes up to 200 files of a repository in one transaction; when none are left, deletes the
+/// repository row and returns `true`. Call it until it returns `true`, one writer turn per call.
+pub fn purge_batch(conn: &mut Connection, repo_id: i64) -> rusqlite::Result<bool> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let has_vec = vec_table_exists(&tx)?;
+    let file_ids: Vec<i64> = tx
+        .prepare("SELECT id FROM files WHERE repo_id = ?1 LIMIT ?2")?
+        .query_map(params![repo_id, PURGE_BATCH_FILES], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let done = file_ids.is_empty();
+    if done {
+        repositories::delete(&tx, repo_id)?;
     }
+    for file_id in file_ids {
+        delete_file(&tx, file_id, has_vec)?;
+    }
+    tx.commit()?;
+    Ok(done)
 }
 
 /// Text sent to the embedding model for one chunk (without the document prefix).
@@ -419,4 +417,95 @@ pub fn vec_table_exists(conn: &Connection) -> rusqlite::Result<bool> {
         [],
         |row| row.get(0),
     )
+}
+
+/// Drops and recreates `vec_chunks`; the only place with its DDL.
+pub fn create_vec_table(conn: &Connection, dimensions: u32) -> rusqlite::Result<()> {
+    conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS vec_chunks;
+         CREATE VIRTUAL TABLE vec_chunks USING vec0(
+           chunk_id INTEGER PRIMARY KEY, repo_id INTEGER PARTITION KEY, embedding float[{dimensions}]);"
+    ))
+}
+
+/// Stores the vector of a chunk (`embedding` as [`to_blob`] bytes).
+pub fn put_vector(
+    conn: &Connection,
+    chunk_id: i64,
+    repo_id: i64,
+    embedding: &[u8],
+) -> rusqlite::Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO vec_chunks (chunk_id, repo_id, embedding) VALUES (?1, ?2, ?3)",
+    )?
+    .execute(params![chunk_id, repo_id, embedding])?;
+    Ok(())
+}
+
+/// `(chunk_id, distance)`, ascending by distance, at most `k` over all given repositories.
+pub fn knn(
+    conn: &Connection,
+    repo_ids: &[i64],
+    vector: &[f32],
+    k: usize,
+) -> rusqlite::Result<Vec<(i64, f64)>> {
+    if k == 0 {
+        return Ok(Vec::new());
+    }
+    let blob = to_blob(vector);
+    let k_value = i64::try_from(k).unwrap_or(i64::MAX);
+    let mut stmt = conn.prepare_cached(
+        "SELECT chunk_id, distance FROM vec_chunks WHERE embedding MATCH ?1 AND k = ?2 AND repo_id = ?3",
+    )?;
+    let mut hits: Vec<(i64, f64)> = Vec::new();
+    for &repo_id in repo_ids {
+        let rows = stmt.query_map(params![blob, k_value, repo_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        for row in rows {
+            hits.push(row?);
+        }
+    }
+    hits.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    hits.truncate(k);
+    Ok(hits)
+}
+
+/// Little-endian f32 bytes, the encoding of every `vec_chunks` insert and query.
+pub fn to_blob(vector: &[f32]) -> Vec<u8> {
+    vector
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+/// Lower-cased identifier parts: splits at non-alphanumerics, lower|digit→Upper and acronym→Word
+/// (`HTTPServer` → `http`, `server`; `get_user` → `get`, `user`). Shared by the `idents` column
+/// and the query planner so both tokenise identifiers the same way.
+pub fn camel_parts(identifier: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    for run in identifier.split(|c: char| !c.is_alphanumeric()) {
+        let chars: Vec<char> = run.chars().collect();
+        let mut start = 0;
+        for i in 1..chars.len() {
+            let prev = chars[i - 1];
+            let cur = chars[i];
+            let lower_to_upper = (prev.is_lowercase() || prev.is_numeric()) && cur.is_uppercase();
+            let acronym_to_word = prev.is_uppercase()
+                && cur.is_uppercase()
+                && chars.get(i + 1).is_some_and(|next| next.is_lowercase());
+            if lower_to_upper || acronym_to_word {
+                parts.push(lower(&chars[start..i]));
+                start = i;
+            }
+        }
+        if start < chars.len() {
+            parts.push(lower(&chars[start..]));
+        }
+    }
+    parts
+}
+
+fn lower(chars: &[char]) -> String {
+    chars.iter().flat_map(|c| c.to_lowercase()).collect()
 }

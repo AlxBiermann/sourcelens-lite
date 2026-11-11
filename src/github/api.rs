@@ -6,7 +6,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiResult, GitHubFailure};
 use crate::github::app::GitHub;
 
 const RAW_ACCEPT: &str = "application/vnd.github.raw+json";
@@ -66,18 +66,17 @@ pub async fn branch_head(
         gh.api_base(),
         percent_encode(branch)
     );
-    match get_json::<Branch>(gh, token, &url).await {
-        Ok(branch) => Ok(branch.commit.sha),
-        Err(err) if err.upstream_status == Some(404) => {
-            let mut mapped = ApiError::unprocessable(
-                "branch_not_found",
-                format!("Branch \"{branch}\" was not found in {full_name}."),
-            );
-            mapped.upstream_status = err.upstream_status;
-            Err(mapped)
-        }
-        Err(err) => Err(err),
-    }
+    get_json::<Branch>(gh, token, &url)
+        .await
+        .map(|branch| branch.commit.sha)
+        .map_err(|err| {
+            map_not_found(err, || {
+                ApiError::unprocessable(
+                    "branch_not_found",
+                    format!("Branch \"{branch}\" was not found in {full_name}."),
+                )
+            })
+        })
 }
 
 /// Branch names of the first page (100 branches).
@@ -221,35 +220,32 @@ pub async fn user_installation_repos(
 /// Repository as seen with the user's token; 404 → 404 `repository_not_accessible`.
 pub async fn user_repo(gh: &GitHub, user_token: &str, full_name: &str) -> ApiResult<GhRepo> {
     let url = format!("{}/repos/{full_name}", gh.api_base());
-    match get_json(gh, user_token, &url).await {
-        Ok(repo) => Ok(repo),
-        Err(err) if err.upstream_status == Some(404) => {
-            let mut mapped = ApiError::not_found(
+    get_json(gh, user_token, &url).await.map_err(|err| {
+        map_not_found(err, || {
+            ApiError::not_found(
                 "repository_not_accessible",
                 format!("{full_name} is not accessible to you and the GitHub App."),
-            );
-            mapped.upstream_status = err.upstream_status;
-            Err(mapped)
-        }
-        Err(err) => Err(err),
+            )
+        })
+    })
+}
+
+/// Replaces a GitHub 404 with `not_found()`, keeping [`ApiError::github`]; other errors pass through.
+fn map_not_found(err: ApiError, not_found: impl FnOnce() -> ApiError) -> ApiError {
+    if err.github == Some(GitHubFailure::Status(404)) {
+        not_found().with_github(err.github)
+    } else {
+        err
     }
 }
 
 async fn get_json<T: DeserializeOwned>(gh: &GitHub, token: &str, url: &str) -> ApiResult<T> {
     let response = gh.send(|| gh.http().get(url).bearer_auth(token)).await?;
-    response.json::<T>().await.map_err(|err| {
-        tracing::warn!("unexpected GitHub response from {url}: {err}");
-        ApiError::new(
-            axum::http::StatusCode::BAD_GATEWAY,
-            "github_error",
-            "GitHub returned an unexpected response.",
-        )
-    })
+    GitHub::json(response, url).await
 }
 
 fn read_failed(err: reqwest::Error) -> ApiError {
-    ApiError::new(
-        axum::http::StatusCode::BAD_GATEWAY,
+    ApiError::bad_gateway(
         "github_unreachable",
         format!("Reading the GitHub response failed: {err}"),
     )

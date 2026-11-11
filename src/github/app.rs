@@ -8,13 +8,13 @@ use base64::Engine;
 use reqwest::header::{ACCEPT, RETRY_AFTER};
 use ring::rand::SystemRandom;
 use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
-use rusqlite::OptionalExtension;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::SecretKey;
-use crate::db::Db;
-use crate::error::{ApiError, ApiResult};
-use crate::state::now;
+use crate::db::{self, Db};
+use crate::error::{ApiError, ApiResult, GitHubFailure};
+use crate::state::{lock, now};
 
 const SETTINGS_KEY: &str = "github_app";
 const API_VERSION_HEADER: &str = "x-github-api-version";
@@ -92,16 +92,9 @@ impl GitHub {
         if let Some(env) = &self.env {
             return Ok(Some(env.clone()));
         }
-        let sealed: Option<Vec<u8>> = self
+        let sealed = self
             .db
-            .read(|conn| {
-                conn.query_row(
-                    "SELECT value FROM settings WHERE key = ?1",
-                    [SETTINGS_KEY],
-                    |row| row.get(0),
-                )
-                .optional()
-            })
+            .read(|conn| db::get_setting(conn, SETTINGS_KEY))
             .await?;
         let Some(sealed) = sealed else {
             return Ok(None);
@@ -135,15 +128,8 @@ impl GitHub {
         };
         let json = serde_json::to_vec(&stored).map_err(ApiError::internal)?;
         let sealed = self.key.seal(&json);
-        let ts = now();
         self.db
-            .write(move |conn| {
-                conn.execute(
-                    "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3)
-                     ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-                    rusqlite::params![SETTINGS_KEY, sealed, ts],
-                )
-            })
+            .write(move |conn| db::put_setting(conn, SETTINGS_KEY, sealed))
             .await?;
         Ok(())
     }
@@ -197,7 +183,7 @@ impl GitHub {
         struct TokenResponse {
             token: String,
         }
-        let body: TokenResponse = response.json().await.map_err(invalid_response)?;
+        let body: TokenResponse = Self::json(response, &url).await?;
         self.cache()
             .insert(installation_id, (body.token.clone(), Instant::now()));
         Ok(body.token)
@@ -218,12 +204,20 @@ impl GitHub {
         struct InstallationResponse {
             id: u64,
         }
-        let body: InstallationResponse = response.json().await.map_err(invalid_response)?;
+        let body: InstallationResponse = Self::json(response, &url).await?;
         Ok(body.id)
     }
 
+    /// Parses a 2xx GitHub response body; a body that does not parse is 502 `github_error`.
+    pub async fn json<T: DeserializeOwned>(response: reqwest::Response, url: &str) -> ApiResult<T> {
+        response.json::<T>().await.map_err(|err| {
+            tracing::warn!("unexpected GitHub response from {url}: {err}");
+            ApiError::bad_gateway("github_error", "GitHub sent an unexpected response.")
+        })
+    }
+
     /// Single path for every GitHub call: default headers, retries on network errors and 502/503/504,
-    /// rate-limit and error mapping with `upstream_status`.
+    /// rate-limit and error mapping with [`ApiError::github`].
     pub async fn send(
         &self,
         build: impl Fn() -> reqwest::RequestBuilder,
@@ -252,8 +246,7 @@ impl GitHub {
                 }
                 Err(err) => {
                     if attempt >= MAX_ATTEMPTS {
-                        return Err(ApiError::new(
-                            StatusCode::BAD_GATEWAY,
+                        return Err(ApiError::bad_gateway(
                             "github_unreachable",
                             format!("GitHub could not be reached: {err}"),
                         ));
@@ -268,9 +261,7 @@ impl GitHub {
     }
 
     fn cache(&self) -> MutexGuard<'_, HashMap<u64, (String, Instant)>> {
-        self.token_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        lock(&self.token_cache)
     }
 }
 
@@ -279,13 +270,12 @@ async fn error_from_response(response: reqwest::Response) -> ApiError {
     let code = status.as_u16();
     if matches!(code, 403 | 429) {
         if let Some(seconds) = rate_limit_wait(response.headers()) {
-            let mut err = ApiError::new(
+            return ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "github_rate_limited",
                 format!("GitHub rate limit reached. Try again in {seconds} seconds."),
-            );
-            err.upstream_status = Some(code);
-            return err;
+            )
+            .with_github(Some(GitHubFailure::RateLimited));
         }
     }
     let text = response.text().await.unwrap_or_default();
@@ -294,15 +284,13 @@ async fn error_from_response(response: reqwest::Response) -> ApiError {
         .and_then(|body| body.get("message")?.as_str().map(str::to_string))
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| status.canonical_reason().unwrap_or("").to_string());
-    let mut err = ApiError::new(
-        StatusCode::BAD_GATEWAY,
+    ApiError::bad_gateway(
         "github_error",
         format!("GitHub rejected the request: {code} {message}")
             .trim_end()
             .to_string(),
-    );
-    err.upstream_status = Some(code);
-    err
+    )
+    .with_github(Some(GitHubFailure::Status(code)))
 }
 
 /// Seconds to wait when the response is a rate-limit answer, else `None`.
@@ -359,13 +347,5 @@ pub(crate) fn app_not_configured() -> ApiError {
     ApiError::conflict(
         "app_not_configured",
         "The GitHub App is not configured yet.",
-    )
-}
-
-fn invalid_response(err: reqwest::Error) -> ApiError {
-    ApiError::new(
-        StatusCode::BAD_GATEWAY,
-        "github_error",
-        format!("GitHub sent an unexpected response: {err}"),
     )
 }
