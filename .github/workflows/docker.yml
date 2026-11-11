@@ -1,0 +1,140 @@
+name: Container image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY_IMAGE: ghcr.io/alxbiermann/sourcelens-lite
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Prepare
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          labels: |
+            org.opencontainers.image.title=SourceLens Lite
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ env.REGISTRY_IMAGE }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish manifest list
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        env:
+          # The manifest list carries the description GHCR shows on the package page.
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          # latest follows main only; version tags do not move it.
+          flavor: latest=false
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          annotations: |
+            org.opencontainers.image.title=SourceLens Lite
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          args=()
+          while IFS= read -r tag; do args+=(--tag "$tag"); done < <(jq -r '.tags[]' <<<"$DOCKER_METADATA_OUTPUT_JSON")
+          while IFS= read -r annotation; do args+=(--annotation "$annotation"); done < <(jq -r '.annotations[]' <<<"$DOCKER_METADATA_OUTPUT_JSON")
+          if [ "${#args[@]}" -eq 0 ]; then echo "No tags to publish" >&2; exit 1; fi
+          sources=()
+          for digest in *; do sources+=("${REGISTRY_IMAGE}@sha256:${digest}"); done
+          docker buildx imagetools create "${args[@]}" "${sources[@]}"
+
+      - name: Inspect image
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: docker buildx imagetools inspect "${REGISTRY_IMAGE}:${VERSION}"

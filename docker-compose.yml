@@ -1,8 +1,12 @@
 services:
   sourcelens:
+    # `docker compose up` pulls the published image; `docker compose up --build` builds it from this checkout.
+    image: ghcr.io/alxbiermann/sourcelens-lite:latest
     build: .
     env_file: .env
     environment:
+      # Fixed inside the container regardless of .env: the volume, port mapping and health check rely on them.
+      SOURCELENS_BIND: 0.0.0.0:3000
       SOURCELENS_DATA_DIR: /data
     ports:
       - "3000:3000"

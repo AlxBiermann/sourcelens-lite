@@ -1,0 +1,29 @@
+# The image is built from Cargo.toml, Cargo.lock, build.rs, migrations/, src/ and ui/ (sources only).
+.git
+.github
+.gitignore
+.dockerignore
+target
+data
+.env
+.env.*
+tests
+ui/node_modules
+ui/dist
+ui/*.tsbuildinfo
+docker-compose.yml
+docs
+*.md
+
+# Local worktrees, agent and editor state
+.worktrees
+.claude
+.planning
+.orca
+.vscode
+.idea
+.zed
+.fleet
+**/.DS_Store
+**/*.swp
+**/*~
