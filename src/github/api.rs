@@ -11,6 +11,10 @@ use crate::github::app::GitHub;
 
 const RAW_ACCEPT: &str = "application/vnd.github.raw+json";
 const TARBALL_TIMEOUT: Duration = Duration::from_secs(600);
+/// Tarballs hold a private repository's whole source: owner read/write only.
+#[cfg(unix)]
+const TARBALL_FILE_MODE: u32 = 0o600;
+const BYTES_PER_GIB: f64 = (1u64 << 30) as f64;
 const PER_PAGE: usize = 100;
 const MAX_REPO_PAGES: u32 = 10;
 const MAX_INSTALLATION_PAGES: u32 = 10;
@@ -134,13 +138,15 @@ pub async fn blob(gh: &GitHub, token: &str, full_name: &str, blob_sha: &str) -> 
     Ok(bytes.to_vec())
 }
 
-/// Streams the gzipped tarball of a commit to `dest`.
+/// Streams the gzipped tarball of a commit to `dest` (created with mode 0600). An archive larger
+/// than `max_bytes` fails with 422 `archive_too_large`; the caller removes the partial file.
 pub async fn tarball(
     gh: &GitHub,
     token: &str,
     full_name: &str,
     sha: &str,
     dest: &Path,
+    max_bytes: u64,
 ) -> ApiResult<()> {
     let url = format!(
         "{}/repos/{full_name}/tarball/{}",
@@ -155,14 +161,32 @@ pub async fn tarball(
                 .timeout(TARBALL_TIMEOUT)
         })
         .await?;
-    let mut file = tokio::fs::File::create(dest)
-        .await
-        .map_err(ApiError::internal)?;
+    if response.content_length().is_some_and(|len| len > max_bytes) {
+        return Err(archive_too_large(max_bytes));
+    }
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(TARBALL_FILE_MODE);
+    let mut file = options.open(dest).await.map_err(ApiError::internal)?;
+    let mut written: u64 = 0;
     while let Some(chunk) = response.chunk().await.map_err(read_failed)? {
+        written += chunk.len() as u64;
+        if written > max_bytes {
+            return Err(archive_too_large(max_bytes));
+        }
         file.write_all(&chunk).await.map_err(ApiError::internal)?;
     }
     file.flush().await.map_err(ApiError::internal)?;
     Ok(())
+}
+
+fn archive_too_large(max_bytes: u64) -> ApiError {
+    let gib = (max_bytes as f64 / BYTES_PER_GIB * 100.0).round() / 100.0;
+    ApiError::unprocessable(
+        "archive_too_large",
+        format!("Repository archive is larger than {gib} GiB. Raise SOURCELENS_MAX_ARCHIVE_BYTES."),
+    )
 }
 
 /// Installations of this app that the signed-in user can access.

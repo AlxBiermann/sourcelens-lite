@@ -12,12 +12,16 @@ use sourcelens::config::Config;
 use sourcelens::crypto::git_blob_sha1;
 use sourcelens::github::app::AppCredentials;
 use sourcelens::index::jobs;
-use sourcelens::index::pipeline::TARBALL_THRESHOLD;
+use sourcelens::index::pipeline::{archive_threads_running, TARBALL_THRESHOLD};
 use sourcelens::model::Trigger;
 use sourcelens::state::{now, AppState};
 use tempfile::TempDir;
 
 const INSTALLATION_ID: i64 = 42;
+
+/// Held by every test that runs an archive pipeline, so `archive_threads_running` only sees the
+/// current test's threads.
+static ARCHIVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // ── Fake GitHub ──────────────────────────────────────────────────────────────
 
@@ -30,6 +34,10 @@ struct Fake {
     truncated: bool,
     /// paths left out of tarballs
     archive_omit: HashSet<String>,
+    /// serve only the first half of the tarball bytes
+    archive_cut: bool,
+    /// runs while a tarball is served
+    tarball_hook: Option<Box<dyn Fn() + Send>>,
     token_status: Option<StatusCode>,
     installation_status: Option<StatusCode>,
     tree_requests: usize,
@@ -170,6 +178,9 @@ async fn tarball(
 ) -> Response {
     let mut fake = fake.lock().unwrap();
     fake.tarball_requests += 1;
+    if let Some(hook) = &fake.tarball_hook {
+        hook();
+    }
     let Some(files) = fake.commits.get(&sha) else {
         return not_found();
     };
@@ -206,7 +217,11 @@ async fn tarball(
     }
     let mut gz = builder.into_inner().unwrap();
     gz.flush().unwrap();
-    gz.finish().unwrap().into_response()
+    let mut bytes = gz.finish().unwrap();
+    if fake.archive_cut {
+        bytes.truncate(bytes.len() / 2);
+    }
+    bytes.into_response()
 }
 
 async fn start_fake(fake: Shared) -> String {
@@ -253,12 +268,17 @@ fn credentials() -> AppCredentials {
 }
 
 async fn setup() -> Env {
+    setup_with(|_| {}).await
+}
+
+async fn setup_with(configure: impl FnOnce(&mut Config)) -> Env {
     let tmp = tempfile::tempdir().unwrap();
     let fake: Shared = Arc::default();
     let base = start_fake(fake.clone()).await;
     let mut cfg = Config::new("http://localhost:3000", tmp.path());
     cfg.github = Some(credentials());
     cfg.github_api_url = base;
+    configure(&mut cfg);
     let state = AppState::new(cfg).unwrap();
     let repo_id = state
         .db
@@ -298,8 +318,13 @@ impl Env {
 
     /// Queues a job, runs it through `run_next` and returns its row (`None` when it was discarded).
     async fn run(&self, trigger: &str, force: bool) -> Option<JobRow> {
+        self.run_target(trigger, None, force).await
+    }
+
+    /// [`Env::run`] with a pushed `target_commit` on the queued job.
+    async fn run_target(&self, trigger: &str, target: Option<&str>, force: bool) -> Option<JobRow> {
         let trigger = Trigger::parse(trigger).expect("known trigger");
-        let job_id = jobs::enqueue(&self.state, self.repo_id, trigger, None, force)
+        let job_id = jobs::enqueue(&self.state, self.repo_id, trigger, target, force)
             .await
             .unwrap();
         assert!(jobs::run_next(&self.state).await.unwrap());
@@ -493,6 +518,7 @@ async fn unchanged_head_makes_no_tree_request() {
 
 #[tokio::test]
 async fn many_changed_files_use_the_tarball() {
+    let _archive = ARCHIVE_LOCK.lock().await;
     let env = setup().await;
     let contents: Vec<(String, Vec<u8>)> = (0..TARBALL_THRESHOLD + 10)
         .map(|i| {
@@ -557,6 +583,7 @@ async fn many_changed_files_use_the_tarball() {
 
 #[tokio::test]
 async fn truncated_tree_takes_files_and_deletions_from_the_archive() {
+    let _archive = ARCHIVE_LOCK.lock().await;
     let env = setup().await;
     env.fake().set_commit(
         &"1".repeat(40),
@@ -801,4 +828,334 @@ async fn recovery_purges_repositories_being_deleted() {
     assert_eq!((repos, files), (0, 0));
     let fts: i64 = env.fts_hits("quokkaword").await;
     assert_eq!(fts, 0);
+}
+
+// ── Fixes: push target, app auth, archive limits and the archive pipeline ────
+
+impl Env {
+    /// Files left in `<data>/tmp`.
+    fn tmp_leftovers(&self) -> Vec<std::ffi::OsString> {
+        std::fs::read_dir(self.tmp.path().join("tmp"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect()
+    }
+
+    /// Every row of `sql` (one `?1` = repository id), all columns rendered, sorted.
+    async fn dump(&self, sql: &'static str) -> Vec<String> {
+        let repo_id = self.repo_id;
+        let mut rows = self
+            .state
+            .db
+            .read(move |conn| {
+                let mut stmt = conn.prepare(sql)?;
+                let columns = stmt.column_count();
+                let rows = stmt
+                    .query_map([repo_id], |row| {
+                        (0..columns)
+                            .map(|i| {
+                                row.get::<_, rusqlite::types::Value>(i)
+                                    .map(|v| format!("{v:?}"))
+                            })
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                            .map(|values| values.join(" | "))
+                    })?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                Ok::<_, rusqlite::Error>(rows)
+            })
+            .await
+            .unwrap();
+        rows.sort();
+        rows
+    }
+
+    async fn repo_state(&self) -> (String, Option<String>) {
+        let state: String = self
+            .query("SELECT state FROM repositories WHERE id = ?1")
+            .await;
+        let reason: Option<String> = self
+            .query("SELECT state_reason FROM repositories WHERE id = ?1")
+            .await;
+        (state, reason)
+    }
+}
+
+fn generated_files(count: usize) -> Vec<(String, Vec<u8>)> {
+    (0..count)
+        .map(|i| {
+            (
+                format!("src/gen/mod_{i}.rs"),
+                format!(
+                    "pub fn generated_{i}(seed: u32) -> u32 {{\n    let value = seed * {i};\n    value + {i}\n}}\n"
+                )
+                .into_bytes(),
+            )
+        })
+        .collect()
+}
+
+fn set_files(fake: &mut Fake, sha: &str, files: &[(String, Vec<u8>)]) {
+    let files: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(path, content)| (path.as_str(), content.as_slice()))
+        .collect();
+    fake.set_commit(sha, &files);
+}
+
+#[tokio::test]
+async fn queued_older_target_commit_indexes_the_branch_head() {
+    let env = setup().await;
+    first_commit(&mut env.fake());
+    env.run("connect", false).await.unwrap();
+    {
+        let mut fake = env.fake();
+        let mut files = fake.commits[&"1".repeat(40)].clone();
+        files.insert("src/util.py".into(), UTIL_V2.to_vec());
+        fake.commits.insert("2".repeat(40), files);
+        fake.branches.insert("main".into(), "2".repeat(40));
+    }
+    // A replayed or late delivery of the first push queues the older commit.
+    let job = env
+        .run_target("webhook", Some(&"1".repeat(40)), false)
+        .await
+        .unwrap();
+    assert_eq!(job.status, "succeeded", "{:?}", job.error);
+    let indexed: Option<String> = env
+        .query("SELECT indexed_commit FROM repositories WHERE id = ?1")
+        .await;
+    let job_commit: Option<String> = env
+        .query("SELECT target_commit FROM jobs WHERE repo_id = ?1 ORDER BY id DESC LIMIT 1")
+        .await;
+    assert_eq!(indexed, Some("2".repeat(40)));
+    assert_eq!(job_commit, Some("2".repeat(40)));
+    assert_eq!(env.fts_hits("zebracorn").await, 1);
+    assert_eq!(env.fts_hits("quokkaword").await, 0);
+}
+
+#[tokio::test]
+async fn rejected_app_credentials_fail_the_job_and_keep_the_repository_connected() {
+    for (token, lookup) in [
+        (StatusCode::UNAUTHORIZED, None),
+        (StatusCode::NOT_FOUND, Some(StatusCode::UNAUTHORIZED)),
+    ] {
+        let env = setup().await;
+        first_commit(&mut env.fake());
+        {
+            let mut fake = env.fake();
+            fake.token_status = Some(token);
+            fake.installation_status = lookup;
+        }
+        let job = env.run("connect", false).await.unwrap();
+        assert_eq!(job.status, "failed", "token {token}, lookup {lookup:?}");
+        assert!(job.error.is_some_and(|e| !e.is_empty()));
+        assert_eq!(env.repo_state().await, ("connected".to_string(), None));
+        let installation: i64 = env
+            .query("SELECT installation_id FROM repositories WHERE id = ?1")
+            .await;
+        assert_eq!(installation, INSTALLATION_ID);
+        assert!(env.files().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn forbidden_installation_lookup_disconnects_the_repository() {
+    let env = setup().await;
+    first_commit(&mut env.fake());
+    {
+        let mut fake = env.fake();
+        fake.token_status = Some(StatusCode::NOT_FOUND);
+        fake.installation_status = Some(StatusCode::FORBIDDEN);
+    }
+    let job = env.run("connect", false).await.unwrap();
+    assert_eq!(job.status, "failed");
+    assert_eq!(env.repo_state().await.0, "disconnected");
+}
+
+#[tokio::test]
+async fn tarball_is_written_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = setup().await;
+    env.fake()
+        .set_commit(&"1".repeat(40), &[("a.py", b"def a():\n    return 1\n")]);
+    let token = env
+        .state
+        .github
+        .installation_token(INSTALLATION_ID as u64)
+        .await
+        .unwrap();
+    let dest = env.tmp.path().join("archive.tar.gz");
+    sourcelens::github::api::tarball(
+        &env.state.github,
+        &token,
+        "acme/api",
+        &"1".repeat(40),
+        &dest,
+        u64::MAX,
+    )
+    .await
+    .unwrap();
+    let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+}
+
+#[tokio::test]
+async fn archive_over_the_size_limit_fails_the_job_and_leaves_no_temp_file() {
+    let env = setup_with(|cfg| cfg.max_archive_bytes = 1024).await;
+    set_files(
+        &mut env.fake(),
+        &"1".repeat(40),
+        &generated_files(TARBALL_THRESHOLD + 10),
+    );
+    let job = env.run("connect", false).await.unwrap();
+    assert_eq!(job.status, "failed");
+    assert!(
+        job.error
+            .as_deref()
+            .is_some_and(|e| e.contains("SOURCELENS_MAX_ARCHIVE_BYTES")),
+        "{:?}",
+        job.error
+    );
+    assert_eq!(env.fake().tarball_requests, 1);
+    assert!(env.tmp_leftovers().is_empty(), "{:?}", env.tmp_leftovers());
+    assert!(env.files().await.is_empty());
+    let indexed: Option<String> = env
+        .query("SELECT indexed_commit FROM repositories WHERE id = ?1")
+        .await;
+    assert_eq!(indexed, None);
+}
+
+#[tokio::test]
+async fn archive_and_blobs_index_the_same_rows() {
+    let _archive = ARCHIVE_LOCK.lock().await;
+    const TS: &[u8] = b"export class UserStore {\n  private users = new Map<string, string>();\n\n  getUserById(id: string): string | undefined {\n    return this.users.get(id);\n  }\n}\n";
+    let mut snapshots = Vec::new();
+    for truncated in [false, true] {
+        let env = setup().await;
+        {
+            let mut fake = env.fake();
+            first_commit(&mut fake);
+            let mut files = fake.commits[&"1".repeat(40)].clone();
+            files.insert("web/store.ts".into(), TS.to_vec());
+            fake.commits.insert("1".repeat(40), files);
+            fake.truncated = truncated;
+        }
+        let job = env.run("connect", false).await.unwrap();
+        assert_eq!(job.status, "succeeded", "{:?}", job.error);
+        {
+            let fake = env.fake();
+            let expected = if truncated { (1, 0) } else { (0, 5) };
+            assert_eq!((fake.tarball_requests, fake.blob_requests), expected);
+        }
+        snapshots.push((
+            env.dump(
+                "SELECT path, blob_sha, language, size, line_count, skip_reason
+                 FROM files WHERE repo_id = ?1",
+            )
+            .await,
+            env.dump(
+                "SELECT f.path, c.kind, c.symbol_path, c.start_line, c.end_line, c.start_byte,
+                        c.end_byte, c.embed_hash
+                 FROM chunks c JOIN files f ON f.id = c.file_id WHERE c.repo_id = ?1",
+            )
+            .await,
+            env.dump(
+                "SELECT f.path, s.kind, s.qualified_name, s.signature, s.start_line, s.end_line
+                 FROM symbols s JOIN files f ON f.id = s.file_id WHERE s.repo_id = ?1",
+            )
+            .await,
+        ));
+    }
+    let (blobs, archive) = (&snapshots[0], &snapshots[1]);
+    assert_eq!(blobs.0.len(), 5);
+    assert!(!blobs.1.is_empty() && !blobs.2.is_empty());
+    assert_eq!(blobs.0, archive.0);
+    assert_eq!(blobs.1, archive.1);
+    assert_eq!(blobs.2, archive.2);
+}
+
+#[tokio::test]
+async fn archive_failure_midway_leaves_no_temp_file_and_no_thread() {
+    let _archive = ARCHIVE_LOCK.lock().await;
+    let env = setup().await;
+    {
+        let mut fake = env.fake();
+        set_files(
+            &mut fake,
+            &"1".repeat(40),
+            &generated_files(TARBALL_THRESHOLD + 50),
+        );
+        fake.archive_cut = true;
+    }
+    let job = env.run("connect", false).await.unwrap();
+    assert_eq!(job.status, "failed");
+    assert!(job.error.is_some_and(|e| !e.is_empty()));
+    assert_eq!(env.fake().tarball_requests, 1);
+    assert!(env.tmp_leftovers().is_empty(), "{:?}", env.tmp_leftovers());
+    assert_eq!(archive_threads_running(), 0);
+    let indexed: Option<String> = env
+        .query("SELECT indexed_commit FROM repositories WHERE id = ?1")
+        .await;
+    assert_eq!(indexed, None);
+}
+
+#[tokio::test]
+async fn disconnect_during_the_archive_stops_every_stage() {
+    let _archive = ARCHIVE_LOCK.lock().await;
+    let env = setup().await;
+    let db_path = env.tmp.path().join("sourcelens.db");
+    let repo_id = env.repo_id;
+    {
+        let mut fake = env.fake();
+        set_files(
+            &mut fake,
+            &"1".repeat(40),
+            &generated_files(TARBALL_THRESHOLD + 50),
+        );
+        // The repository is disconnected while its archive downloads.
+        fake.tarball_hook = Some(Box::new(move || {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            conn.execute(
+                "UPDATE repositories SET state = 'disconnected' WHERE id = ?1",
+                [repo_id],
+            )
+            .unwrap();
+        }));
+    }
+    let job = env.run("connect", false).await.unwrap();
+    assert_eq!(job.status, "failed");
+    assert!(job.error.is_some_and(|e| !e.is_empty()));
+    assert!(env.tmp_leftovers().is_empty(), "{:?}", env.tmp_leftovers());
+    assert_eq!(archive_threads_running(), 0);
+    assert!(env.files().await.is_empty());
+}
+
+#[tokio::test]
+async fn deleting_more_than_one_slice_of_files_works() {
+    let _archive = ARCHIVE_LOCK.lock().await;
+    let env = setup().await;
+    let mut files = generated_files(TARBALL_THRESHOLD + 50);
+    set_files(&mut env.fake(), &"1".repeat(40), &files);
+    let job = env.run("connect", false).await.unwrap();
+    assert_eq!(job.status, "succeeded", "{:?}", job.error);
+
+    files.truncate(1);
+    set_files(&mut env.fake(), &"2".repeat(40), &files);
+    let job = env.run("webhook", false).await.unwrap();
+    assert_eq!(job.status, "succeeded", "{:?}", job.error);
+    assert_eq!(
+        (job.files_deleted, job.files_changed),
+        ((TARBALL_THRESHOLD + 49) as i64, 0)
+    );
+    let left: Vec<String> = env.files().await.into_keys().collect();
+    assert_eq!(left, vec!["src/gen/mod_0.rs".to_string()]);
+    let chunks: i64 = env
+        .query("SELECT count(*) FROM chunks WHERE repo_id = ?1")
+        .await;
+    let chunk_count: i64 = env
+        .query("SELECT chunk_count FROM repositories WHERE id = ?1")
+        .await;
+    assert_eq!(chunk_count, chunks);
 }

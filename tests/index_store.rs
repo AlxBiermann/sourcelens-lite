@@ -5,7 +5,7 @@ use sourcelens::db::Db;
 use sourcelens::index::select::{content_skip_reason, path_allowed};
 use sourcelens::index::store::{
     apply_files, delete_paths, existing_files, plan_diff, prepare_file, purge_batch, skipped,
-    FileOutcome, TreeEntry,
+    FileOutcome, TreeEntry, DELETE_BATCH_FILES, DELETE_FILE_ROWS_SQL,
 };
 use sourcelens::model::SkipReason;
 
@@ -382,4 +382,81 @@ async fn purge_batch_deletes_one_bounded_batch_per_writer_turn() {
         .await
         .unwrap();
     assert_eq!(after, (0, 0, 0, 0, 0, 0, 1));
+}
+
+#[tokio::test]
+async fn file_row_deletes_use_indexes_and_rowid_lookups() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = open_db(&tmp);
+    let plans: Vec<Vec<String>> = db
+        .read(|conn| {
+            DELETE_FILE_ROWS_SQL
+                .iter()
+                .map(|sql| {
+                    conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?
+                        .query_map([1], |row| row.get(3))?
+                        .collect()
+                })
+                .collect::<rusqlite::Result<_>>()
+        })
+        .await
+        .unwrap();
+    for (sql, plan) in DELETE_FILE_ROWS_SQL.iter().zip(&plans) {
+        for step in plan {
+            // FTS5 takes `rowid IN (…)` one value at a time (idxStr `=`); plain tables use an index.
+            let ok = step.starts_with("SEARCH ")
+                || step.starts_with("LIST SUBQUERY")
+                || step.ends_with("VIRTUAL TABLE INDEX 0:=");
+            assert!(ok, "{sql}: {plan:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn delete_paths_in_slices_lets_other_writes_interleave() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = open_db(&tmp);
+    let repo = db
+        .write(|conn| {
+            let repo = insert_repo(conn, 1, "acme/api");
+            let files: Vec<_> = (0..450)
+                .map(|i| prepare_file(&format!("src/f{i}.rs"), "s", V2.as_bytes()))
+                .collect();
+            apply_files(conn, repo, &files)?;
+            Ok::<_, rusqlite::Error>(repo)
+        })
+        .await
+        .unwrap();
+    let paths: Vec<String> = (0..450).map(|i| format!("src/f{i}.rs")).collect();
+
+    let mut deleted = 0;
+    for (turn, slice) in paths.chunks(DELETE_BATCH_FILES).enumerate() {
+        let slice = slice.to_vec();
+        deleted += db
+            .write(move |conn| delete_paths(conn, repo, &slice))
+            .await
+            .unwrap();
+        db.write(move |conn| {
+            conn.execute(
+                "INSERT INTO webhook_deliveries (delivery_id, event, received_at) VALUES (?1, 'push', 1)",
+                [format!("d{turn}")],
+            )
+        })
+        .await
+        .unwrap();
+    }
+    let after = db
+        .read(|conn| {
+            Ok::<_, rusqlite::Error>((
+                count(conn, "SELECT count(*) FROM files"),
+                count(conn, "SELECT count(*) FROM chunks"),
+                count(conn, "SELECT count(*) FROM symbols"),
+                fts_hits(conn, "chunks_fts", "platypus"),
+                count(conn, "SELECT count(*) FROM webhook_deliveries"),
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(deleted, 450);
+    assert_eq!(after, (0, 0, 0, 0, 3));
 }
