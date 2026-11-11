@@ -39,7 +39,9 @@ pub async fn search(
         }
     };
     let input = format!("{}{}", settings.query_prefix, query);
-    let vector = match tokio::time::timeout(QUERY_EMBED_TIMEOUT, embedder.embed(&[input])).await {
+    // One attempt: a provider that fails would otherwise hold the search for the whole timeout.
+    let embedded = tokio::time::timeout(QUERY_EMBED_TIMEOUT, embedder.embed_once(&[input])).await;
+    let vector = match embedded {
         Ok(Ok(vectors)) => match vectors.into_iter().next() {
             Some(vector) => vector,
             None => {

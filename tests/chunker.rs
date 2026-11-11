@@ -348,6 +348,94 @@ fn constants_are_symbols_without_changing_chunks() {
     );
 }
 
+/// Chunk ranges of `content` and of the same text with every `const`/`constexpr` keyword blanked
+/// out (same lines and columns), so the constant symbols cannot have moved a chunk boundary.
+fn assert_same_chunks_without_const(path: &str, content: &str) {
+    let plain = content
+        .replace("constexpr", "         ")
+        .replace("const ", "      ");
+    let (with_const, _) = chunk(path, content);
+    let (without_const, plain_symbols) = chunk(path, &plain);
+    assert_eq!(ranges(&with_const), ranges(&without_const));
+    // Without the keyword only the macros are constants, so the comparison is meaningful.
+    let is_macro = |symbol: &Symbol| {
+        symbol
+            .signature
+            .as_deref()
+            .is_some_and(|signature| signature.starts_with("#define"))
+    };
+    assert!(plain_symbols
+        .iter()
+        .all(|symbol| symbol.kind != "constant" || is_macro(symbol)));
+}
+
+#[test]
+fn c_cpp_and_php_constants_are_symbols_without_changing_chunks() {
+    let constants = |symbols: &[Symbol]| {
+        let mut names: Vec<String> = symbols
+            .iter()
+            .filter(|symbol| symbol.kind == "constant")
+            .map(|symbol| symbol.name.clone())
+            .collect();
+        names.sort();
+        names
+    };
+
+    let c = "#ifndef GEOMETRY_H\n#define GEOMETRY_H\n#include <stdint.h>\n\n#define MAX_SHAPES 128\n#define AREA(w, h) ((w) * (h))\nstatic const int DEFAULT_WIDTH = 640;\nconst char *const UNIT_NAME = \"px\";\nextern const int EXTERNAL_LIMIT;\nint counter = 0;\n\nuint32_t size_area(uint32_t w, uint32_t h) {\n    return AREA(w, h);\n}\n#endif\n";
+    let (chunks, symbols) = chunk("geo/geometry.c", c);
+    assert_disjoint(&chunks);
+    assert!(chunks.iter().all(|chunk| chunk.kind != "constant"));
+    // Include guards, function-like macros, declarations without a value and variables are not.
+    assert_eq!(constants(&symbols), ["DEFAULT_WIDTH", "MAX_SHAPES", "UNIT_NAME"]);
+    let width = symbol(&symbols, "DEFAULT_WIDTH");
+    assert_eq!(width.start_line, line_of(c, "DEFAULT_WIDTH"));
+    assert_eq!(
+        width.signature.as_deref(),
+        Some("static const int DEFAULT_WIDTH = 640;")
+    );
+    assert_eq!(
+        symbol(&symbols, "MAX_SHAPES").signature.as_deref(),
+        Some("#define MAX_SHAPES 128")
+    );
+    assert_same_chunks_without_const("geo/geometry.c", c);
+
+    let cpp = "namespace ui {\nconstexpr int kMaxWidgets = 64;\nconst double kScale = 1.5;\n#define UI_VERSION \"2.1\"\nint instances = 0;\nvoid draw();\n}\n\nstatic const int kDefaultHeight = 480;\n";
+    let (chunks, symbols) = chunk("ui/widgets.cpp", cpp);
+    assert_disjoint(&chunks);
+    assert!(chunks.iter().all(|chunk| chunk.kind != "constant"));
+    assert_eq!(
+        constants(&symbols),
+        ["UI_VERSION", "kDefaultHeight", "kMaxWidgets", "kScale"]
+    );
+    assert_eq!(
+        symbol(&symbols, "kMaxWidgets").qualified_name,
+        "ui.kMaxWidgets"
+    );
+    assert_same_chunks_without_const("ui/widgets.cpp", cpp);
+
+    let php = "<?php\nnamespace Acme\\Invoices;\n\nconst DEFAULT_LOCALE = 'de';\n\nclass InvoiceRenderer\n{\n    const DEFAULT_CURRENCY = 'EUR';\n    public const ROUNDING = 2, PRECISION = 4;\n\n    public function render(array $invoice): string\n    {\n        return implode(\"\\n\", $invoice);\n    }\n}\n";
+    let (chunks, symbols) = chunk("src/Invoice.php", php);
+    assert_disjoint(&chunks);
+    assert!(chunks.iter().all(|chunk| chunk.kind != "constant"));
+    assert_eq!(
+        constants(&symbols),
+        ["DEFAULT_CURRENCY", "DEFAULT_LOCALE", "PRECISION", "ROUNDING"]
+    );
+    let currency = symbol(&symbols, "DEFAULT_CURRENCY");
+    assert_eq!(
+        (currency.qualified_name.as_str(), currency.start_line),
+        (
+            "Acme.Invoices.InvoiceRenderer.DEFAULT_CURRENCY",
+            line_of(php, "DEFAULT_CURRENCY")
+        )
+    );
+    assert_eq!(
+        symbol(&symbols, "DEFAULT_LOCALE").qualified_name,
+        "Acme.Invoices.DEFAULT_LOCALE"
+    );
+    assert!(symbols.iter().any(|s| s.name == "render" && s.kind == "method"));
+}
+
 #[test]
 fn small_sibling_does_not_swallow_a_large_declaration() {
     let fixture = include_str!("fixtures/consts.go");

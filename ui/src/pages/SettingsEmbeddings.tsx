@@ -72,6 +72,7 @@ export function SettingsEmbeddings() {
     if (!form) return;
     const input = toInput(form);
     setTest(null);
+    setSaveError(null);
     void action.run(async () => setTest(await api.post<EmbeddingTestResult>('/api/settings/embeddings/test', input)), {
       key: 'test',
       onError: (error) => setTest({ ok: false, error }),
@@ -83,6 +84,7 @@ export function SettingsEmbeddings() {
     if (!form) return;
     const input = toInput(form);
     setSaveError(null);
+    setTest(null);
     void action.run(
       async () => {
         const saved = await api.put<EmbeddingSettings & { reembedRepositories: number }>('/api/settings/embeddings', input);
@@ -104,7 +106,7 @@ export function SettingsEmbeddings() {
   const keyHint = !data?.apiKeySet
     ? 'Leave empty for servers without authentication.'
     : form && form.baseUrl.trim() !== data.baseUrl
-      ? 'Enter the API key for the new base URL.'
+      ? 'The saved key is only sent to the saved base URL.'
       : 'Leave empty to keep the saved key.';
 
   return (

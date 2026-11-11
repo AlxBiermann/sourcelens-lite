@@ -1036,7 +1036,8 @@ struct ValueDeclaration<'t> {
 }
 
 /// Root-level constants and variables, and fields in class bodies (Rust, Go, TS/JS, Python, Java,
-/// C#). Function-valued declarations are chunks of their own and never reach this.
+/// C#), file- and namespace-scope C/C++ constants and object-like macros, PHP constants.
+/// Function-valued declarations are chunks of their own and never reach this.
 fn value_declarations<'t>(
     language: &str,
     node: Node<'t>,
@@ -1177,9 +1178,73 @@ fn value_declarations<'t>(
                 }
             }
         }
+        ("c" | "cpp", "declaration") if at_root || in_cpp_namespace(language, node) => {
+            let constant = named_children_of(node).iter().any(|child| {
+                child.kind() == "type_qualifier"
+                    && matches!(child.utf8_text(source).ok(), Some("const" | "constexpr"))
+            });
+            if !constant {
+                return values;
+            }
+            let mut cursor = node.walk();
+            for declarator in node.children_by_field_name("declarator", &mut cursor) {
+                // Only definitions with a value; `extern const int X;` and prototypes are not.
+                if declarator.kind() == "init_declarator" {
+                    let name = declared_identifier(declarator.child_by_field_name("declarator"));
+                    values.extend(value("constant", name, node));
+                }
+            }
+        }
+        // Object-like macros with a value; include guards (`#define FOO_H`) have none.
+        ("c" | "cpp", "preproc_def")
+            if (at_root || in_cpp_namespace(language, node))
+                && node.child_by_field_name("value").is_some() =>
+        {
+            values.extend(value("constant", node.child_by_field_name("name"), node));
+        }
+        // File-scope constants and class/interface/trait/enum constants.
+        ("php", "const_declaration") if at_root || parent_kind == Some("declaration_list") => {
+            for element in named_children_of(node) {
+                if element.kind() == "const_element" {
+                    let name = named_children_of(element)
+                        .into_iter()
+                        .find(|child| child.kind() == "name");
+                    values.extend(value("constant", name, node));
+                }
+            }
+        }
         _ => {}
     }
     values
+}
+
+/// A C++ declaration directly inside a `namespace … { }` body.
+fn in_cpp_namespace(language: &str, node: Node<'_>) -> bool {
+    language == "cpp"
+        && effective_parent(language, node).is_some_and(|parent| {
+            parent.kind() == "declaration_list"
+                && parent
+                    .parent()
+                    .is_some_and(|owner| owner.kind() == "namespace_definition")
+        })
+}
+
+/// The identifier a C/C++ declarator names, through pointer, array and reference declarators;
+/// `None` for function declarators.
+fn declared_identifier(declarator: Option<Node<'_>>) -> Option<Node<'_>> {
+    let mut current = declarator?;
+    loop {
+        match current.kind() {
+            "identifier" => return Some(current),
+            "pointer_declarator" | "array_declarator" | "parenthesized_declarator" => {
+                current = current
+                    .child_by_field_name("declarator")
+                    .or_else(|| current.named_child(0))?;
+            }
+            "reference_declarator" => current = current.named_child(0)?,
+            _ => return None,
+        }
+    }
 }
 
 /// The only `variable_declarator` of a TS/JS declaration when its value is a function.

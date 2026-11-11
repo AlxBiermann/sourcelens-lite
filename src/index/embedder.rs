@@ -89,6 +89,15 @@ impl Embedder {
             .collect()
     }
 
+    /// One request without retries, for a caller that waits on the answer (the search query):
+    /// a failing provider must not hold up the search.
+    pub async fn embed_once(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.request(inputs, 1).await.map_err(|failure| match failure {
+            Failure::Refused(message) => EmbedError::Rejected(message),
+            Failure::Provider(message) => EmbedError::Provider(message),
+        })
+    }
+
     /// Like `embed`, but a refused single input yields `Err(message)` in its slot instead of failing
     /// the whole call. Refused batches are split in halves and retried.
     pub(crate) fn embed_partial<'a>(
@@ -99,7 +108,7 @@ impl Embedder {
             if inputs.is_empty() {
                 return Ok(Vec::new());
             }
-            match self.request(inputs).await {
+            match self.request(inputs, MAX_ATTEMPTS).await {
                 Ok(vectors) => Ok(vectors.into_iter().map(Ok).collect()),
                 Err(Failure::Refused(_)) if inputs.len() > 1 => {
                     let (left, right) = inputs.split_at(inputs.len() / 2);
@@ -113,14 +122,14 @@ impl Embedder {
         })
     }
 
-    /// One batch with retries on network errors, 429 and 5xx.
-    async fn request(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>, Failure> {
+    /// One batch with up to `max_attempts` attempts; network errors, 429 and 5xx are retried.
+    async fn request(&self, inputs: &[String], max_attempts: u32) -> Result<Vec<Vec<f32>>, Failure> {
         let mut body = serde_json::json!({ "model": self.model, "input": inputs });
         if let Some(dimensions) = self.request_dimensions {
             body["dimensions"] = dimensions.into();
         }
         let mut last_error = String::new();
-        for attempt in 0..MAX_ATTEMPTS {
+        for attempt in 0..max_attempts {
             let mut builder = self
                 .http
                 .post(&self.url)
@@ -157,7 +166,7 @@ impl Embedder {
                     retry_after
                 }
             };
-            if attempt + 1 < MAX_ATTEMPTS {
+            if attempt + 1 < max_attempts {
                 tokio::time::sleep(retry_delay(attempt, retry_after)).await;
             }
         }

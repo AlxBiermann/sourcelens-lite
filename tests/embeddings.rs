@@ -783,6 +783,48 @@ async fn vectors_make_search_hybrid_with_semantic_only_hits() {
     assert_eq!(last, vec!["query: zebra".to_string()]);
 }
 
+#[tokio::test]
+async fn failing_provider_makes_search_lexical_after_one_attempt() {
+    let tmp = TempDir::new().unwrap();
+    let state = new_state(&tmp, |_| {});
+    let fake = Fake::start().await;
+    let repo = insert_repo_async(&state, 1, "acme/api", "connected").await;
+    index_sample(&state, repo).await;
+    embed::apply_settings(&state, settings_input(&fake))
+        .await
+        .unwrap();
+    let job = start_job(&state, repo).await;
+    embed::embed_pending(&state, repo, job).await.unwrap();
+
+    // Enough failures for every retry an indexing call would make.
+    fake.script(&[(503, None); 5]);
+    let before = fake.requests().len();
+    let started = std::time::Instant::now();
+    let response = search::search(
+        &state,
+        SearchRequest {
+            query: "frobnicate".into(),
+            filter: Filter {
+                repo_ids: vec![repo],
+                ..Filter::default()
+            },
+            limit: Some(8),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.mode, "lexical");
+    assert!(!response.hits.is_empty());
+    assert_eq!(fake.requests().len() - before, 1);
+    // The first retry would wait at least one second.
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(900),
+        "search took {:?}",
+        started.elapsed()
+    );
+}
+
 // ── HTTP: /api/settings/embeddings ─────────────────────────────────────────
 
 #[tokio::test]
