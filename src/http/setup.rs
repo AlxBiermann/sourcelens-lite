@@ -16,6 +16,11 @@ use crate::http::Body;
 use crate::model::Role;
 use crate::state::{lock, AppState};
 
+/// Bytes of randomness in the manifest-flow `state`.
+const MANIFEST_STATE_BYTES: usize = 16;
+/// Bytes of the random suffix that keeps app names unique on GitHub.
+const APP_NAME_SUFFIX_BYTES: usize = 2;
+
 /// `GET /api/state`, `POST /api/setup/manifest`, `GET /auth/github/app-created`.
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -153,7 +158,7 @@ async fn create_manifest(
         }
     }
 
-    let manifest_state = random_hex(16);
+    let manifest_state = random_hex(MANIFEST_STATE_BYTES);
     *lock(&state.manifest_state) = Some(manifest_state.clone());
 
     let post_url = match &organization {
@@ -164,7 +169,7 @@ async fn create_manifest(
     };
     let public = &state.cfg.public_url;
     let manifest = json!({
-        "name": format!("SourceLens {}", random_hex(2)),
+        "name": format!("SourceLens {}", random_hex(APP_NAME_SUFFIX_BYTES)),
         "url": public,
         "hook_attributes": {
             "url": state.cfg.webhook_url(),
@@ -192,9 +197,7 @@ async fn app_created(
     State(state): State<AppState>,
     Query(query): Query<AppCreatedQuery>,
 ) -> Redirect {
-    let expected = lock(&state.manifest_state).take();
-    let state_ok = matches!((&expected, &query.state), (Some(e), Some(s)) if e == s);
-    if !state_ok {
+    if !take_manifest_state(&state, query.state.as_deref()) {
         return Redirect::to("/setup?error=state");
     }
     let Some(code) = query.code.filter(|c| {
@@ -213,34 +216,24 @@ async fn app_created(
     }
 }
 
-async fn convert_manifest(state: &AppState, code: &str) -> ApiResult<()> {
-    #[derive(Deserialize)]
-    struct Conversion {
-        id: u64,
-        slug: String,
-        client_id: String,
-        client_secret: String,
-        webhook_secret: Option<String>,
-        pem: String,
-        html_url: String,
+/// Consumes the pending manifest `state` only when `returned` matches it, so a request with a wrong
+/// state cannot cancel the flow in progress.
+fn take_manifest_state(state: &AppState, returned: Option<&str>) -> bool {
+    let mut pending = lock(&state.manifest_state);
+    let matches = pending.is_some() && pending.as_deref() == returned;
+    if matches {
+        pending.take();
     }
+    matches
+}
+
+async fn convert_manifest(state: &AppState, code: &str) -> ApiResult<()> {
     let url = format!(
         "{}/app-manifests/{code}/conversions",
         state.github.api_base()
     );
     let response = state.github.send(|| state.http.post(&url)).await?;
-    let conversion: Conversion = GitHub::json(response, &url).await?;
-    state
-        .github
-        .store_manifest_credentials(&AppCredentials {
-            app_id: conversion.id,
-            slug: conversion.slug,
-            client_id: conversion.client_id,
-            client_secret: conversion.client_secret,
-            webhook_secret: conversion.webhook_secret.filter(|s| !s.is_empty()),
-            private_key_pem: conversion.pem,
-            html_url: conversion.html_url,
-            source: "manifest",
-        })
-        .await
+    let mut creds: AppCredentials = GitHub::json(response, &url).await?;
+    creds.webhook_secret = creds.webhook_secret.filter(|s| !s.is_empty());
+    state.github.store_manifest_credentials(&creds).await
 }

@@ -11,12 +11,13 @@ pub mod ui;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Path, Request, State};
 use axum::http::request::Parts;
-use axum::http::{header, Method, StatusCode};
+use axum::http::{header, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
+use tower_http::compression::CompressionLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::error::ApiError;
@@ -25,6 +26,20 @@ use crate::state::AppState;
 const API_BODY_LIMIT: usize = 1024 * 1024;
 const WEBHOOK_BODY_LIMIT: usize = 8 * 1024 * 1024;
 const MCP_BODY_LIMIT: usize = 1024 * 1024;
+
+/// The UI loads scripts, styles and fonts only from this origin, avatars from GitHub, and submits
+/// the manifest form to GitHub; nothing may frame it.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
+    img-src 'self' https://avatars.githubusercontent.com data:; \
+    style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self'; \
+    frame-ancestors 'none'; base-uri 'none'; form-action 'self' https://github.com";
+
+const SECURITY_HEADERS: [(HeaderName, &str); 4] = [
+    (header::X_FRAME_OPTIONS, "DENY"),
+    (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+    (header::REFERRER_POLICY, "same-origin"),
+    (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
+];
 
 pub fn router(state: AppState) -> Router {
     let app_routes = Router::new()
@@ -50,8 +65,18 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             require_same_origin,
         ))
+        .layer(middleware::map_response(add_security_headers))
+        .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn add_security_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    for (name, value) in SECURITY_HEADERS {
+        headers.insert(name, HeaderValue::from_static(value));
+    }
+    response
 }
 
 /// CSRF protection: state-changing `/api/` requests must come from the UI's origin.

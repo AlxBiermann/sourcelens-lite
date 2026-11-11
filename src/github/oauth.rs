@@ -1,6 +1,6 @@
 use reqwest::header::ACCEPT;
 use reqwest::Url;
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use crate::db::{self, Db};
@@ -65,7 +65,13 @@ pub async fn exchange_code(
         "code": code,
         "redirect_uri": state.cfg.callback_url(),
     });
-    token_request(state, &body).await
+    token_request(state, &body).await.map_err(|err| match err {
+        TokenError::OAuth(reason) => ApiError::bad_gateway(
+            "github_error",
+            format!("GitHub rejected the sign-in: {reason}"),
+        ),
+        TokenError::Request(err) => err,
+    })
 }
 
 pub async fn fetch_user(state: &AppState, access_token: &str) -> ApiResult<GhUser> {
@@ -77,61 +83,23 @@ pub async fn fetch_user(state: &AppState, access_token: &str) -> ApiResult<GhUse
     GitHub::json(response, &url).await
 }
 
-/// Applies the four sign-in rules in one transaction: known `github_id` → update profile; invited login →
-/// bind `github_id`; no owner and `claim` → new owner; otherwise not invited / setup required.
+/// Applies the sign-in rules in one transaction, in order: a member (or invitation) with this
+/// GitHub account id → update profile; no owner and `claim` → new owner; otherwise not invited, or
+/// setup required while there is no owner.
 pub async fn resolve_user(db: &Db, user: &GhUser, claim: bool) -> ApiResult<Resolution> {
     let user = user.clone();
     let ts = now();
     let resolution = db
         .write(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let known: Option<i64> = tx
-                .query_row(
-                    "SELECT id FROM users WHERE github_id = ?1",
-                    [user.id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let resolution = if let Some(id) = known {
-                // A stale invitation for the (possibly renamed) login would collide with the UNIQUE login.
-                tx.execute(
-                    "DELETE FROM users WHERE login = ?1 AND github_id IS NULL",
-                    [&user.login],
-                )?;
-                tx.execute(
-                    "UPDATE users SET login = ?1, name = ?2, avatar_url = ?3, last_login_at = ?4 WHERE id = ?5",
-                    params![user.login, user.name, user.avatar_url, ts, id],
-                )?;
+            let resolution = if let Some(id) = by_github_id(&tx, &user, ts)? {
                 Resolution::User(id)
+            } else if let Some(id) = by_claim(&tx, &user, claim, ts)? {
+                Resolution::User(id)
+            } else if db::owner_exists(&tx)? {
+                Resolution::NotInvited
             } else {
-                let invited: Option<i64> = tx
-                    .query_row(
-                        "SELECT id FROM users WHERE login = ?1 AND github_id IS NULL",
-                        [&user.login],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if let Some(id) = invited {
-                    tx.execute(
-                        "UPDATE users SET github_id = ?1, login = ?2, name = ?3, avatar_url = ?4, last_login_at = ?5 WHERE id = ?6",
-                        params![user.id, user.login, user.name, user.avatar_url, ts, id],
-                    )?;
-                    Resolution::User(id)
-                } else {
-                    let owner_exists = db::owner_exists(&tx)?;
-                    match (owner_exists, claim) {
-                        (false, true) => {
-                            tx.execute(
-                                "INSERT INTO users (github_id, login, name, avatar_url, role, created_at, last_login_at)
-                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-                                params![user.id, user.login, user.name, user.avatar_url, Role::Owner, ts],
-                            )?;
-                            Resolution::User(tx.last_insert_rowid())
-                        }
-                        (false, false) => Resolution::SetupRequired,
-                        (true, _) => Resolution::NotInvited,
-                    }
-                }
+                Resolution::SetupRequired
             };
             tx.commit()?;
             Ok::<_, rusqlite::Error>(resolution)
@@ -140,12 +108,72 @@ pub async fn resolve_user(db: &Db, user: &GhUser, claim: bool) -> ApiResult<Reso
     Ok(resolution)
 }
 
+/// Rule 1: the account id belongs to a member or an invitation → refresh the profile.
+fn by_github_id(tx: &Transaction<'_>, user: &GhUser, ts: i64) -> rusqlite::Result<Option<i64>> {
+    let id: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM users WHERE github_id = ?1",
+            [user.id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(id) = id else {
+        return Ok(None);
+    };
+    // GitHub logins are unique at any time, so another row holding this login is out of date (its
+    // account was renamed). Mark it until that account signs in again, keeping `login` UNIQUE.
+    tx.execute(
+        "UPDATE users SET login = login || '~' || id WHERE login = ?1 AND id != ?2",
+        params![user.login, id],
+    )?;
+    tx.execute(
+        "UPDATE users SET login = ?1, name = ?2, avatar_url = ?3, last_login_at = ?4
+         WHERE id = ?5",
+        params![user.login, user.name, user.avatar_url, ts, id],
+    )?;
+    Ok(Some(id))
+}
+
+/// Rule 2: no owner yet and the sign-in presented the setup token → this account becomes the owner.
+fn by_claim(
+    tx: &Transaction<'_>,
+    user: &GhUser,
+    claim: bool,
+    ts: i64,
+) -> rusqlite::Result<Option<i64>> {
+    if !claim || db::owner_exists(tx)? {
+        return Ok(None);
+    }
+    tx.execute(
+        "INSERT INTO users (github_id, login, name, avatar_url, role, created_at, last_login_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+        params![
+            user.id,
+            user.login,
+            user.name,
+            user.avatar_url,
+            Role::Owner,
+            ts
+        ],
+    )?;
+    Ok(Some(tx.last_insert_rowid()))
+}
+
+/// Why `POST https://github.com/login/oauth/access_token` produced no token.
+#[derive(Debug)]
+pub enum TokenError {
+    /// GitHub answered with an OAuth `error` (for example `bad_refresh_token`): the grant is gone.
+    OAuth(String),
+    /// GitHub could not be reached or failed (network, 5xx, rate limit, unexpected answer).
+    Request(ApiError),
+}
+
 /// Exchanges a refresh token for a new user token.
 pub async fn refresh_token(
     state: &AppState,
     creds: &AppCredentials,
     refresh_token: &str,
-) -> ApiResult<GhToken> {
+) -> Result<GhToken, TokenError> {
     let body = serde_json::json!({
         "client_id": creds.client_id,
         "client_secret": creds.client_secret,
@@ -155,8 +183,8 @@ pub async fn refresh_token(
     token_request(state, &body).await
 }
 
-/// `POST https://github.com/login/oauth/access_token`; GitHub reports OAuth failures as 200 with an `error` field.
-async fn token_request(state: &AppState, body: &serde_json::Value) -> ApiResult<GhToken> {
+/// GitHub reports OAuth failures as 200 with an `error` field.
+async fn token_request(state: &AppState, body: &serde_json::Value) -> Result<GhToken, TokenError> {
     #[derive(Deserialize)]
     struct TokenResponse {
         access_token: Option<String>,
@@ -174,17 +202,19 @@ async fn token_request(state: &AppState, body: &serde_json::Value) -> ApiResult<
                 .header(ACCEPT, "application/json")
                 .json(body)
         })
-        .await?;
-    let parsed: TokenResponse = GitHub::json(response, ACCESS_TOKEN_URL).await?;
+        .await
+        .map_err(TokenError::Request)?;
+    let parsed: TokenResponse = GitHub::json(response, ACCESS_TOKEN_URL)
+        .await
+        .map_err(TokenError::Request)?;
     let Some(access_token) = parsed.access_token.filter(|t| !t.is_empty()) else {
-        let reason = parsed
-            .error_description
-            .or(parsed.error)
-            .unwrap_or_else(|| "no access token returned".to_string());
-        return Err(ApiError::bad_gateway(
-            "github_error",
-            format!("GitHub rejected the sign-in: {reason}"),
-        ));
+        return Err(match parsed.error {
+            Some(error) => TokenError::OAuth(parsed.error_description.unwrap_or(error)),
+            None => TokenError::Request(ApiError::bad_gateway(
+                "github_error",
+                "GitHub returned no access token.",
+            )),
+        });
     };
     let expires_at = match parsed.expires_in {
         Some(seconds) => now().saturating_add(seconds),

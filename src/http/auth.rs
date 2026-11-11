@@ -11,11 +11,12 @@ use serde::{Deserialize, Serialize};
 use crate::crypto::{random_hex, sha256_hex};
 use crate::error::ApiResult;
 use crate::github::oauth::{self, Resolution};
-use crate::http::session::{self, clear_cookie, cookie, set_cookie, SESSION_COOKIE};
+use crate::http::session::{self, clear_cookie, cookie, oauth_cookie, session_cookie, set_cookie};
 use crate::http::setup::setup_token_valid;
 use crate::state::AppState;
 
-const OAUTH_COOKIE: &str = "sl_oauth";
+/// Bytes of randomness in the OAuth `state` parameter.
+const OAUTH_STATE_BYTES: usize = 16;
 const OAUTH_COOKIE_MAX_AGE: i64 = 600;
 
 /// `GET /auth/github/login`, `GET /auth/github/callback`, `POST /api/logout`.
@@ -26,7 +27,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/logout", post(logout))
 }
 
-/// Sealed into the `sl_oauth` cookie between login and callback.
+/// Sealed into the OAuth cookie between login and callback.
 #[derive(Serialize, Deserialize)]
 struct OAuthCookie {
     state: String,
@@ -56,7 +57,7 @@ async fn start_login(state: &AppState, setup_token: Option<&str>) -> ApiResult<R
         Some(token) => setup_token_valid(state, token).await?,
         None => false,
     };
-    let oauth_state = random_hex(16);
+    let oauth_state = random_hex(OAUTH_STATE_BYTES);
     let payload = serde_json::to_vec(&OAuthCookie {
         state: oauth_state.clone(),
         claim,
@@ -66,7 +67,12 @@ async fn start_login(state: &AppState, setup_token: Option<&str>) -> ApiResult<R
     Ok((
         AppendHeaders([(
             SET_COOKIE,
-            set_cookie(state, OAUTH_COOKIE, &value, OAUTH_COOKIE_MAX_AGE),
+            set_cookie(
+                state,
+                oauth_cookie(&state.cfg),
+                &value,
+                OAUTH_COOKIE_MAX_AGE,
+            ),
         )]),
         Redirect::to(&oauth::authorize_url(state, &creds, &oauth_state)),
     )
@@ -84,8 +90,8 @@ async fn callback(
     headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> Response {
-    let clear_oauth = (SET_COOKIE, clear_cookie(&state, OAUTH_COOKIE));
-    let saved = cookie(&headers, OAUTH_COOKIE)
+    let clear_oauth = (SET_COOKIE, clear_cookie(&state, oauth_cookie(&state.cfg)));
+    let saved = cookie(&headers, oauth_cookie(&state.cfg))
         .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
         .and_then(|sealed| state.key.open(&sealed))
         .and_then(|plain| serde_json::from_slice::<OAuthCookie>(&plain).ok());
@@ -112,7 +118,7 @@ async fn callback(
                     SET_COOKIE,
                     set_cookie(
                         &state,
-                        SESSION_COOKIE,
+                        session_cookie(&state.cfg),
                         &session_value,
                         session::SESSION_MAX_AGE,
                     ),
@@ -154,12 +160,12 @@ async fn finish_login(
 }
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
-    if let Some(value) = cookie(&headers, SESSION_COOKIE) {
+    if let Some(value) = cookie(&headers, session_cookie(&state.cfg)) {
         session::delete_session(&state, &sha256_hex(value.as_bytes())).await?;
     }
     Ok((
         StatusCode::NO_CONTENT,
-        AppendHeaders([(SET_COOKIE, clear_cookie(&state, SESSION_COOKIE))]),
+        AppendHeaders([(SET_COOKIE, clear_cookie(&state, session_cookie(&state.cfg)))]),
     )
         .into_response())
 }

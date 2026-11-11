@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -11,16 +12,23 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde_json::{json, Value};
 use sourcelens::config::Config;
-use sourcelens::error::GitHubFailure;
+use sourcelens::crypto::{random_hex, sha256_hex};
+use sourcelens::error::{ApiError, GitHubFailure};
 use sourcelens::github::app::{AppCredentials, GitHub};
-use sourcelens::github::oauth::{resolve_user, GhToken, GhUser, Resolution};
+use sourcelens::github::oauth::{resolve_user, GhToken, GhUser, Resolution, TokenError};
 use sourcelens::http;
-use sourcelens::http::session::create_session;
+use sourcelens::http::session::{create_session, user_token_with, AuthUser};
+use sourcelens::model::Role;
 use sourcelens::state::{now, AppState};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
 const PUBLIC_URL: &str = "http://localhost:3000";
+const HTTPS_PUBLIC_URL: &str = "https://sourcelens.example.com";
+/// Account id the fake GitHub reports for the login `hubot`.
+const HUBOT_GITHUB_ID: i64 = 5001;
+/// App id in the fake manifest conversion.
+const CONVERTED_APP_ID: u64 = 777;
 
 fn test_credentials() -> AppCredentials {
     let pem = std::fs::read_to_string(concat!(
@@ -82,6 +90,7 @@ fn error_code(body: &Value) -> &str {
     body["error"]["code"].as_str().unwrap_or("")
 }
 
+/// A user who has signed in before.
 async fn insert_user(state: &AppState, login: &str, role: &str, github_id: Option<i64>) -> i64 {
     let login = login.to_string();
     let role = role.to_string();
@@ -89,8 +98,25 @@ async fn insert_user(state: &AppState, login: &str, role: &str, github_id: Optio
         .db
         .write(move |c| {
             c.execute(
-                "INSERT INTO users (github_id, login, role, created_at) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO users (github_id, login, role, created_at, last_login_at)
+                 VALUES (?1, ?2, ?3, ?4, ?4)",
                 rusqlite::params![github_id, login, role, now()],
+            )?;
+            Ok::<_, rusqlite::Error>(c.last_insert_rowid())
+        })
+        .await
+        .unwrap()
+}
+
+/// An invited member who has not signed in yet.
+async fn insert_invitation(state: &AppState, login: &str, github_id: i64) -> i64 {
+    let login = login.to_string();
+    state
+        .db
+        .write(move |c| {
+            c.execute(
+                "INSERT INTO users (github_id, login, role, created_at) VALUES (?1, ?2, 'member', ?3)",
+                rusqlite::params![github_id, login, now()],
             )?;
             Ok::<_, rusqlite::Error>(c.last_insert_rowid())
         })
@@ -432,26 +458,33 @@ async fn user_resolution_rules() {
         ("renamed", "New Name", "https://avatars.example/new")
     );
 
-    // Invited login (case-insensitive) → github_id bound.
-    let invited = insert_user(&state, "Invitee", "member", None).await;
+    // An invitation binds to the GitHub account id: another account holding the invited login is
+    // not the member.
+    let invited = insert_invitation(&state, "invitee", 77).await;
     assert_eq!(
-        resolve_user(&state.db, &gh_user(77, "invitee"), false)
+        resolve_user(&state.db, &gh_user(78, "invitee"), false)
+            .await
+            .unwrap(),
+        Resolution::NotInvited
+    );
+    assert_eq!(
+        resolve_user(&state.db, &gh_user(77, "Invitee"), false)
             .await
             .unwrap(),
         Resolution::User(invited)
     );
-    let github_id: Option<i64> = state
+    let last_login_at: Option<i64> = state
         .db
         .read(move |c| {
             c.query_row(
-                "SELECT github_id FROM users WHERE id = ?1",
+                "SELECT last_login_at FROM users WHERE id = ?1",
                 [invited],
                 |r| r.get(0),
             )
         })
         .await
         .unwrap();
-    assert_eq!(github_id, Some(77));
+    assert!(last_login_at.is_some());
 
     // Unknown user with an owner present → not invited, even with a claim.
     assert_eq!(
@@ -461,6 +494,44 @@ async fn user_resolution_rules() {
         Resolution::NotInvited
     );
     assert_eq!(count(&state, "SELECT count(*) FROM users").await, 2);
+}
+
+#[tokio::test]
+async fn renamed_account_takes_over_a_login_held_by_an_older_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = new_state(&tmp, |_| {});
+    insert_user(&state, "octocat", "owner", Some(1)).await;
+    let old_holder = insert_invitation(&state, "bob", 2).await;
+    let member = insert_user(&state, "robert", "member", Some(3)).await;
+
+    // Account 3 renamed itself to "bob" on GitHub; account 2 no longer holds that login.
+    assert_eq!(
+        resolve_user(&state.db, &gh_user(3, "bob"), false)
+            .await
+            .unwrap(),
+        Resolution::User(member)
+    );
+    let logins: Vec<(i64, String)> = state
+        .db
+        .read(|c| {
+            let mut stmt = c.prepare("SELECT id, login FROM users ORDER BY id")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .await
+        .unwrap();
+    assert!(logins.contains(&(member, "bob".to_string())));
+    assert!(logins
+        .iter()
+        .any(|(id, login)| *id == old_holder && login != "bob"));
+
+    // The older row is still bound to account 2 and gets its current login back on sign-in.
+    assert_eq!(
+        resolve_user(&state.db, &gh_user(2, "bobby"), false)
+            .await
+            .unwrap(),
+        Resolution::User(old_holder)
+    );
 }
 
 // ── Sessions and Origin ───────────────────────────────────────────────────────
@@ -545,8 +616,9 @@ async fn origin_is_checked_for_state_changing_api_requests() {
 
 #[tokio::test]
 async fn owner_manages_members() {
+    let (base, _) = spawn_fake_github().await;
     let tmp = tempfile::tempdir().unwrap();
-    let state = new_state(&tmp, |_| {});
+    let state = new_state(&tmp, |cfg| cfg.github_api_url = base.clone());
     let owner = insert_user(&state, "octocat", "owner", Some(1)).await;
     let cookie = session_for(&state, owner).await;
 
@@ -556,14 +628,52 @@ async fn owner_manages_members() {
             "POST",
             "/api/members",
             Some(&cookie),
-            Some(json!({ "login": "hubot" })),
+            Some(json!({ "login": "Hubot" })),
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["login"], "hubot");
     assert_eq!(body["role"], "member");
     assert_eq!(body["pending"], true);
+    let member = body["id"].as_i64().unwrap();
+    let github_id: Option<i64> = state
+        .db
+        .read(move |c| {
+            c.query_row("SELECT github_id FROM users WHERE id = ?1", [member], |r| {
+                r.get(0)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(github_id, Some(HUBOT_GITHUB_ID));
+
+    let (status, _, body) = call(
+        &state,
+        request(
+            "POST",
+            "/api/members",
+            Some(&cookie),
+            Some(json!({ "login": "ghost-user" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_code(&body), "invalid_login");
+
+    // Someone who later registers the invited login is a different GitHub account.
+    assert_eq!(
+        resolve_user(&state.db, &gh_user(9999, "hubot"), false)
+            .await
+            .unwrap(),
+        Resolution::NotInvited
+    );
+    assert_eq!(
+        resolve_user(&state.db, &gh_user(HUBOT_GITHUB_ID, "hubot"), false)
+            .await
+            .unwrap(),
+        Resolution::User(member)
+    );
 
     let (status, _, body) = call(
         &state,
@@ -852,6 +962,50 @@ async fn spawn_fake_github() -> (String, Arc<Counters>) {
                 Json(json!({ "accept": get("accept"), "apiVersion": get("x-github-api-version") }))
             }),
         )
+        .route(
+            "/users/{login}",
+            get(|Path(login): Path<String>, headers: HeaderMap| async move {
+                let auth = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
+                if auth != Some("Bearer gho_test") {
+                    return (StatusCode::UNAUTHORIZED, Json(json!({ "message": "Requires authentication" })));
+                }
+                if !login.eq_ignore_ascii_case("hubot") {
+                    return (StatusCode::NOT_FOUND, Json(json!({ "message": "Not Found" })));
+                }
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "id": HUBOT_GITHUB_ID,
+                        "login": "hubot",
+                        "name": "Hubot",
+                        "avatar_url": "https://avatars.githubusercontent.com/u/5001",
+                        "type": "User",
+                    })),
+                )
+            }),
+        )
+        .route(
+            "/app-manifests/{code}/conversions",
+            post(|Path(code): Path<String>| async move {
+                if code != "good-code" {
+                    return (StatusCode::NOT_FOUND, Json(json!({ "message": "Not Found" })));
+                }
+                (
+                    StatusCode::CREATED,
+                    Json(json!({
+                        "id": CONVERTED_APP_ID,
+                        "slug": "sourcelens-abcd",
+                        "name": "SourceLens abcd",
+                        "client_id": "Iv1.converted",
+                        "client_secret": "converted-secret",
+                        "webhook_secret": "converted-hook",
+                        "pem": test_credentials().private_key_pem,
+                        "html_url": "https://github.com/apps/sourcelens-abcd",
+                        "owner": { "login": "octocat" },
+                    })),
+                )
+            }),
+        )
         .with_state(counters.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -930,4 +1084,265 @@ async fn send_maps_github_responses() {
         .await
         .unwrap();
     assert_eq!(custom["accept"], "application/vnd.github.raw+json");
+}
+
+// ── Member removal revokes keys ───────────────────────────────────────────────
+
+async fn insert_key(state: &AppState, created_by: i64) -> String {
+    let secret = format!("sl_{}", random_hex(32));
+    let hash = sha256_hex(secret.as_bytes());
+    let last4 = secret[secret.len() - 4..].to_string();
+    state
+        .db
+        .write(move |c| {
+            c.execute(
+                "INSERT INTO api_keys (name, key_hash, last4, all_repos, created_by, created_at)
+                 VALUES ('agent', ?1, ?2, 1, ?3, ?4)",
+                rusqlite::params![hash, last4, created_by, now()],
+            )
+        })
+        .await
+        .unwrap();
+    secret
+}
+
+async fn mcp_ping(state: &AppState, secret: &str) -> StatusCode {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .body(Body::from(
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }).to_string(),
+        ))
+        .unwrap();
+    call(state, req).await.0
+}
+
+#[tokio::test]
+async fn removing_a_member_revokes_their_api_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = new_state(&tmp, |_| {});
+    let owner = insert_user(&state, "octocat", "owner", Some(1)).await;
+    let member = insert_user(&state, "hubot", "member", Some(2)).await;
+    let owner_cookie = session_for(&state, owner).await;
+    let member_key = insert_key(&state, member).await;
+    let owner_key = insert_key(&state, owner).await;
+    assert_eq!(mcp_ping(&state, &member_key).await, StatusCode::OK);
+
+    let (status, _, _) = call(
+        &state,
+        request(
+            "DELETE",
+            &format!("/api/members/{member}"),
+            Some(&owner_cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        mcp_ping(&state, &member_key).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(mcp_ping(&state, &owner_key).await, StatusCode::OK);
+}
+
+// ── Manifest flow state ───────────────────────────────────────────────────────
+
+async fn get_location(state: &AppState, uri: &str) -> String {
+    let (status, headers, _) = call(state, request("GET", uri, None, None)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{uri}");
+    headers[header::LOCATION].to_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn wrong_manifest_state_does_not_cancel_the_pending_flow() {
+    let (base, _) = spawn_fake_github().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let state = new_state(&tmp, |cfg| cfg.github_api_url = base.clone());
+    let token = state.setup_token.to_string();
+    let (status, _, body) = call(
+        &state,
+        request(
+            "POST",
+            "/api/setup/manifest",
+            None,
+            Some(json!({ "setupToken": token })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let post_url = body["postUrl"].as_str().unwrap();
+    let manifest_state = post_url.split("state=").nth(1).unwrap().to_string();
+
+    for forged in [
+        "/auth/github/app-created?code=good-code&state=forged",
+        "/auth/github/app-created?code=good-code",
+    ] {
+        assert_eq!(get_location(&state, forged).await, "/setup?error=state");
+    }
+    assert!(state.github.credentials().await.unwrap().is_none());
+
+    let location = get_location(
+        &state,
+        &format!("/auth/github/app-created?code=good-code&state={manifest_state}"),
+    )
+    .await;
+    assert_eq!(location, "/setup?step=install");
+    let creds = state.github.credentials().await.unwrap().unwrap();
+    assert_eq!(creds.app_id, CONVERTED_APP_ID);
+    assert_eq!(creds.client_id, "Iv1.converted");
+    assert_eq!(creds.webhook_secret.as_deref(), Some("converted-hook"));
+    assert_eq!(creds.source, "manifest");
+
+    // The state is single-use.
+    let replay = format!("/auth/github/app-created?code=good-code&state={manifest_state}");
+    assert_eq!(get_location(&state, &replay).await, "/setup?error=state");
+}
+
+// ── Token refresh ─────────────────────────────────────────────────────────────
+
+/// A session whose GitHub token expired, and the user it belongs to.
+async fn expired_session(state: &AppState) -> AuthUser {
+    let owner = insert_user(state, "octocat", "owner", Some(1)).await;
+    let token = GhToken {
+        access_token: "gho_expired".into(),
+        refresh_token: Some("ghr_once".into()),
+        expires_at: now() - 10,
+    };
+    let cookie = create_session(state, owner, &token).await.unwrap();
+    AuthUser {
+        id: owner,
+        login: "octocat".into(),
+        role: Role::Owner,
+        session_hash: sha256_hex(cookie.as_bytes()),
+    }
+}
+
+#[tokio::test]
+async fn concurrent_token_refreshes_send_one_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = new_state(&tmp, |_| {});
+    let user = expired_session(&state).await;
+    let refreshes = Arc::new(AtomicUsize::new(0));
+
+    let refresh = |refresh_token: String| {
+        let refreshes = refreshes.clone();
+        async move {
+            assert_eq!(refresh_token, "ghr_once");
+            refreshes.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok::<_, TokenError>(GhToken {
+                access_token: "gho_fresh".into(),
+                refresh_token: Some("ghr_next".into()),
+                expires_at: now() + 3600,
+            })
+        }
+    };
+    let (first, second) = tokio::join!(
+        user_token_with(&state, &user, refresh),
+        user_token_with(&state, &user, refresh),
+    );
+    assert_eq!(first.unwrap(), "gho_fresh");
+    assert_eq!(second.unwrap(), "gho_fresh");
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    assert!(state.refresh_locks.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn transient_refresh_failure_keeps_the_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = new_state(&tmp, |_| {});
+    let user = expired_session(&state).await;
+
+    let err = user_token_with(&state, &user, |_| async {
+        Err(TokenError::Request(ApiError::bad_gateway(
+            "github_unreachable",
+            "GitHub could not be reached.",
+        )))
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(err.code, "github_unavailable");
+    assert_eq!(count(&state, "SELECT count(*) FROM sessions").await, 1);
+
+    let err = user_token_with(&state, &user, |_| async {
+        Err(TokenError::OAuth("bad_refresh_token".into()))
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, "github_reauth_required");
+    assert_eq!(count(&state, "SELECT count(*) FROM sessions").await, 0);
+}
+
+// ── Security headers and cookies ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn security_headers_on_api_and_ui_responses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = new_state(&tmp, |_| {});
+    for uri in ["/api/state", "/repositories", "/assets/missing.js"] {
+        let (_, headers, _) = call(&state, request("GET", uri, None, None)).await;
+        assert_eq!(headers[header::X_FRAME_OPTIONS], "DENY", "{uri}");
+        assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{uri}");
+        assert_eq!(headers[header::REFERRER_POLICY], "same-origin", "{uri}");
+        let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+        assert!(csp.contains("frame-ancestors 'none'"), "{uri}: {csp}");
+        assert!(csp.contains("default-src 'self'"), "{uri}: {csp}");
+    }
+
+    let gzip = Request::builder()
+        .uri("/api/state")
+        .header(header::ACCEPT_ENCODING, "gzip")
+        .body(Body::empty())
+        .unwrap();
+    let (status, headers, _) = call(&state, gzip).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::CONTENT_ENCODING], "gzip");
+}
+
+#[tokio::test]
+async fn https_instance_uses_host_locked_cookies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = Config::new(HTTPS_PUBLIC_URL, tmp.path());
+    cfg.github = Some(test_credentials());
+    let state = AppState::new(cfg).unwrap();
+
+    let (_, headers, _) = call(&state, request("GET", "/auth/github/login", None, None)).await;
+    let oauth = headers[header::SET_COOKIE].to_str().unwrap();
+    assert!(oauth.starts_with("__Host-sl_oauth="), "{oauth}");
+    assert!(
+        oauth.contains("; Secure") && oauth.contains("Path=/"),
+        "{oauth}"
+    );
+
+    let owner = insert_user(&state, "octocat", "owner", Some(1)).await;
+    let session = session_for(&state, owner).await;
+    let state_user = |cookie: String| {
+        Request::builder()
+            .uri("/api/state")
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (_, _, body) = call(&state, state_user(format!("__Host-sl_session={session}"))).await;
+    assert_eq!(body["user"]["id"], owner);
+    let (_, _, body) = call(&state, state_user(format!("sl_session={session}"))).await;
+    assert_eq!(body["user"], Value::Null);
+
+    let logout = Request::builder()
+        .method("POST")
+        .uri("/api/logout")
+        .header(header::ORIGIN, HTTPS_PUBLIC_URL)
+        .header(header::COOKIE, format!("__Host-sl_session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, headers, _) = call(&state, logout).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let cleared = headers[header::SET_COOKIE].to_str().unwrap();
+    assert!(cleared.starts_with("__Host-sl_session=;"), "{cleared}");
+    assert_eq!(count(&state, "SELECT count(*) FROM sessions").await, 0);
 }

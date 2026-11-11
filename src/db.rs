@@ -4,17 +4,28 @@ use std::sync::{Arc, Mutex, Once};
 
 use rusqlite::types::ValueRef;
 use rusqlite::{ffi, params, Connection, OptionalExtension, ToSql};
+use tokio::sync::Semaphore;
 
 use crate::model::Role;
 use crate::state::{lock, now};
 
-const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
-const SCHEMA_VERSION: i64 = 1;
+/// Schema migrations in order; after applying `MIGRATIONS[i]`, `user_version` is `i + 1`.
+const MIGRATIONS: [&str; 2] = [
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_indexes.sql"),
+];
+
+/// Reader connections in use at the same time; further reads wait for a free one.
+const MAX_READERS: usize = 8;
 
 const CONNECTION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 PRAGMA foreign_keys=ON;
-PRAGMA busy_timeout=5000;";
+PRAGMA busy_timeout=5000;
+PRAGMA journal_size_limit=67108864;";
+
+/// Reader connections map the database file instead of copying pages through the page cache.
+const READER_PRAGMAS: &str = "PRAGMA mmap_size=268435456;";
 
 type AutoExtension = unsafe extern "C" fn(
     *mut ffi::sqlite3,
@@ -24,11 +35,13 @@ type AutoExtension = unsafe extern "C" fn(
 
 static REGISTER_VEC: Once = Once::new();
 
-/// SQLite handle: one writer connection behind a mutex plus a free list of reader connections.
+/// SQLite handle: one writer connection behind a mutex plus a free list of at most [`MAX_READERS`]
+/// reader connections.
 #[derive(Clone)]
 pub struct Db {
     writer: Arc<Mutex<Connection>>,
     readers: Arc<Mutex<Vec<Connection>>>,
+    reader_permits: Arc<Semaphore>,
     path: PathBuf,
 }
 
@@ -40,11 +53,12 @@ impl Db {
         Ok(Self {
             writer: Arc::new(Mutex::new(writer)),
             readers: Arc::new(Mutex::new(Vec::new())),
+            reader_permits: Arc::new(Semaphore::new(MAX_READERS)),
             path: path.to_path_buf(),
         })
     }
 
-    /// Runs `f` on a reader connection in a blocking task.
+    /// Runs `f` on a reader connection in a blocking task; waits while [`MAX_READERS`] reads run.
     pub async fn read<T, E>(
         &self,
         f: impl FnOnce(&Connection) -> Result<T, E> + Send + 'static,
@@ -53,15 +67,23 @@ impl Db {
         T: Send + 'static,
         E: From<rusqlite::Error> + Send + 'static,
     {
+        let permit = match self.reader_permits.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(err) => return Err(E::from(interrupted(format!("reader pool closed: {err}")))),
+        };
         let db = self.clone();
         run_blocking(move || {
+            let _permit = permit;
             let pooled = lock(&db.readers).pop();
             let conn = match pooled {
                 Some(conn) => conn,
-                None => open_connection(&db.path)?,
+                None => open_reader(&db.path)?,
             };
             let result = f(&conn);
-            lock(&db.readers).push(conn);
+            let mut readers = lock(&db.readers);
+            if readers.len() < MAX_READERS {
+                readers.push(conn);
+            }
             result
         })
         .await
@@ -99,11 +121,14 @@ where
     match tokio::task::spawn_blocking(f).await {
         Ok(result) => result,
         Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
-        Err(err) => Err(E::from(rusqlite::Error::SqliteFailure(
-            ffi::Error::new(ffi::SQLITE_INTERRUPT),
-            Some(format!("database task was cancelled: {err}")),
-        ))),
+        Err(err) => Err(E::from(interrupted(format!(
+            "database task was cancelled: {err}"
+        )))),
     }
+}
+
+fn interrupted(message: String) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_INTERRUPT), Some(message))
 }
 
 /// Value of `settings[key]` as bytes (stored as BLOB or TEXT).
@@ -200,13 +225,21 @@ fn open_connection(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+fn open_reader(path: &Path) -> rusqlite::Result<Connection> {
+    let conn = open_connection(path)?;
+    conn.execute_batch(READER_PRAGMAS)?;
+    Ok(conn)
+}
+
+/// Applies every migration newer than `PRAGMA user_version`, each in its own transaction.
 fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version >= SCHEMA_VERSION {
-        return Ok(());
+    let applied = usize::try_from(version).unwrap_or(0);
+    for (index, migration) in MIGRATIONS.iter().enumerate().skip(applied) {
+        let tx = conn.transaction()?;
+        tx.execute_batch(migration)?;
+        tx.execute_batch(&format!("PRAGMA user_version = {};", index + 1))?;
+        tx.commit()?;
     }
-    let tx = conn.transaction()?;
-    tx.execute_batch(MIGRATION_0001)?;
-    tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
-    tx.commit()
+    Ok(())
 }

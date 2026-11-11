@@ -1,3 +1,7 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use ring::hmac;
@@ -30,7 +34,7 @@ async fn migration_applies_and_sqlite_vec_is_loaded() {
         })
         .await
         .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
     assert!(
         vec_version.starts_with('v'),
         "vec_version() = {vec_version}"
@@ -237,4 +241,118 @@ fn config_helpers() {
     assert!(
         Config::new("http://127.0.0.1:3000", std::path::Path::new("/tmp")).public_host_is_local()
     );
+}
+
+fn index_names(db: &rusqlite::Connection) -> Vec<String> {
+    let mut stmt = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+        .unwrap();
+    stmt.query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<String>>>()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn version_1_database_is_migrated_to_version_2() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("old.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(include_str!("../migrations/0001_init.sql"))
+            .unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 1;
+             INSERT INTO users (github_id, login, role, created_at) VALUES (1, 'octocat', 'owner', 0);
+             INSERT INTO users (github_id, login, role, created_at) VALUES (NULL, 'invited', 'member', 0);",
+        )
+        .unwrap();
+        assert!(index_names(&conn).contains(&"chunks_pending".to_string()));
+    }
+
+    let db = Db::open(&path).unwrap();
+    let (version, indexes, logins) = db
+        .read(|c| {
+            let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            let mut stmt = c.prepare("SELECT login FROM users ORDER BY id")?;
+            let logins = stmt
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            Ok::<_, rusqlite::Error>((version, index_names(c), logins))
+        })
+        .await
+        .unwrap();
+    assert_eq!(version, 2);
+    assert!(
+        indexes.contains(&"chunks_repo_state".to_string()),
+        "{indexes:?}"
+    );
+    assert!(indexes.contains(&"symbols_repo".to_string()), "{indexes:?}");
+    assert!(
+        !indexes.contains(&"chunks_pending".to_string()),
+        "{indexes:?}"
+    );
+    assert_eq!(logins, ["octocat"]);
+
+    // A fresh database gets the same schema.
+    let fresh = Db::open(&tmp.path().join("fresh.db")).unwrap();
+    let fresh_indexes = fresh
+        .read(|c| Ok::<_, rusqlite::Error>(index_names(c)))
+        .await
+        .unwrap();
+    assert_eq!(fresh_indexes, indexes);
+}
+
+#[cfg(unix)]
+#[test]
+fn data_dir_is_private_and_tmp_is_emptied_at_start() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+    let state = AppState::new(Config::new("http://localhost:3000", &data)).unwrap();
+    assert_eq!(mode(&data), 0o700);
+    assert_eq!(mode(&data.join("tmp")), 0o700);
+    drop(state);
+
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let leftover = data.join("tmp").join("job-1.tar.gz");
+    std::fs::write(&leftover, b"partial archive").unwrap();
+    AppState::new(Config::new("http://localhost:3000", &data)).unwrap();
+    assert_eq!(mode(&data), 0o700);
+    assert!(!leftover.exists());
+    assert!(data.join("tmp").is_dir());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn more_reads_than_reader_connections_complete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open(&tmp.path().join("test.db")).unwrap();
+    let running = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+
+    let reads = (0..24).map(|i| {
+        let db = db.clone();
+        let running = running.clone();
+        let peak = peak.clone();
+        tokio::spawn(async move {
+            db.read(move |c| {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(20));
+                let value: i64 = c.query_row("SELECT ?1", [i], |r| r.get(0))?;
+                running.fetch_sub(1, Ordering::SeqCst);
+                Ok::<_, rusqlite::Error>(value)
+            })
+            .await
+        })
+    });
+    let results = futures_util::future::join_all(reads).await;
+    let values: Vec<i64> = results.into_iter().map(|r| r.unwrap().unwrap()).collect();
+    assert_eq!(values, (0..24).collect::<Vec<i64>>());
+    let peak = peak.load(Ordering::SeqCst);
+    assert!((2..=8).contains(&peak), "peak concurrent reads: {peak}");
 }

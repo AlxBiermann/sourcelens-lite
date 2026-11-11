@@ -19,7 +19,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home-dir /data sourcelens \
     && mkdir -p /data \
-    && chown sourcelens /data
+    && chown sourcelens /data \
+    && chmod 700 /data
 COPY --from=build /src/target/release/sourcelens /usr/local/bin/sourcelens
 USER sourcelens
 ENV SOURCELENS_DATA_DIR=/data
