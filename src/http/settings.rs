@@ -48,7 +48,10 @@ async fn github_settings(
         .db
         .read(|conn| {
             conn.query_row(
-                "SELECT received_at, event FROM webhook_deliveries ORDER BY received_at DESC, rowid DESC LIMIT 1",
+                "SELECT received_at, event
+                 FROM webhook_deliveries
+                 ORDER BY received_at DESC, rowid DESC
+                 LIMIT 1",
                 [],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
@@ -92,7 +95,7 @@ async fn embeddings_view(
         .db
         .read(|conn| {
             conn.query_row(
-                "SELECT COALESCE(sum(embed_state = ?1), 0), count(*), COALESCE(sum(embed_state = ?2), 0)
+                "SELECT COALESCE(SUM(embed_state = ?1), 0), COUNT(*), COALESCE(SUM(embed_state = ?2), 0)
                  FROM chunks",
                 [EMBED_DONE, EMBED_REJECTED],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),

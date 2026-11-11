@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod chunker;
 pub mod embed;
+pub mod embedder;
 pub mod jobs;
 pub mod languages;
 pub mod markdown;
