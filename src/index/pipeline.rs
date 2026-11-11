@@ -96,7 +96,12 @@ pub(crate) async fn run_job(state: &AppState, job: ClaimedJob) -> ApiResult<JobO
         return Err(disconnected());
     }
     let token = access_token(state, &mut repo).await?;
-    let head = resolve_head(state, &job, &repo, &token).await?;
+    let head = match resolve_head(state, &job, &repo, &token).await {
+        Err(err) if err.github == Some(GitHubFailure::Status(404)) => {
+            return Err(missing_branch_or_no_access(state, &repo, err).await);
+        }
+        head => head?,
+    };
     let force = job.force || repo.chunker_version != CHUNKER_VERSION;
 
     let mut outcome = if force || repo.indexed_commit.as_deref() != Some(head.as_str()) {
@@ -743,20 +748,37 @@ async fn access_token(state: &AppState, repo: &mut RepoRow) -> ApiResult<String>
     match retried {
         Ok(token) => Ok(token),
         Err(err) if matches!(err.github, Some(GitHubFailure::Status(403 | 404))) => {
-            let repo_id = repo.id;
-            state
-                .db
-                .write(move |conn| {
-                    repositories::disconnect(conn, Target::Id(repo_id), NO_ACCESS_REASON)
-                })
-                .await?;
-            Err(ApiError::forbidden(
-                "github_no_access",
-                format!("The GitHub App has no access to {}.", repo.full_name),
-            ))
+            Err(lose_access(state, repo).await?)
         }
         Err(err) => Err(app_auth_error(err)),
     }
+}
+
+/// GitHub answers 404 for the branch both when it does not exist and when the installation no
+/// longer includes the repository. The app's installation lookup tells the two apart.
+async fn missing_branch_or_no_access(state: &AppState, repo: &RepoRow, err: ApiError) -> ApiError {
+    match state.github.repo_installation(&repo.full_name).await {
+        Err(lookup) if matches!(lookup.github, Some(GitHubFailure::Status(403 | 404))) => {
+            match lose_access(state, repo).await {
+                Ok(no_access) | Err(no_access) => no_access,
+            }
+        }
+        Err(lookup) => app_auth_error(lookup),
+        Ok(_) => err,
+    }
+}
+
+/// Marks the repository `disconnected` and returns the job error.
+async fn lose_access(state: &AppState, repo: &RepoRow) -> ApiResult<ApiError> {
+    let repo_id = repo.id;
+    state
+        .db
+        .write(move |conn| repositories::disconnect(conn, Target::Id(repo_id), NO_ACCESS_REASON))
+        .await?;
+    Ok(ApiError::forbidden(
+        "github_no_access",
+        format!("The GitHub App has no access to {}.", repo.full_name),
+    ))
 }
 
 /// Replaces a 401 from an app-JWT call with `github_app_auth_failed`; other errors pass through.

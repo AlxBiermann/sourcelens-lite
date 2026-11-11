@@ -38,7 +38,8 @@ const SERVER_ERROR: i64 = -32000;
 const SEARCH_TEXT_BUDGET: usize = 24_000;
 const SEARCH_PREVIEW_LINES: usize = 6;
 const SEARCH_PREVIEW_CHARS: usize = 1_500;
-/// Longer lines of a search hit are cut, in the text and in `structuredContent`.
+/// Longer lines of a search hit or a `get_code` page are cut, in the text and in
+/// `structuredContent`, so one minified or data line cannot flood the agent's context.
 const MAX_LINE_CHARS: usize = 400;
 const GET_CODE_DEFAULT_LINES: usize = 400;
 const GET_CODE_MAX_LINES: usize = 800;
@@ -930,7 +931,11 @@ async fn get_code(
         end,
         wanted_end,
     } = page(path, start_arg, end_arg, line_count)?;
-    let code = lines[start - 1..end].join("\n");
+    let code = lines[start - 1..end]
+        .iter()
+        .map(|line| cap_line(line))
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut text = format!(
         "{} {path}:{start}-{end} of {line_count} lines{at_commit}\n{}",
         repo.full_name,
