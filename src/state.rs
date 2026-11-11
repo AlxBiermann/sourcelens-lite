@@ -1,11 +1,12 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
 use crate::crypto::{random_hex, SecretKey};
 use crate::db::Db;
 use crate::github::app::GitHub;
+use crate::rate::RateLimiter;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -16,10 +17,14 @@ pub struct AppState {
     pub github: Arc<GitHub>,
     pub job_notify: Arc<tokio::sync::Notify>,
     pub setup_token: Arc<String>,
-    /// Last `api_keys.last_used_at` write per key id.
+    /// Last `api_keys.last_used_at` write per key id; owned by `mcp`.
     pub key_touch: Arc<Mutex<HashMap<i64, Instant>>>,
-    /// Pending manifest-flow `state`.
+    /// Pending manifest-flow `state`; owned by `http::setup`.
     pub manifest_state: Arc<Mutex<Option<String>>>,
+    /// Request budget per API key on `/mcp`.
+    pub mcp_rate: Arc<RateLimiter>,
+    /// Request budget per user on `POST /api/search`.
+    pub search_rate: Arc<RateLimiter>,
 }
 
 impl AppState {
@@ -50,6 +55,8 @@ impl AppState {
             setup_token: Arc::new(random_hex(16)),
             key_touch: Arc::new(Mutex::new(HashMap::new())),
             manifest_state: Arc::new(Mutex::new(None)),
+            mcp_rate: Arc::new(RateLimiter::default()),
+            search_rate: Arc::new(RateLimiter::default()),
         })
     }
 }
@@ -60,4 +67,11 @@ pub fn now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+/// Locks `mutex`, recovering the data when another thread panicked while holding it.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }

@@ -5,11 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ApiResult;
 use crate::http::session::AuthUser;
+use crate::http::Body;
+use crate::repositories;
 use crate::search::{self, Filter, SearchHit, SearchRequest};
 use crate::state::AppState;
-
-const DEFAULT_LIMIT: usize = 8;
-const MAX_LIMIT: usize = 20;
 
 /// `POST /api/search`.
 pub fn routes() -> Router<AppState> {
@@ -38,17 +37,9 @@ struct SearchResult {
 async fn search_handler(
     State(state): State<AppState>,
     _user: AuthUser,
-    Json(body): Json<SearchBody>,
+    Body(body): Body<SearchBody>,
 ) -> ApiResult<Json<SearchResult>> {
-    let connected = state
-        .db
-        .read(|conn| {
-            let mut stmt =
-                conn.prepare("SELECT id FROM repositories WHERE state = 'connected' ORDER BY id")?;
-            let ids = stmt.query_map([], |row| row.get::<_, i64>(0))?;
-            ids.collect::<rusqlite::Result<Vec<i64>>>()
-        })
-        .await?;
+    let connected = state.db.read(repositories::connected_ids).await?;
     let repo_ids = match body.repository_ids {
         Some(wanted) => connected
             .into_iter()
@@ -56,26 +47,13 @@ async fn search_handler(
             .collect(),
         None => connected,
     };
-    let path_prefix = body
-        .path_prefix
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty());
-    let languages = body
-        .languages
-        .into_iter()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
+    let filter = Filter::new(repo_ids, &body.languages, body.path_prefix.as_deref())?;
     let response = search::search(
         &state,
         SearchRequest {
             query: body.query,
-            filter: Filter {
-                repo_ids,
-                languages,
-                path_prefix,
-            },
-            limit: body.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT),
+            filter,
+            limit: body.limit,
         },
     )
     .await?;

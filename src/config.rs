@@ -12,6 +12,7 @@ const DEFAULT_BIND: &str = "0.0.0.0:3000";
 const DEFAULT_DATA_DIR: &str = "./data";
 const DEFAULT_INDEX_CONCURRENCY: usize = 2;
 const DEFAULT_MAX_FILE_BYTES: u64 = 1_048_576;
+const DEFAULT_MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com";
 
 const GITHUB_VARS: [&str; 6] = [
@@ -31,6 +32,8 @@ pub struct Config {
     pub secret_key: Option<[u8; 32]>,
     pub index_concurrency: usize,
     pub max_file_bytes: u64,
+    /// Largest repository tarball an index job downloads.
+    pub max_archive_bytes: u64,
     pub dev_origin: Option<String>,
     /// GitHub App credentials from the environment (`source = "env"`).
     pub github: Option<AppCredentials>,
@@ -63,11 +66,10 @@ impl Config {
                 .ok_or("SOURCELENS_INDEX_CONCURRENCY must be a positive integer")?;
         }
         if let Some(n) = var("SOURCELENS_MAX_FILE_BYTES") {
-            cfg.max_file_bytes = n
-                .parse::<u64>()
-                .ok()
-                .filter(|n| *n >= 1)
-                .ok_or("SOURCELENS_MAX_FILE_BYTES must be a positive integer")?;
+            cfg.max_file_bytes = positive("SOURCELENS_MAX_FILE_BYTES", &n)?;
+        }
+        if let Some(n) = var("SOURCELENS_MAX_ARCHIVE_BYTES") {
+            cfg.max_archive_bytes = positive("SOURCELENS_MAX_ARCHIVE_BYTES", &n)?;
         }
         if let Some(origin) = var("SOURCELENS_DEV_ORIGIN") {
             cfg.dev_origin = Some(origin.trim_end_matches('/').to_string());
@@ -84,6 +86,7 @@ impl Config {
             secret_key: None,
             index_concurrency: DEFAULT_INDEX_CONCURRENCY,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            max_archive_bytes: DEFAULT_MAX_ARCHIVE_BYTES,
             dev_origin: None,
             github: None,
             github_api_url: DEFAULT_GITHUB_API_URL.to_string(),
@@ -120,6 +123,24 @@ impl Config {
     pub fn public_is_https(&self) -> bool {
         self.public_url.starts_with("https://")
     }
+
+    /// Where GitHub delivers webhooks.
+    pub fn webhook_url(&self) -> String {
+        format!("{}/webhooks/github", self.public_url)
+    }
+
+    /// OAuth redirect target after GitHub sign-in.
+    pub fn callback_url(&self) -> String {
+        format!("{}/auth/github/callback", self.public_url)
+    }
+}
+
+fn positive(name: &str, value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n >= 1)
+        .ok_or_else(|| format!("{name} must be a positive integer"))
 }
 
 fn var(name: &str) -> Option<String> {

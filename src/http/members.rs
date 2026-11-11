@@ -1,4 +1,4 @@
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
 use axum::{Json, Router};
@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ApiResult};
 use crate::http::session::Owner;
-use crate::http::setup::valid_github_name;
+use crate::http::{Body, PathId};
+use crate::model::Role;
 use crate::state::{now, AppState};
 
 const MEMBER_COLUMNS: &str = "id, login, name, avatar_url, role, github_id IS NULL, last_login_at";
@@ -26,7 +27,7 @@ struct Member {
     login: String,
     name: Option<String>,
     avatar_url: Option<String>,
-    role: String,
+    role: Role,
     pending: bool,
     last_login_at: Option<i64>,
 }
@@ -41,6 +42,11 @@ fn member_from_row(row: &Row<'_>) -> rusqlite::Result<Member> {
         pending: row.get(5)?,
         last_login_at: row.get(6)?,
     })
+}
+
+/// GitHub user and organization names: `^[A-Za-z0-9-]{1,39}$`.
+pub(crate) fn valid_github_name(name: &str) -> bool {
+    (1..=39).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 async fn list(State(state): State<AppState>, _owner: Owner) -> ApiResult<Json<Vec<Member>>> {
@@ -65,7 +71,7 @@ struct AddMember {
 async fn add(
     State(state): State<AppState>,
     _owner: Owner,
-    Json(req): Json<AddMember>,
+    Body(req): Body<AddMember>,
 ) -> ApiResult<Json<Member>> {
     let login = req.login.trim().trim_start_matches('@').to_string();
     if !valid_github_name(&login) {
@@ -75,57 +81,57 @@ async fn add(
         ));
     }
     let ts = now();
-    let inserted = state
+    let member = state
         .db
-        .write(move |conn| {
+        .write(move |conn| -> ApiResult<Member> {
             let result = conn.execute(
-                "INSERT INTO users (login, role, created_at) VALUES (?1, 'member', ?2)",
-                params![login, ts],
+                "INSERT INTO users (login, role, created_at) VALUES (?1, ?2, ?3)",
+                params![login, Role::Member, ts],
             );
             match result {
                 Ok(_) => {}
                 Err(rusqlite::Error::SqliteFailure(err, _))
                     if err.code == ErrorCode::ConstraintViolation =>
                 {
-                    return Ok(None)
+                    return Err(ApiError::conflict(
+                        "member_exists",
+                        "This GitHub user is already a member.",
+                    ))
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(err.into()),
             }
-            conn.query_row(
+            Ok(conn.query_row(
                 &format!("SELECT {MEMBER_COLUMNS} FROM users WHERE id = ?1"),
                 [conn.last_insert_rowid()],
                 member_from_row,
-            )
-            .map(Some)
+            )?)
         })
         .await?;
-    inserted
-        .map(Json)
-        .ok_or_else(|| ApiError::conflict("member_exists", "This GitHub user is already a member."))
+    Ok(Json(member))
 }
 
 async fn remove(
     State(state): State<AppState>,
     _owner: Owner,
-    Path(id): Path<i64>,
+    PathId(id): PathId,
 ) -> ApiResult<StatusCode> {
-    let role: Option<String> = state
+    let role: Option<Role> = state
         .db
         .write(move |conn| {
-            let role: Option<String> = conn
+            let role: Option<Role> = conn
                 .query_row("SELECT role FROM users WHERE id = ?1", [id], |row| {
                     row.get(0)
                 })
                 .optional()?;
-            if role.as_deref() == Some("member") {
+            if role == Some(Role::Member) {
                 conn.execute("DELETE FROM users WHERE id = ?1", [id])?;
             }
-            Ok(role)
+            Ok::<_, rusqlite::Error>(role)
         })
         .await?;
-    match role.as_deref() {
-        Some("member") => Ok(StatusCode::NO_CONTENT),
-        Some(_) => Err(ApiError::conflict(
+    match role {
+        Some(Role::Member) => Ok(StatusCode::NO_CONTENT),
+        Some(Role::Owner) => Err(ApiError::conflict(
             "cannot_remove_owner",
             "The owner cannot be removed.",
         )),

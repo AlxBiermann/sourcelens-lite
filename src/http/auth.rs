@@ -155,11 +155,7 @@ async fn finish_login(
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
     if let Some(value) = cookie(&headers, SESSION_COOKIE) {
-        let hash = sha256_hex(value.as_bytes());
-        state
-            .db
-            .write(move |conn| conn.execute("DELETE FROM sessions WHERE id_hash = ?1", [hash]))
-            .await?;
+        session::delete_session(&state, &sha256_hex(value.as_bytes())).await?;
     }
     Ok((
         StatusCode::NO_CONTENT,

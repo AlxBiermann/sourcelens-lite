@@ -1,10 +1,12 @@
 use std::time::Duration;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, OptionalExtension};
 
 use crate::error::{ApiError, ApiResult};
 use crate::index::pipeline::{self, ClaimedJob, JobOutcome};
 use crate::index::store;
+use crate::model::{JobStatus, RepoState, Trigger};
+use crate::repositories::{self, CONNECTED_IDS};
 use crate::state::{now, AppState};
 
 /// How long an idle worker waits for a notification before looking for jobs again.
@@ -19,11 +21,10 @@ const PURGE_POLL: Duration = Duration::from_millis(250);
 pub async fn enqueue(
     state: &AppState,
     repo_id: i64,
-    trigger: &str,
+    trigger: Trigger,
     target_commit: Option<&str>,
     force: bool,
 ) -> ApiResult<i64> {
-    let trigger = trigger.to_string();
     let target_commit = target_commit.map(str::to_string);
     let id = state
         .db
@@ -46,34 +47,40 @@ pub async fn enqueue(
     Ok(id)
 }
 
-/// Startup: fails interrupted jobs, finishes pending deletions and queues a `startup` job per connected repository.
+/// Startup: fails interrupted jobs, starts pending deletions in the background and queues a
+/// `startup` job per connected repository.
 pub async fn recover_and_reconcile(state: &AppState) -> ApiResult<()> {
     let finished_at = now();
     let (deleting, connected) = state
         .db
         .write(move |conn| {
             conn.execute(
-                "UPDATE jobs SET status = 'failed', error = 'Interrupted by a restart.', finished_at = ?1
-                 WHERE status = 'running'",
-                [finished_at],
+                "UPDATE jobs SET status = ?2, error = 'Interrupted by a restart.', finished_at = ?1
+                 WHERE status = ?3",
+                params![finished_at, JobStatus::Failed, JobStatus::Running],
             )?;
-            let deleting = repository_ids(conn, "deleting")?;
-            let connected = repository_ids(conn, "connected")?;
-            Ok((deleting, connected))
+            let deleting = repositories::ids_in_state(conn, RepoState::Deleting)?;
+            let connected = repositories::connected_ids(conn)?;
+            Ok::<_, rusqlite::Error>((deleting, connected))
         })
         .await?;
     for repo_id in deleting {
-        purge_repository(state, repo_id).await?;
+        let task_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(err) = purge_repository(&task_state, repo_id).await {
+                tracing::error!(repo_id, "deleting repository index failed: {err}");
+            }
+        });
     }
     for repo_id in connected {
-        enqueue(state, repo_id, "startup", None, false).await?;
+        enqueue(state, repo_id, Trigger::Startup, None, false).await?;
     }
     Ok(())
 }
 
 /// Starts `cfg.index_concurrency` workers that run queued jobs until the process exits.
 pub fn spawn_workers(state: AppState) {
-    for worker in 0..state.cfg.index_concurrency.max(1) {
+    for worker in 0..state.cfg.index_concurrency {
         let state = state.clone();
         tokio::spawn(async move {
             loop {
@@ -99,7 +106,7 @@ pub async fn run_next(state: &AppState) -> ApiResult<bool> {
     let Some(job) = claim(state).await? else {
         return Ok(false);
     };
-    let (job_id, repo_id, trigger) = (job.id, job.repo_id, job.trigger.clone());
+    let (job_id, repo_id, trigger) = (job.id, job.repo_id, job.trigger);
     let task_state = state.clone();
     // A separate task so a panic inside the pipeline fails the job instead of killing the worker.
     let result = match tokio::spawn(async move { pipeline::run_job(&task_state, job).await }).await
@@ -112,11 +119,12 @@ pub async fn run_next(state: &AppState) -> ApiResult<bool> {
     if let Err(err) = &result {
         tracing::warn!(job_id, repo_id, "index job failed: {}", err.message);
     }
-    finish(state, job_id, repo_id, &trigger, result).await?;
+    finish(state, job_id, repo_id, trigger, result).await?;
     Ok(true)
 }
 
-/// Waits until no job of the repository is running, then deletes its index and row.
+/// Waits until no job of the repository is running, then deletes its index and row, one batch
+/// per writer turn so other writes can run in between.
 pub async fn purge_repository(state: &AppState, repo_id: i64) -> ApiResult<()> {
     let started = tokio::time::Instant::now();
     loop {
@@ -124,8 +132,8 @@ pub async fn purge_repository(state: &AppState, repo_id: i64) -> ApiResult<()> {
             .db
             .read(move |conn| {
                 conn.query_row(
-                    "SELECT EXISTS (SELECT 1 FROM jobs WHERE repo_id = ?1 AND status = 'running')",
-                    [repo_id],
+                    "SELECT EXISTS (SELECT 1 FROM jobs WHERE repo_id = ?1 AND status = ?2)",
+                    params![repo_id, JobStatus::Running],
                     |row| row.get(0),
                 )
             })
@@ -135,11 +143,15 @@ pub async fn purge_repository(state: &AppState, repo_id: i64) -> ApiResult<()> {
         }
         tokio::time::sleep(PURGE_POLL).await;
     }
-    state
-        .db
-        .write(move |conn| store::purge_repository(conn, repo_id))
-        .await?;
-    Ok(())
+    loop {
+        let done = state
+            .db
+            .write(move |conn| store::purge_batch(conn, repo_id))
+            .await?;
+        if done {
+            return Ok(());
+        }
+    }
 }
 
 async fn claim(state: &AppState) -> ApiResult<Option<ClaimedJob>> {
@@ -148,12 +160,14 @@ async fn claim(state: &AppState) -> ApiResult<Option<ClaimedJob>> {
         .db
         .write(move |conn| {
             conn.query_row(
-                "UPDATE jobs SET status = 'running', started_at = ?1, phase = 'resolve'
-                 WHERE id = (SELECT j.id FROM jobs j JOIN repositories r ON r.id = j.repo_id
-                             WHERE j.status = 'queued' AND r.state = 'connected'
-                               AND NOT EXISTS (SELECT 1 FROM jobs x WHERE x.repo_id = j.repo_id AND x.status = 'running')
-                             ORDER BY j.id LIMIT 1)
-                 RETURNING id, repo_id, trigger, target_commit, force",
+                &format!(
+                    "UPDATE jobs SET status = 'running', started_at = ?1, phase = 'resolve'
+                     WHERE id = (SELECT j.id FROM jobs j
+                                 WHERE j.status = 'queued' AND j.repo_id IN ({CONNECTED_IDS})
+                                   AND NOT EXISTS (SELECT 1 FROM jobs x WHERE x.repo_id = j.repo_id AND x.status = 'running')
+                                 ORDER BY j.id LIMIT 1)
+                     RETURNING id, repo_id, trigger, target_commit, force"
+                ),
                 [started_at],
                 |row| {
                     Ok(ClaimedJob {
@@ -175,14 +189,14 @@ async fn finish(
     state: &AppState,
     job_id: i64,
     repo_id: i64,
-    trigger: &str,
+    trigger: Trigger,
     result: ApiResult<JobOutcome>,
 ) -> ApiResult<()> {
-    let discard = trigger == "startup"
+    let discard = trigger == Trigger::Startup
         && matches!(&result, Ok(o) if o.files_changed == 0 && o.files_deleted == 0 && o.files_skipped == 0 && o.embedded == 0);
     let (status, error) = match result {
-        Ok(_) => ("succeeded", None),
-        Err(err) => ("failed", Some(err.message)),
+        Ok(_) => (JobStatus::Succeeded, None),
+        Err(err) => (JobStatus::Failed, Some(err.message)),
     };
     let finished_at = now();
     state
@@ -202,18 +216,10 @@ async fn finish(
                                   ORDER BY id DESC LIMIT ?2)",
                 params![repo_id, KEEP_FINISHED_JOBS],
             )?;
-            Ok(())
+            Ok::<_, rusqlite::Error>(())
         })
         .await?;
     // A queued job of the same repository may have waited for this one.
     state.job_notify.notify_waiters();
     Ok(())
-}
-
-fn repository_ids(conn: &Connection, repo_state: &str) -> rusqlite::Result<Vec<i64>> {
-    let mut stmt = conn.prepare("SELECT id FROM repositories WHERE state = ?1 ORDER BY id")?;
-    let ids = stmt
-        .query_map([repo_state], |row| row.get(0))?
-        .collect::<rusqlite::Result<Vec<i64>>>()?;
-    Ok(ids)
 }

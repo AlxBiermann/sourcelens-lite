@@ -7,10 +7,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::crypto::{random_hex, sha256_hex};
+use crate::db;
 use crate::error::{ApiError, ApiResult};
-use crate::github::app::AppCredentials;
+use crate::github::app::{AppCredentials, GitHub};
+use crate::http::members::valid_github_name;
 use crate::http::session::current_user;
-use crate::state::AppState;
+use crate::http::Body;
+use crate::model::Role;
+use crate::state::{lock, AppState};
 
 /// `GET /api/state`, `POST /api/setup/manifest`, `GET /auth/github/app-created`.
 pub fn routes() -> Router<AppState> {
@@ -45,7 +49,7 @@ struct StateUser {
     login: String,
     name: Option<String>,
     avatar_url: Option<String>,
-    role: String,
+    role: Role,
 }
 
 async fn get_state(
@@ -97,16 +101,7 @@ pub fn install_url(slug: &str) -> String {
 }
 
 pub async fn owner_exists(state: &AppState) -> ApiResult<bool> {
-    Ok(state
-        .db
-        .read(|conn| {
-            conn.query_row(
-                "SELECT EXISTS (SELECT 1 FROM users WHERE role = 'owner')",
-                [],
-                |row| row.get(0),
-            )
-        })
-        .await?)
+    Ok(state.db.read(db::owner_exists).await?)
 }
 
 /// True when `token` is this process's setup token and no owner exists yet.
@@ -131,7 +126,7 @@ struct ManifestResponse {
 
 async fn create_manifest(
     State(state): State<AppState>,
-    Json(req): Json<ManifestRequest>,
+    Body(req): Body<ManifestRequest>,
 ) -> ApiResult<Json<ManifestResponse>> {
     if !setup_token_valid(&state, &req.setup_token).await? {
         return Err(ApiError::forbidden(
@@ -159,10 +154,7 @@ async fn create_manifest(
     }
 
     let manifest_state = random_hex(16);
-    *state
-        .manifest_state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(manifest_state.clone());
+    *lock(&state.manifest_state) = Some(manifest_state.clone());
 
     let post_url = match &organization {
         Some(org) => format!(
@@ -175,11 +167,11 @@ async fn create_manifest(
         "name": format!("SourceLens {}", random_hex(2)),
         "url": public,
         "hook_attributes": {
-            "url": format!("{public}/webhooks/github"),
+            "url": state.cfg.webhook_url(),
             "active": !state.cfg.public_host_is_local(),
         },
         "redirect_url": format!("{public}/auth/github/app-created"),
-        "callback_urls": [format!("{public}/auth/github/callback")],
+        "callback_urls": [state.cfg.callback_url()],
         "setup_url": format!("{public}/repositories?installed=1"),
         "setup_on_update": true,
         "public": false,
@@ -188,11 +180,6 @@ async fn create_manifest(
         "default_events": ["push", "repository"],
     });
     Ok(Json(ManifestResponse { post_url, manifest }))
-}
-
-/// GitHub user and organization names: `^[A-Za-z0-9-]{1,39}$`.
-pub fn valid_github_name(name: &str) -> bool {
-    (1..=39).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 #[derive(Deserialize)]
@@ -205,11 +192,7 @@ async fn app_created(
     State(state): State<AppState>,
     Query(query): Query<AppCreatedQuery>,
 ) -> Redirect {
-    let expected = state
-        .manifest_state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
+    let expected = lock(&state.manifest_state).take();
     let state_ok = matches!((&expected, &query.state), (Some(e), Some(s)) if e == s);
     if !state_ok {
         return Redirect::to("/setup?error=state");
@@ -246,7 +229,7 @@ async fn convert_manifest(state: &AppState, code: &str) -> ApiResult<()> {
         state.github.api_base()
     );
     let response = state.github.send(|| state.http.post(&url)).await?;
-    let conversion: Conversion = response.json().await.map_err(ApiError::internal)?;
+    let conversion: Conversion = GitHub::json(response, &url).await?;
     state
         .github
         .store_manifest_credentials(&AppCredentials {

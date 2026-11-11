@@ -1,7 +1,8 @@
 use rusqlite::{params, Connection};
 use sourcelens::db::Db;
-use sourcelens::index::store::{apply_files, prepare_file, vec_table_exists};
-use sourcelens::search::vector::{create_vec_table, knn, to_blob};
+use sourcelens::index::store::{
+    apply_files, create_vec_table, knn, prepare_file, to_blob, vec_table_exists,
+};
 
 fn insert_repo(conn: &Connection, github_id: i64) -> i64 {
     conn.query_row(
@@ -40,7 +41,7 @@ async fn knn_orders_by_distance_and_respects_scope_and_k() {
             insert_vector(conn, 2, a, &[0.0, 1.0, 0.0, 0.0]);
             insert_vector(conn, 3, b, &[0.8, 0.6, 0.0, 0.0]);
             let query = [1.0, 0.0, 0.0, 0.0];
-            Ok((
+            Ok::<_, rusqlite::Error>((
                 exists_before,
                 knn(conn, &[a, b], &query, 10)?,
                 knn(conn, &[a], &query, 10)?,
@@ -134,7 +135,7 @@ async fn unchanged_chunks_keep_their_vectors_when_a_file_is_reapplied() {
                 .collect::<rusqlite::Result<_>>()?;
             let vec_rows: i64 =
                 conn.query_row("SELECT count(*) FROM vec_chunks", [], |row| row.get(0))?;
-            Ok((rows, vec_rows))
+            Ok::<_, rusqlite::Error>((rows, vec_rows))
         })
         .await
         .unwrap();

@@ -6,15 +6,17 @@ use axum::http::StatusCode;
 use reqwest::header::RETRY_AFTER;
 use reqwest::Url;
 use ring::rand::{SecureRandom, SystemRandom};
-use rusqlite::types::ValueRef;
-use rusqlite::{params, Connection, OptionalExtension, ToSql, TransactionBehavior};
+use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::sha256_hex;
+use crate::db::sql::text_column;
+use crate::db::{delete_setting, get_setting, put_setting};
 use crate::error::{ApiError, ApiResult};
 use crate::index::{jobs, store};
-use crate::search::vector;
-use crate::state::{now, AppState};
+use crate::model::{JobPhase, Trigger, EMBED_DONE, EMBED_PENDING, EMBED_REJECTED};
+use crate::repositories;
+use crate::state::AppState;
 
 const SETTINGS_KEY: &str = "embeddings";
 const API_KEY_KEY: &str = "embeddings_api_key";
@@ -289,34 +291,14 @@ fn error_message(status: StatusCode, body: &str) -> String {
     }
 }
 
-fn setting_bytes(conn: &Connection, key: &str) -> rusqlite::Result<Option<Vec<u8>>> {
-    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
-        Ok(match row.get_ref(0)? {
-            ValueRef::Blob(b) | ValueRef::Text(b) => Some(b.to_vec()),
-            _ => None,
-        })
-    })
-    .optional()
-    .map(Option::flatten)
-}
-
-fn put_setting(conn: &Connection, key: &str, value: impl ToSql) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3)
-         ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-        params![key, value, now()],
-    )?;
-    Ok(())
-}
-
 /// Stored settings plus the sealed API key, read in one go.
 async fn stored(state: &AppState) -> ApiResult<(EmbeddingSettings, Option<String>)> {
     let (json, sealed) = state
         .db
         .read(|conn| {
-            Ok((
-                setting_bytes(conn, SETTINGS_KEY)?,
-                setting_bytes(conn, API_KEY_KEY)?,
+            Ok::<_, rusqlite::Error>((
+                get_setting(conn, SETTINGS_KEY)?,
+                get_setting(conn, API_KEY_KEY)?,
             ))
         })
         .await?;
@@ -374,16 +356,13 @@ fn pending_batch(
         "SELECT c.id, f.path, c.symbol_path,
                 substr(CAST(f.content AS BLOB), c.start_byte + 1, c.end_byte - c.start_byte)
          FROM chunks c JOIN files f ON f.id = c.file_id
-         WHERE c.repo_id = ?1 AND c.embed_state = 0
+         WHERE c.repo_id = ?1 AND c.embed_state = ?3
          ORDER BY c.id LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![repo_id, limit], |row| {
+    let rows = stmt.query_map(params![repo_id, limit, EMBED_PENDING], |row| {
         let path: String = row.get(1)?;
         let symbol_path: String = row.get(2)?;
-        let content = match row.get_ref(3)? {
-            ValueRef::Blob(b) | ValueRef::Text(b) => String::from_utf8_lossy(b).into_owned(),
-            _ => String::new(),
-        };
+        let content = text_column(row, 3)?;
         let full = format!(
             "{prefix}{}",
             store::embedding_input(&path, &symbol_path, &content)
@@ -415,15 +394,15 @@ pub async fn embed_pending(state: &AppState, repo_id: i64, job_id: i64) -> ApiRe
         .db
         .write(move |conn| {
             let total: i64 = conn.query_row(
-                "SELECT count(*) FROM chunks WHERE repo_id = ?1 AND embed_state = 0",
-                [repo_id],
+                "SELECT count(*) FROM chunks WHERE repo_id = ?1 AND embed_state = ?2",
+                params![repo_id, EMBED_PENDING],
                 |row| row.get(0),
             )?;
             conn.execute(
-                "UPDATE jobs SET phase = 'embed', embed_total = ?1, embed_done = 0 WHERE id = ?2",
-                params![total, job_id],
+                "UPDATE jobs SET phase = ?3, embed_total = ?1, embed_done = 0 WHERE id = ?2",
+                params![total, job_id, JobPhase::Embed],
             )?;
-            Ok(())
+            Ok::<_, rusqlite::Error>(())
         })
         .await?;
 
@@ -474,15 +453,12 @@ fn store_batch(
             Ok(vector) => {
                 // Only chunks that still exist and are still pending get a vector.
                 let changed = tx.execute(
-                    "UPDATE chunks SET embed_state = 1 WHERE id = ?1 AND embed_state = 0",
-                    [id],
+                    "UPDATE chunks SET embed_state = ?2 WHERE id = ?1 AND embed_state = ?3",
+                    params![id, EMBED_DONE, EMBED_PENDING],
                 )?;
                 if changed == 1 {
                     tx.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", [id])?;
-                    tx.execute(
-                        "INSERT INTO vec_chunks (chunk_id, repo_id, embedding) VALUES (?1, ?2, ?3)",
-                        params![id, repo_id, vector::to_blob(vector)],
-                    )?;
+                    store::put_vector(&tx, *id, repo_id, &store::to_blob(vector))?;
                     embedded += 1;
                 }
             }
@@ -492,8 +468,8 @@ fn store_batch(
                     "embedding provider rejected a chunk: {message}"
                 );
                 tx.execute(
-                    "UPDATE chunks SET embed_state = 2 WHERE id = ?1 AND embed_state = 0",
-                    [id],
+                    "UPDATE chunks SET embed_state = ?2 WHERE id = ?1 AND embed_state = ?3",
+                    params![id, EMBED_REJECTED, EMBED_PENDING],
                 )?;
             }
         }
@@ -507,8 +483,7 @@ fn store_batch(
 }
 
 fn provider_error(message: String) -> ApiError {
-    ApiError::new(
-        StatusCode::BAD_GATEWAY,
+    ApiError::bad_gateway(
         "embedding_provider_error",
         format!("Embedding provider error: {message}"),
     )
@@ -668,44 +643,30 @@ pub async fn apply_settings(
             match key_change {
                 KeyChange::Keep => {}
                 KeyChange::Set(sealed) => put_setting(&tx, API_KEY_KEY, &sealed)?,
-                KeyChange::Clear => {
-                    tx.execute("DELETE FROM settings WHERE key = ?1", [API_KEY_KEY])?;
-                }
+                KeyChange::Clear => delete_setting(&tx, API_KEY_KEY)?,
             }
             let mut repos = Vec::new();
             if let Some((dimensions, fingerprint)) = target {
-                let stored_fingerprint = setting_bytes(&tx, FINGERPRINT_KEY)?;
+                let stored_fingerprint = get_setting(&tx, FINGERPRINT_KEY)?;
                 let unchanged = stored_fingerprint.as_deref() == Some(fingerprint.as_bytes())
                     && store::vec_table_exists(&tx)?;
-                let sql = if !unchanged {
-                    vector::create_vec_table(&tx, dimensions)?;
-                    tx.execute("UPDATE chunks SET embed_state = 0", [])?;
+                if !unchanged {
+                    store::create_vec_table(&tx, dimensions)?;
+                    tx.execute("UPDATE chunks SET embed_state = ?1", [EMBED_PENDING])?;
                     put_setting(&tx, FINGERPRINT_KEY, &fingerprint)?;
-                    Some("SELECT id FROM repositories WHERE state = 'connected' ORDER BY id")
+                    repos = repositories::connected_ids(&tx)?;
                 } else if !was_enabled {
                     // Chunks indexed while embeddings were off are still pending.
-                    Some(
-                        "SELECT r.id FROM repositories r WHERE r.state = 'connected'
-                         AND EXISTS (SELECT 1 FROM chunks c WHERE c.repo_id = r.id AND c.embed_state = 0)
-                         ORDER BY r.id",
-                    )
-                } else {
-                    None
-                };
-                if let Some(sql) = sql {
-                    let mut stmt = tx.prepare(sql)?;
-                    repos = stmt
-                        .query_map([], |row| row.get::<_, i64>(0))?
-                        .collect::<rusqlite::Result<_>>()?;
+                    repos = repositories::connected_with_pending_embeddings(&tx)?;
                 }
             }
             tx.commit()?;
-            Ok(repos)
+            Ok::<_, rusqlite::Error>(repos)
         })
         .await?;
 
     for &repo_id in &repos {
-        jobs::enqueue(state, repo_id, "settings", None, false).await?;
+        jobs::enqueue(state, repo_id, Trigger::Settings, None, false).await?;
     }
     Ok((settings, u32::try_from(repos.len()).unwrap_or(u32::MAX)))
 }

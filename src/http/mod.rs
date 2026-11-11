@@ -8,12 +8,15 @@ pub mod settings;
 pub mod setup;
 pub mod ui;
 
-use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::{header, Method};
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Path, Request, State};
+use axum::http::request::Parts;
+use axum::http::{header, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
+use axum::{Json, Router};
+use serde::de::DeserializeOwned;
 use tower_http::trace::TraceLayer;
 
 use crate::error::ApiError;
@@ -73,4 +76,54 @@ async fn require_same_origin(State(state): State<AppState>, req: Request, next: 
         }
     }
     next.run(req).await
+}
+
+/// JSON request body whose rejection (bad JSON, wrong types, missing content type) is answered as
+/// 400 `invalid_body` in the API error format.
+pub struct Body<T>(pub T);
+
+impl<T, S> FromRequest<S> for Body<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) => Err(invalid_body(&rejection)),
+        }
+    }
+}
+
+fn invalid_body(rejection: &JsonRejection) -> ApiError {
+    if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large",
+            "The request body is too large.",
+        );
+    }
+    ApiError::bad_request(
+        "invalid_body",
+        format!("The request body is invalid: {}", rejection.body_text()),
+    )
+}
+
+/// Numeric `{id}` path segment; anything else is 404 `not_found` in the API error format.
+pub struct PathId(pub i64);
+
+impl<S: Send + Sync> FromRequestParts<S> for PathId {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match Path::<i64>::from_request_parts(parts, state).await {
+            Ok(Path(id)) => Ok(Self(id)),
+            Err(_) => Err(ApiError::not_found(
+                "not_found",
+                "Nothing exists at this address.",
+            )),
+        }
+    }
 }

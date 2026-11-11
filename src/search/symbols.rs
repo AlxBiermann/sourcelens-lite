@@ -3,6 +3,8 @@
 use rusqlite::types::Value;
 use rusqlite::{params_from_iter, Connection, OptionalExtension};
 
+use crate::db::sql::{escape_like, placeholders};
+
 /// Minimum name length for prefix and substring lookup (the trigram index needs three chars).
 const MIN_FUZZY_CHARS: usize = 3;
 
@@ -102,17 +104,6 @@ fn normalize_qualified(candidate: &str) -> String {
     candidate.replace("::", ".").replace(['#', '/'], ".")
 }
 
-pub(crate) fn escape_like(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        if matches!(c, '\\' | '%' | '_') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run(
     conn: &Connection,
@@ -156,10 +147,6 @@ fn run(
         })
     })?;
     rows.collect()
-}
-
-pub(crate) fn placeholders(count: usize) -> String {
-    vec!["?"; count].join(", ")
 }
 
 /// Innermost chunk of the file that contains `line`.

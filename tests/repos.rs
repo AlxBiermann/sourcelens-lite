@@ -183,7 +183,7 @@ impl Env {
                 let rows = stmt
                     .query_map([repo_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                Ok::<_, rusqlite::Error>(rows)
             })
             .await
             .unwrap()
@@ -382,7 +382,7 @@ async fn list_computes_effective_branch_and_jobs() {
                 [a],
             )?;
             conn.execute("INSERT INTO jobs (repo_id, status, trigger, created_at) VALUES (?1, 'queued', 'webhook', 5)", [a])?;
-            Ok((a, b))
+            Ok::<_, rusqlite::Error>((a, b))
         })
         .await
         .unwrap();

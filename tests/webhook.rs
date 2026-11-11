@@ -101,7 +101,7 @@ async fn jobs(state: &AppState, repo_id: i64) -> Vec<(String, Option<String>, St
             let rows = stmt
                 .query_map([repo_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
+            Ok::<_, rusqlite::Error>(rows)
         })
         .await
         .unwrap()

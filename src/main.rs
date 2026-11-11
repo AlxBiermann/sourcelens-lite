@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
 use sourcelens::config::Config;
-use sourcelens::http;
+use sourcelens::http::{self, setup};
 use sourcelens::index::jobs;
 use sourcelens::state::AppState;
 use tracing_subscriber::EnvFilter;
@@ -27,17 +27,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cfg = Config::from_env()?;
     let state = AppState::new(cfg)?;
 
-    let owner_exists = state
-        .db
-        .read(|conn| {
-            conn.query_row(
-                "SELECT EXISTS (SELECT 1 FROM users WHERE role = 'owner')",
-                [],
-                |row| row.get::<_, bool>(0),
-            )
-        })
-        .await?;
-    if !owner_exists {
+    if !setup::owner_exists(&state).await? {
         tracing::info!(
             "Setup token: {} — open {}/setup",
             state.setup_token,

@@ -8,6 +8,7 @@ use sourcelens::github::oauth::GhToken;
 use sourcelens::http::keys::{self, NewKey};
 use sourcelens::http::session;
 use sourcelens::index::store;
+use sourcelens::mcp::authenticate;
 use sourcelens::state::{now, AppState};
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -45,7 +46,7 @@ async fn insert_repo(state: &AppState, github_id: i64, full_name: &str, repo_sta
                  VALUES (?1, 1, ?2, 0, 'main', ?3, 0)",
                 rusqlite::params![github_id, full_name, repo_state],
             )?;
-            Ok(c.last_insert_rowid())
+            Ok::<_, rusqlite::Error>(c.last_insert_rowid())
         })
         .await
         .unwrap()
@@ -423,7 +424,7 @@ async fn key_scope_excludes_disconnected_and_foreign_repositories() {
     mark_indexed(&env.state, api).await;
 
     let all_key = create_key(&env.state, None).await;
-    let scope = keys::authenticate(&env.state, &all_key).await.unwrap();
+    let scope = authenticate(&env.state, &all_key).await.unwrap();
     assert_eq!(scope.repo_ids, vec![api, orders]);
 
     let result = call(&env.app, &all_key, "list_repositories", json!({})).await;
@@ -447,7 +448,7 @@ async fn key_scope_excludes_disconnected_and_foreign_repositories() {
     assert_eq!(names, ["acme/api", "acme/orders"]);
 
     let key_a = create_key(&env.state, Some(vec![api, gone])).await;
-    let scope = keys::authenticate(&env.state, &key_a).await.unwrap();
+    let scope = authenticate(&env.state, &key_a).await.unwrap();
     assert_eq!(scope.repo_ids, vec![api]);
     let result = call(&env.app, &key_a, "list_repositories", json!({})).await;
     assert!(!text(&result).contains("acme/orders"));
@@ -571,7 +572,7 @@ async fn keys_api_through_the_router() {
         .db
         .write(|c| {
             c.execute("INSERT INTO users (github_id, login, role, created_at) VALUES (7, 'alex', 'member', 0)", [])?;
-            Ok(c.last_insert_rowid())
+            Ok::<_, rusqlite::Error>(c.last_insert_rowid())
         })
         .await
         .unwrap();
@@ -631,10 +632,7 @@ async fn keys_api_through_the_router() {
     assert!(!raw.contains(&secret[3..]));
 
     assert_eq!(
-        keys::authenticate(&env.state, &secret)
-            .await
-            .unwrap()
-            .repo_ids,
+        authenticate(&env.state, &secret).await.unwrap().repo_ids,
         vec![r1]
     );
 
@@ -649,10 +647,7 @@ async fn keys_api_through_the_router() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(patched["repositoryIds"], json!([r2]));
     assert_eq!(
-        keys::authenticate(&env.state, &secret)
-            .await
-            .unwrap()
-            .repo_ids,
+        authenticate(&env.state, &secret).await.unwrap().repo_ids,
         vec![r2]
     );
 
@@ -677,10 +672,7 @@ async fn keys_api_through_the_router() {
     .await;
     assert_eq!(patched["allRepositories"], true);
     assert_eq!(
-        keys::authenticate(&env.state, &secret)
-            .await
-            .unwrap()
-            .repo_ids,
+        authenticate(&env.state, &secret).await.unwrap().repo_ids,
         vec![r1, r2]
     );
 
@@ -852,6 +844,26 @@ async fn indexed_env() -> (Env, i64, i64) {
     )
     .await;
     (env, r1, r2)
+}
+
+#[tokio::test]
+async fn search_code_reports_unknown_languages() {
+    let (env, _, _) = indexed_env().await;
+    let key = create_key(&env.state, None).await;
+
+    let result = call(
+        &env.app,
+        &key,
+        "search_code",
+        json!({ "query": "getUserById", "languages": ["klingon"] }),
+    )
+    .await;
+    assert!(is_error(&result));
+    assert!(
+        text(&result).contains("Unknown language \"klingon\""),
+        "{}",
+        text(&result)
+    );
 }
 
 #[tokio::test]

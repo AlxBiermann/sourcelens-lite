@@ -3,8 +3,8 @@
 use rusqlite::types::Value;
 use rusqlite::{params_from_iter, Connection};
 
+use crate::db::sql::{escape_like, placeholders};
 use crate::search::query::Group;
-use crate::search::symbols::{escape_like, placeholders};
 use crate::search::Filter;
 
 /// FTS5 expression of one group: `"whole"*` (prefix from three chars), or-ed with all of its parts.
@@ -69,7 +69,8 @@ pub fn search(
     rows.collect()
 }
 
-/// Appends ` AND …` conditions for `filter` on aliases `c` (chunks) and `f` (files).
+/// Appends ` AND …` conditions for `filter` (already normalised by [`Filter::new`]) on aliases
+/// `c` (chunks) and `f` (files).
 pub(crate) fn push_filter(sql: &mut String, values: &mut Vec<Value>, filter: &Filter) {
     sql.push_str(&format!(
         " AND c.repo_id IN ({})",
@@ -81,18 +82,9 @@ pub(crate) fn push_filter(sql: &mut String, values: &mut Vec<Value>, filter: &Fi
             " AND f.language IN ({})",
             placeholders(filter.languages.len())
         ));
-        values.extend(filter.languages.iter().map(|language| {
-            let canonical = crate::index::languages::language_by_name(language)
-                .map(|known| known.name.to_string())
-                .unwrap_or_else(|| language.trim().to_lowercase());
-            Value::from(canonical)
-        }));
+        values.extend(filter.languages.iter().cloned().map(Value::from));
     }
-    let prefix = filter
-        .path_prefix
-        .as_deref()
-        .map(|p| p.trim_start_matches('/'));
-    if let Some(prefix) = prefix.filter(|p| !p.is_empty()) {
+    if let Some(prefix) = &filter.path_prefix {
         sql.push_str(" AND f.path LIKE ? ESCAPE '\\'");
         values.push(Value::from(format!("{}%", escape_like(prefix))));
     }

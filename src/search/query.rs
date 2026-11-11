@@ -1,5 +1,7 @@
 //! Turns a free-text query into lexical groups, identifier candidates and highlight terms.
 
+use crate::index::store::camel_parts;
+
 const MAX_QUERY_CHARS: usize = 512;
 const MAX_SYMBOL_CANDIDATES: usize = 4;
 
@@ -21,36 +23,6 @@ pub struct QueryPlan {
     pub groups: Vec<Group>,
     pub symbol_candidates: Vec<String>,
     pub terms: Vec<String>,
-}
-
-/// Lower-cased identifier parts: splits at non-alphanumerics, lower|digit→Upper and acronym→Word
-/// (`HTTPServer` → `http`, `server`; `get_user` → `get`, `user`).
-pub fn camel_parts(identifier: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    for run in identifier.split(|c: char| !c.is_alphanumeric()) {
-        let chars: Vec<char> = run.chars().collect();
-        let mut start = 0;
-        for i in 1..chars.len() {
-            let prev = chars[i - 1];
-            let cur = chars[i];
-            let lower_to_upper = (prev.is_lowercase() || prev.is_numeric()) && cur.is_uppercase();
-            let acronym_to_word = prev.is_uppercase()
-                && cur.is_uppercase()
-                && chars.get(i + 1).is_some_and(|next| next.is_lowercase());
-            if lower_to_upper || acronym_to_word {
-                parts.push(lower(&chars[start..i]));
-                start = i;
-            }
-        }
-        if start < chars.len() {
-            parts.push(lower(&chars[start..]));
-        }
-    }
-    parts
-}
-
-fn lower(chars: &[char]) -> String {
-    chars.iter().flat_map(|c| c.to_lowercase()).collect()
 }
 
 fn is_code_like(word: &str) -> bool {

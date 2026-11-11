@@ -13,6 +13,7 @@ use sourcelens::crypto::git_blob_sha1;
 use sourcelens::github::app::AppCredentials;
 use sourcelens::index::jobs;
 use sourcelens::index::pipeline::TARBALL_THRESHOLD;
+use sourcelens::model::Trigger;
 use sourcelens::state::{now, AppState};
 use tempfile::TempDir;
 
@@ -297,6 +298,7 @@ impl Env {
 
     /// Queues a job, runs it through `run_next` and returns its row (`None` when it was discarded).
     async fn run(&self, trigger: &str, force: bool) -> Option<JobRow> {
+        let trigger = Trigger::parse(trigger).expect("known trigger");
         let job_id = jobs::enqueue(&self.state, self.repo_id, trigger, None, force)
             .await
             .unwrap();
@@ -347,7 +349,7 @@ impl Env {
                 let rows = stmt
                     .query_map([repo_id], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
-                Ok(rows)
+                Ok::<_, rusqlite::Error>(rows)
             })
             .await
             .unwrap()
@@ -655,10 +657,10 @@ async fn idle_startup_job_is_discarded_and_failures_keep_the_message() {
 #[tokio::test]
 async fn enqueue_keeps_one_queued_job_per_repository() {
     let env = setup().await;
-    let first = jobs::enqueue(&env.state, env.repo_id, "webhook", Some("a"), true)
+    let first = jobs::enqueue(&env.state, env.repo_id, Trigger::Webhook, Some("a"), true)
         .await
         .unwrap();
-    let second = jobs::enqueue(&env.state, env.repo_id, "manual", Some("b"), false)
+    let second = jobs::enqueue(&env.state, env.repo_id, Trigger::Manual, Some("b"), false)
         .await
         .unwrap();
     assert_eq!(first, second);
@@ -697,7 +699,7 @@ async fn claim_skips_busy_and_disconnected_repositories() {
         })
         .await
         .unwrap();
-    jobs::enqueue(&env.state, repo_id, "manual", None, false)
+    jobs::enqueue(&env.state, repo_id, Trigger::Manual, None, false)
         .await
         .unwrap();
     assert!(
@@ -751,7 +753,7 @@ async fn recovery_fails_interrupted_jobs_and_queues_startup_jobs() {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
+            Ok::<_, rusqlite::Error>(rows)
         })
         .await
         .unwrap();
@@ -782,9 +784,17 @@ async fn recovery_purges_repositories_being_deleted() {
         .await
         .unwrap();
     jobs::recover_and_reconcile(&env.state).await.unwrap();
-    let repos: i64 = env
-        .query("SELECT count(*) FROM repositories WHERE id = ?1")
-        .await;
+    // The purge runs in the background so startup is not blocked by it.
+    let mut repos: i64 = 1;
+    for _ in 0..400 {
+        repos = env
+            .query("SELECT count(*) FROM repositories WHERE id = ?1")
+            .await;
+        if repos == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
     let files: i64 = env
         .query("SELECT count(*) FROM files WHERE repo_id = ?1")
         .await;

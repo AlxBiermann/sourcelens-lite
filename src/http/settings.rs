@@ -7,7 +7,10 @@ use serde_json::{json, Value};
 
 use crate::error::{ApiError, ApiResult};
 use crate::http::session::{AuthUser, Owner};
+use crate::http::setup::install_url;
+use crate::http::Body;
 use crate::index::embed::{self, EmbeddingSettings, EmbeddingSettingsInput};
+use crate::model::{EMBED_DONE, EMBED_REJECTED};
 use crate::state::AppState;
 
 /// `/api/settings/github`, `/api/settings/embeddings[/test]`.
@@ -58,10 +61,10 @@ async fn github_settings(
         .is_some_and(|s| !s.is_empty());
     Ok(Json(GithubSettings {
         source: creds.source,
-        install_url: format!("https://github.com/apps/{}/installations/new", creds.slug),
+        install_url: install_url(&creds.slug),
         slug: creds.slug,
         app_url: creds.html_url,
-        webhook_url: format!("{}/webhooks/github", state.cfg.public_url),
+        webhook_url: state.cfg.webhook_url(),
         webhook_active: has_secret && !state.cfg.public_host_is_local(),
         last_delivery_at: last.as_ref().map(|(at, _)| *at),
         last_delivery_event: last.map(|(_, event)| event),
@@ -89,8 +92,9 @@ async fn embeddings_view(
         .db
         .read(|conn| {
             conn.query_row(
-                "SELECT coalesce(sum(embed_state = 1), 0), count(*), coalesce(sum(embed_state = 2), 0) FROM chunks",
-                [],
+                "SELECT COALESCE(sum(embed_state = ?1), 0), count(*), COALESCE(sum(embed_state = ?2), 0)
+                 FROM chunks",
+                [EMBED_DONE, EMBED_REJECTED],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
         })
@@ -115,7 +119,7 @@ async fn get_embeddings(
 async fn put_embeddings(
     State(state): State<AppState>,
     _owner: Owner,
-    Json(input): Json<EmbeddingSettingsInput>,
+    Body(input): Body<EmbeddingSettingsInput>,
 ) -> ApiResult<Json<EmbeddingsView>> {
     let (settings, queued) = embed::apply_settings(&state, input).await?;
     Ok(Json(embeddings_view(&state, settings, Some(queued)).await?))
@@ -124,7 +128,7 @@ async fn put_embeddings(
 async fn test_embeddings(
     State(state): State<AppState>,
     _owner: Owner,
-    Json(input): Json<EmbeddingSettingsInput>,
+    Body(input): Body<EmbeddingSettingsInput>,
 ) -> ApiResult<Json<Value>> {
     Ok(Json(match embed::test_connection(&state, &input).await? {
         Ok((dimensions, latency_ms)) => {

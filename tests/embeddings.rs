@@ -803,7 +803,7 @@ async fn vectors_make_search_hybrid_with_semantic_only_hits() {
                 repo_ids: vec![repo],
                 ..Filter::default()
             },
-            limit: 8,
+            limit: Some(8),
         },
     )
     .await

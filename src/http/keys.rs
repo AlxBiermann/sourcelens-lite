@@ -1,8 +1,6 @@
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, Instant};
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -12,17 +10,12 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::crypto::{random_hex, sha256_hex};
 use crate::error::{ApiError, ApiResult};
 use crate::http::session::AuthUser;
-use crate::state::{now, AppState};
+use crate::http::{Body, PathId};
+use crate::repositories::{self, LISTED_IDS};
+use crate::state::{lock, now, AppState};
 
-const KEY_PREFIX: &str = "sl_";
+pub const KEY_PREFIX: &str = "sl_";
 const ALLOWED_EXPIRY_DAYS: [i64; 3] = [30, 90, 365];
-const TOUCH_INTERVAL: Duration = Duration::from_secs(60);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyScope {
-    pub key_id: i64,
-    pub repo_ids: Vec<i64>,
-}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -92,7 +85,7 @@ async fn list(State(state): State<AppState>, _user: AuthUser) -> ApiResult<Json<
 async fn create(
     State(state): State<AppState>,
     user: AuthUser,
-    Json(input): Json<NewKey>,
+    Body(input): Body<NewKey>,
 ) -> ApiResult<Json<CreatedKey>> {
     let (key, secret) = create_key(&state, input, Some(user.id)).await?;
     Ok(Json(CreatedKey { key, secret }))
@@ -101,8 +94,8 @@ async fn create(
 async fn update(
     State(state): State<AppState>,
     _user: AuthUser,
-    Path(id): Path<i64>,
-    Json(input): Json<KeyUpdate>,
+    PathId(id): PathId,
+    Body(input): Body<KeyUpdate>,
 ) -> ApiResult<Json<ApiKey>> {
     let name = match input.name {
         Some(name) => Some(valid_name(&name)?),
@@ -114,13 +107,13 @@ async fn update(
     };
     let key = state
         .db
-        .write(move |conn| {
+        .write(move |conn| -> ApiResult<ApiKey> {
             let tx = conn.transaction()?;
             let exists: Option<i64> = tx
                 .query_row("SELECT id FROM api_keys WHERE id = ?1", [id], |r| r.get(0))
                 .optional()?;
             if exists.is_none() {
-                return Ok(Err(key_not_found()));
+                return Err(key_not_found());
             }
             if let Some(name) = &name {
                 tx.execute(
@@ -129,22 +122,20 @@ async fn update(
                 )?;
             }
             if let Some(scope) = &scope {
-                if let Err(err) = replace_scope(&tx, id, scope.as_deref())? {
-                    return Ok(Err(err));
-                }
+                replace_scope(&tx, id, scope.as_deref())?;
             }
             let key = load_keys(&tx, Some(id))?.pop();
             tx.commit()?;
-            Ok(key.ok_or_else(key_not_found))
+            key.ok_or_else(key_not_found)
         })
-        .await??;
+        .await?;
     Ok(Json(key))
 }
 
 async fn remove(
     State(state): State<AppState>,
     _user: AuthUser,
-    Path(id): Path<i64>,
+    PathId(id): PathId,
 ) -> ApiResult<StatusCode> {
     let deleted = state
         .db
@@ -183,7 +174,7 @@ pub async fn create_key(
     let last4 = secret[secret.len() - 4..].to_string();
     let key = state
         .db
-        .write(move |conn| {
+        .write(move |conn| -> ApiResult<ApiKey> {
             let tx = conn.transaction()?;
             tx.execute(
                 "INSERT INTO api_keys (name, key_hash, last4, all_repos, created_by, created_at, expires_at)
@@ -192,90 +183,14 @@ pub async fn create_key(
             )?;
             let id = tx.last_insert_rowid();
             if let Some(ids) = &repository_ids {
-                if let Err(err) = replace_scope(&tx, id, Some(ids))? {
-                    return Ok(Err(err));
-                }
+                replace_scope(&tx, id, Some(ids))?;
             }
             let key = load_keys(&tx, Some(id))?.pop();
             tx.commit()?;
-            Ok(key.ok_or_else(key_not_found))
-        })
-        .await??;
-    Ok((key, secret))
-}
-
-/// Resolves an API key (with or without a leading `Bearer `) to the connected repositories it may read.
-pub async fn authenticate(state: &AppState, bearer: &str) -> ApiResult<KeyScope> {
-    let secret = bearer.trim();
-    let secret = secret
-        .get(..7)
-        .filter(|scheme| scheme.eq_ignore_ascii_case("bearer "))
-        .map_or(secret, |_| secret[7..].trim_start());
-    if !secret.starts_with(KEY_PREFIX) {
-        return Err(invalid_key());
-    }
-    let key_hash = sha256_hex(secret.as_bytes());
-    let found = state
-        .db
-        .read(move |conn| {
-            let row: Option<(i64, bool, Option<i64>)> = conn
-                .query_row(
-                    "SELECT id, all_repos, expires_at FROM api_keys WHERE key_hash = ?1",
-                    [&key_hash],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .optional()?;
-            let Some((key_id, all_repos, expires_at)) = row else {
-                return Ok(None);
-            };
-            if expires_at.is_some_and(|at| at <= now()) {
-                return Ok(None);
-            }
-            let repo_ids = if all_repos {
-                conn.prepare("SELECT id FROM repositories WHERE state = 'connected' ORDER BY id")?
-                    .query_map([], |r| r.get(0))?
-                    .collect::<rusqlite::Result<Vec<i64>>>()?
-            } else {
-                conn.prepare(
-                    "SELECT r.id FROM api_key_repos k JOIN repositories r ON r.id = k.repo_id
-                     WHERE k.key_id = ?1 AND r.state = 'connected' ORDER BY r.id",
-                )?
-                .query_map([key_id], |r| r.get(0))?
-                .collect::<rusqlite::Result<Vec<i64>>>()?
-            };
-            Ok(Some(KeyScope { key_id, repo_ids }))
+            key.ok_or_else(key_not_found)
         })
         .await?;
-    let scope = found.ok_or_else(invalid_key)?;
-    touch(state, scope.key_id).await?;
-    Ok(scope)
-}
-
-/// Writes `last_used_at` at most once per minute per key.
-async fn touch(state: &AppState, key_id: i64) -> ApiResult<()> {
-    let due = {
-        let mut touched = lock(&state.key_touch);
-        let now = Instant::now();
-        let due = touched
-            .get(&key_id)
-            .is_none_or(|last| now.duration_since(*last) >= TOUCH_INTERVAL);
-        if due {
-            touched.insert(key_id, now);
-        }
-        due
-    };
-    if due {
-        state
-            .db
-            .write(move |conn| {
-                conn.execute(
-                    "UPDATE api_keys SET last_used_at = ?1 WHERE id = ?2",
-                    params![now(), key_id],
-                )
-            })
-            .await?;
-    }
-    Ok(())
+    Ok((key, secret))
 }
 
 fn valid_name(name: &str) -> ApiResult<String> {
@@ -301,41 +216,35 @@ fn valid_repository_ids(mut ids: Vec<i64>) -> ApiResult<Vec<i64>> {
     Ok(ids)
 }
 
-/// Sets the key to all repositories (`None`) or to the given repositories. The inner error reports unknown ids.
-fn replace_scope(
-    tx: &Transaction<'_>,
-    key_id: i64,
-    ids: Option<&[i64]>,
-) -> rusqlite::Result<Result<(), ApiError>> {
+/// Sets the key to all repositories (`None`) or to the given repositories; unknown ids are 422.
+fn replace_scope(tx: &Transaction<'_>, key_id: i64, ids: Option<&[i64]>) -> ApiResult<()> {
     tx.execute("DELETE FROM api_key_repos WHERE key_id = ?1", [key_id])?;
     let Some(ids) = ids else {
         tx.execute("UPDATE api_keys SET all_repos = 1 WHERE id = ?1", [key_id])?;
-        return Ok(Ok(()));
+        return Ok(());
     };
-    let mut exists =
-        tx.prepare("SELECT 1 FROM repositories WHERE id = ?1 AND state <> 'deleting'")?;
     let mut insert = tx.prepare("INSERT INTO api_key_repos (key_id, repo_id) VALUES (?1, ?2)")?;
     for &repo_id in ids {
-        if !exists.exists([repo_id])? {
-            return Ok(Err(ApiError::unprocessable(
+        if !repositories::is_listed(tx, repo_id)? {
+            return Err(ApiError::unprocessable(
                 "unknown_repository",
                 format!("Repository {repo_id} does not exist."),
-            )));
+            ));
         }
         insert.execute([key_id, repo_id])?;
     }
     tx.execute("UPDATE api_keys SET all_repos = 0 WHERE id = ?1", [key_id])?;
-    Ok(Ok(()))
+    Ok(())
 }
 
 /// All keys (newest first), or the key with `only_id`.
 fn load_keys(conn: &Connection, only_id: Option<i64>) -> rusqlite::Result<Vec<ApiKey>> {
     let mut scopes: HashMap<i64, Vec<i64>> = HashMap::new();
     {
-        let mut stmt = conn.prepare(
-            "SELECT k.key_id, k.repo_id FROM api_key_repos k JOIN repositories r ON r.id = k.repo_id
-             WHERE (?1 IS NULL OR k.key_id = ?1) AND r.state <> 'deleting' ORDER BY k.repo_id",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT key_id, repo_id FROM api_key_repos
+             WHERE (?1 IS NULL OR key_id = ?1) AND repo_id IN ({LISTED_IDS}) ORDER BY repo_id"
+        ))?;
         let rows = stmt.query_map([only_id], |r| Ok((r.get::<_, i64>(0)?, r.get(1)?)))?;
         for row in rows {
             let (key_id, repo_id) = row?;
@@ -373,14 +282,4 @@ fn load_keys(conn: &Connection, only_id: Option<i64>) -> rusqlite::Result<Vec<Ap
 
 fn key_not_found() -> ApiError {
     ApiError::not_found("key_not_found", "This API key does not exist.")
-}
-
-fn invalid_key() -> ApiError {
-    ApiError::unauthorized("invalid_api_key", "Invalid, expired or revoked API key.")
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }

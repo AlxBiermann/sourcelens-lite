@@ -6,15 +6,20 @@ pub mod vector;
 
 use std::collections::{HashMap, HashSet};
 
-use rusqlite::types::{Value, ValueRef};
+use rusqlite::types::Value;
 use rusqlite::{params_from_iter, Connection};
 use serde::Serialize;
 
-use crate::error::ApiError;
+use crate::db::sql::{placeholders, text_column};
+use crate::error::{ApiError, ApiResult};
+use crate::index::languages::{language_by_name, LANGUAGES};
+use crate::repositories;
 use crate::search::query::QueryPlan;
 use crate::state::AppState;
 
+/// Results returned when the request names no limit.
 pub const DEFAULT_LIMIT: usize = 8;
+/// Most results one request may ask for.
 pub const MAX_LIMIT: usize = 20;
 
 const SYMBOL_WEIGHT: f64 = 2.0;
@@ -38,19 +43,64 @@ const TEST_DIRECTORIES: &[&str] = &[
     "fixtures",
 ];
 
+/// Where a search looks. Build it with [`Filter::new`] so languages and the path prefix are normalised.
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
     pub repo_ids: Vec<i64>,
+    /// Canonical language names (`languages::Language::name`).
     pub languages: Vec<String>,
+    /// Without leading `/`; `None` when empty.
     pub path_prefix: Option<String>,
+}
+
+impl Filter {
+    /// Trims and canonicalises the languages (names, aliases or extensions) and the path prefix.
+    /// An unknown language is 422 `unknown_language`.
+    pub fn new(
+        repo_ids: Vec<i64>,
+        languages: impl IntoIterator<Item = impl AsRef<str>>,
+        path_prefix: Option<&str>,
+    ) -> ApiResult<Self> {
+        let mut canonical: Vec<String> = Vec::new();
+        for language in languages {
+            let name = language.as_ref().trim();
+            if name.is_empty() {
+                continue;
+            }
+            let Some(known) = language_by_name(name) else {
+                return Err(unknown_language(name));
+            };
+            if !canonical.iter().any(|c| c == known.name) {
+                canonical.push(known.name.to_string());
+            }
+        }
+        let path_prefix = path_prefix
+            .map(|prefix| prefix.trim().trim_start_matches('/'))
+            .filter(|prefix| !prefix.is_empty())
+            .map(str::to_string);
+        Ok(Self {
+            repo_ids,
+            languages: canonical,
+            path_prefix,
+        })
+    }
+}
+
+fn unknown_language(name: &str) -> ApiError {
+    let mut known: Vec<&str> = LANGUAGES.iter().map(|language| language.name).collect();
+    known.sort_unstable();
+    ApiError::unprocessable(
+        "unknown_language",
+        format!("Unknown language \"{name}\". Known: {}.", known.join(", ")),
+    )
 }
 
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
     pub query: String,
     pub filter: Filter,
-    /// Clamped to 1..=20, default 8.
-    pub limit: usize,
+    /// Clamped to `1..=MAX_LIMIT`; `None` = [`DEFAULT_LIMIT`].
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -85,7 +135,7 @@ pub async fn search(state: &AppState, req: SearchRequest) -> Result<SearchRespon
             "Enter a search query.",
         ));
     };
-    let limit = req.limit.clamp(1, MAX_LIMIT);
+    let limit = req.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let terms = plan.terms.clone();
     if req.filter.repo_ids.is_empty() {
         return Ok(SearchResponse {
@@ -167,6 +217,11 @@ fn ranked_hits(
         .collect();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
 
+    let mut repo_ids: Vec<i64> = meta.values().map(|(repo_id, _, _)| *repo_id).collect();
+    repo_ids.sort_unstable();
+    repo_ids.dedup();
+    let names = repositories::full_names(conn, &repo_ids)?;
+
     let mut per_file: HashMap<(i64, &str), usize> = HashMap::new();
     let mut hits = Vec::new();
     for (id, score, channels) in &ranked {
@@ -178,7 +233,7 @@ fn ranked_hits(
             continue;
         }
         *count += 1;
-        if let Some(hit) = load_hit(conn, *id, *score, channels.clone())? {
+        if let Some(hit) = load_hit(conn, &names, *id, *score, channels.clone())? {
             hits.push(hit);
         }
         if hits.len() == limit {
@@ -198,7 +253,7 @@ fn chunk_meta(
     }
     let sql = format!(
         "SELECT c.id, c.repo_id, f.path, c.kind FROM chunks c JOIN files f ON f.id = c.file_id WHERE c.id IN ({})",
-        symbols::placeholders(ids.len())
+        placeholders(ids.len())
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(ids), |row| {
@@ -221,35 +276,34 @@ fn is_test_path(path: &str) -> bool {
 
 fn load_hit(
     conn: &Connection,
+    repository_names: &HashMap<i64, String>,
     id: i64,
     score: f64,
     matched_by: Vec<&'static str>,
 ) -> rusqlite::Result<Option<SearchHit>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT r.full_name, f.path, f.language, c.kind, c.symbol_path, c.start_line, c.end_line,
+        "SELECT c.repo_id, f.path, f.language, c.kind, c.symbol_path, c.start_line, c.end_line,
                 substr(f.content, c.start_byte + 1, c.end_byte - c.start_byte)
-         FROM chunks c JOIN files f ON f.id = c.file_id JOIN repositories r ON r.id = c.repo_id
+         FROM chunks c JOIN files f ON f.id = c.file_id
          WHERE c.id = ?1",
     )?;
     let mut rows = stmt.query([id])?;
     let Some(row) = rows.next()? else {
         return Ok(None);
     };
-    let content = match row.get_ref(7)? {
-        ValueRef::Blob(bytes) | ValueRef::Text(bytes) => {
-            String::from_utf8_lossy(bytes).into_owned()
-        }
-        _ => String::new(),
+    let repo_id: i64 = row.get(0)?;
+    let Some(repository) = repository_names.get(&repo_id) else {
+        return Ok(None);
     };
     Ok(Some(SearchHit {
-        repository: row.get(0)?,
+        repository: repository.clone(),
         path: row.get(1)?,
         language: row.get(2)?,
         kind: row.get(3)?,
         symbol_path: row.get(4)?,
         start_line: row.get(5)?,
         end_line: row.get(6)?,
-        content,
+        content: text_column(row, 7)?,
         score,
         matched_by,
     }))
@@ -266,7 +320,7 @@ pub(crate) fn retain_matching(
     }
     let mut sql = format!(
         "SELECT c.id FROM chunks c JOIN files f ON f.id = c.file_id WHERE c.id IN ({})",
-        symbols::placeholders(ids.len())
+        placeholders(ids.len())
     );
     let mut values: Vec<Value> = ids.iter().map(|&id| Value::from(id)).collect();
     lexical::push_filter(&mut sql, &mut values, filter);
