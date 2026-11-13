@@ -3,7 +3,7 @@
 # Must equal the channel in rust-toolchain.toml; the build stage fails when they differ.
 ARG RUST_VERSION=1.96.1
 
-FROM node:24-trixie-slim AS ui
+FROM node:25-trixie-slim AS ui
 WORKDIR /src/ui
 COPY ui/package.json ui/package-lock.json ./
 RUN npm ci
