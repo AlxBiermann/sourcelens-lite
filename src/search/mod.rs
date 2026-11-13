@@ -1,9 +1,11 @@
 pub mod fuse;
+pub mod grep;
 pub mod lexical;
 pub mod query;
 pub mod symbols;
 pub mod vector;
 
+use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
@@ -101,6 +103,17 @@ fn unknown_language(name: &str) -> ApiError {
         "unknown_language",
         format!("Unknown language \"{name}\". Known: {}.", known.join(", ")),
     )
+}
+
+/// `line` cut after `max_chars` characters to `… [+N chars]`.
+pub fn cap_line(line: &str, max_chars: usize) -> Cow<'_, str> {
+    match line.char_indices().nth(max_chars) {
+        None => Cow::Borrowed(line),
+        Some((at, _)) => {
+            let rest = line[at..].chars().count();
+            Cow::Owned(format!("{}… [+{rest} chars]", &line[..at]))
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -228,7 +228,7 @@ async fn notification_ping_and_unknown_method() {
 }
 
 #[tokio::test]
-async fn tools_list_has_the_five_read_only_tools() {
+async fn tools_list_has_the_six_read_only_tools() {
     let env = env();
     let key = create_key(&env.state, None).await;
     let response = rpc(&env.app, &key, "tools/list", json!({})).await;
@@ -241,6 +241,7 @@ async fn tools_list_has_the_five_read_only_tools() {
             "find_symbol",
             "get_code",
             "get_file_outline",
+            "grep_code",
             "list_repositories",
             "search_code"
         ]
@@ -972,4 +973,144 @@ async fn find_symbol_returns_headings_only_when_asked() {
     )
     .await;
     assert_eq!(kinds(&level), ["heading_2"]);
+}
+
+// ── grep_code ────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn grep_code_lists_occurrences_grouped_by_file() {
+    let (env, _, _) = indexed_env().await;
+    let key = create_key(&env.state, None).await;
+
+    let result = call(
+        &env.app,
+        &key,
+        "grep_code",
+        json!({ "pattern": "getUserById" }),
+    )
+    .await;
+    assert!(!is_error(&result), "{}", text(&result));
+    let body = text(&result);
+    assert!(
+        body.starts_with(
+            "2 matching lines in 1 file for \"getUserById\" (complete, 2 files searched)"
+        ),
+        "{body}"
+    );
+    assert!(
+        body.contains(
+            "\n\nacme/api src/users.ts\n  9: export function getUserById(id: string): User | undefined {\n  33:     const user = getUserById(id);"
+        ),
+        "{body}"
+    );
+    let structured = &result["structuredContent"];
+    assert_eq!(structured["totalMatches"], 2);
+    assert_eq!(structured["matches"][1]["line"], 33);
+    assert_eq!(structured["truncated"], false);
+    assert_eq!(structured["timedOut"], false);
+    assert_eq!(structured["pattern"], "getUserById");
+    assert_eq!(structured["regex"], false);
+    assert_eq!(structured["caseSensitive"], true);
+}
+
+#[tokio::test]
+async fn grep_code_stays_inside_the_key_scope() {
+    let (env, r1, _) = indexed_env().await;
+    let key_a = create_key(&env.state, Some(vec![r1])).await;
+
+    let result = call(
+        &env.app,
+        &key_a,
+        "grep_code",
+        json!({ "pattern": "return" }),
+    )
+    .await;
+    assert!(!is_error(&result), "{}", text(&result));
+    assert!(!text(&result).contains("acme/orders"), "{}", text(&result));
+    assert_eq!(result["structuredContent"]["filesSearched"], 1);
+
+    let foreign = call(
+        &env.app,
+        &key_a,
+        "grep_code",
+        json!({ "pattern": "return", "repositories": ["acme/orders"] }),
+    )
+    .await;
+    assert!(is_error(&foreign));
+    assert!(
+        text(&foreign).contains("Unknown repository"),
+        "{}",
+        text(&foreign)
+    );
+}
+
+#[tokio::test]
+async fn grep_code_reports_no_match_truncation_and_bad_input() {
+    let (env, _, _) = indexed_env().await;
+    let key = create_key(&env.state, None).await;
+
+    let none = call(
+        &env.app,
+        &key,
+        "grep_code",
+        json!({ "pattern": "zzz_not_there" }),
+    )
+    .await;
+    assert!(!is_error(&none), "{}", text(&none));
+    assert_eq!(text(&none), "No lines match \"zzz_not_there\" in 2 files.");
+
+    let cut = call(
+        &env.app,
+        &key,
+        "grep_code",
+        json!({ "pattern": "return", "limit": 1 }),
+    )
+    .await;
+    assert!(!is_error(&cut), "{}", text(&cut));
+    assert!(
+        text(&cut).starts_with("Showing 1 of 6 matching lines in 2 files for \"return\"."),
+        "{}",
+        text(&cut)
+    );
+    assert_eq!(cut["structuredContent"]["truncated"], true);
+
+    let invalid = call(
+        &env.app,
+        &key,
+        "grep_code",
+        json!({ "pattern": "foo(", "regex": true }),
+    )
+    .await;
+    assert!(is_error(&invalid));
+    assert!(
+        text(&invalid).contains("Invalid regular expression"),
+        "{}",
+        text(&invalid)
+    );
+
+    let wrong_type = rpc(
+        &env.app,
+        &key,
+        "tools/call",
+        json!({ "name": "grep_code", "arguments": { "pattern": "x", "regex": "yes" } }),
+    )
+    .await;
+    assert_eq!(wrong_type["error"]["code"], -32602);
+    assert!(wrong_type["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("\"regex\""));
+
+    let missing = rpc(
+        &env.app,
+        &key,
+        "tools/call",
+        json!({ "name": "grep_code", "arguments": {} }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], -32602);
+    assert!(missing["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("\"pattern\""));
 }

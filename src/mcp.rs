@@ -1,6 +1,5 @@
 //! Read-only MCP server: stateless Streamable HTTP with JSON responses only.
 
-use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
@@ -17,6 +16,7 @@ use crate::crypto::sha256_hex;
 use crate::error::{ApiError, ApiResult};
 use crate::http::keys::KEY_PREFIX;
 use crate::repositories::{self, RepoRow, CONNECTED_IDS};
+use crate::search::grep::{self, GrepRequest, GrepResponse};
 use crate::search::symbols::{self, SymbolRow};
 use crate::search::{self, Filter, SearchHit, SearchRequest};
 use crate::state::{lock, now, AppState, SECS_PER_DAY};
@@ -24,7 +24,7 @@ use crate::state::{lock, now, AppState, SECS_PER_DAY};
 const SUPPORTED_VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "2025-03-26"];
 const LATEST_VERSION: &str = SUPPORTED_VERSIONS[0];
 
-const INSTRUCTIONS: &str = "SourceLens searches indexed GitHub repositories. Start with list_repositories, then search_code. Results give repository, path and line range; read more with get_code. Use find_symbol for a definition by name and get_file_outline before reading a large file.";
+const INSTRUCTIONS: &str = "SourceLens searches indexed GitHub repositories. Start with list_repositories, then search_code. Results give repository, path and line range; read more with get_code. Use find_symbol for a definition by name, grep_code to list every occurrence of an exact text or pattern (for example all usages of a function), and get_file_outline before reading a large file.";
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
@@ -356,7 +356,7 @@ struct ToolSpec {
     required: &'static [&'static str],
 }
 
-fn tool_specs() -> [ToolSpec; 5] {
+fn tool_specs() -> [ToolSpec; 6] {
     let repositories = json!({
         "type": "array",
         "items": { "type": "string" },
@@ -365,6 +365,8 @@ fn tool_specs() -> [ToolSpec; 5] {
     let repository =
         json!({ "type": "string", "description": "Repository full name, e.g. owner/repo." });
     let path = json!({ "type": "string", "description": "File path inside the repository." });
+    let languages = json!({ "type": "array", "items": { "type": "string" }, "description": "Language names, e.g. rust, typescript." });
+    let path_prefix = json!({ "type": "string", "description": "Only files whose path starts with this prefix." });
     [
         ToolSpec {
             name: "list_repositories",
@@ -378,11 +380,25 @@ fn tool_specs() -> [ToolSpec; 5] {
             properties: json!({
                 "query": { "type": "string", "description": "What to look for: words, identifiers or a description." },
                 "repositories": repositories,
-                "languages": { "type": "array", "items": { "type": "string" }, "description": "Language names, e.g. rust, typescript." },
-                "pathPrefix": { "type": "string", "description": "Only files whose path starts with this prefix." },
+                "languages": languages,
+                "pathPrefix": path_prefix,
                 "limit": { "type": "integer", "minimum": 1, "maximum": search::MAX_LIMIT, "default": search::DEFAULT_LIMIT },
             }),
             required: &["query"],
+        },
+        ToolSpec {
+            name: "grep_code",
+            description: "Find every line that contains an exact text or matches a regular expression in the indexed text files (binary, minified, generated and vendored files are not indexed). Use it to list all usages of a name, string or pattern. Unlike search_code the result is exhaustive, and it says when it is cut off.",
+            properties: json!({
+                "pattern": { "type": "string", "description": "Text to find. Matched literally unless regex is true." },
+                "regex": { "type": "boolean", "default": false, "description": "Treat pattern as a regular expression (Rust regex syntax: no look-around, no backreferences). ^ and $ match at line boundaries." },
+                "caseSensitive": { "type": "boolean", "default": true },
+                "repositories": repositories,
+                "languages": languages,
+                "pathPrefix": path_prefix,
+                "limit": { "type": "integer", "minimum": 1, "maximum": grep::MAX_LIMIT, "default": grep::DEFAULT_LIMIT, "description": "Most matching lines to return." },
+            }),
+            required: &["pattern"],
         },
         ToolSpec {
             name: "get_code",
@@ -486,6 +502,7 @@ async fn call_tool(
     let output = match spec.name {
         "list_repositories" => list_repositories(state, scope).await,
         "search_code" => search_code(state, scope, args).await,
+        "grep_code" => grep_code(state, scope, args).await,
         "get_code" => get_code(state, scope, args).await,
         "get_file_outline" => get_file_outline(state, scope, args).await,
         _ => find_symbol(state, scope, args).await,
@@ -561,6 +578,16 @@ impl<'a> Args<'a> {
         number
             .map(Some)
             .ok_or_else(|| ToolError::Params(format!("Argument \"{name}\" must be an integer")))
+    }
+
+    fn boolean(&self, name: &str) -> Result<Option<bool>, ToolError> {
+        match self.value(name) {
+            None => Ok(None),
+            Some(Value::Bool(b)) => Ok(Some(*b)),
+            Some(_) => Err(ToolError::Params(format!(
+                "Argument \"{name}\" must be a boolean"
+            ))),
+        }
     }
 
     /// The integer argument `name` clamped to `1..=max`, `default` when absent.
@@ -731,6 +758,99 @@ async fn search_code(
     ToolOutput::new(text, json!({ "mode": response.mode, "results": hits }))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GrepOutput<'a> {
+    pattern: &'a str,
+    regex: bool,
+    case_sensitive: bool,
+    #[serde(flatten)]
+    response: &'a GrepResponse,
+}
+
+async fn grep_code(
+    state: &AppState,
+    scope: &KeyScope,
+    args: Args<'_>,
+) -> Result<ToolOutput, ToolError> {
+    let pattern = args.string("pattern")?;
+    let regex = args.boolean("regex")?.unwrap_or(false);
+    let case_sensitive = args.boolean("caseSensitive")?.unwrap_or(true);
+    let repository_names = args.strings("repositories")?;
+    let languages = args.strings("languages")?;
+    let path_prefix = args.opt_string("pathPrefix")?;
+    let limit = args.limit("limit", grep::DEFAULT_LIMIT, grep::MAX_LIMIT)?;
+
+    let repos = scope_repositories(state, scope).await?;
+    let repo_ids = narrow(&repos, &repository_names)?;
+    let response = grep::grep(
+        state,
+        GrepRequest {
+            pattern: pattern.to_string(),
+            regex,
+            case_sensitive,
+            filter: Filter::new(repo_ids, languages, path_prefix)?,
+            limit,
+        },
+    )
+    .await?;
+
+    let shown = response.matches.len();
+    let total = response.total_matches;
+    let mut text = if response.timed_out {
+        format!(
+            "Incomplete: the search stopped after {} seconds with {} searched. {shown} of {} so far for \"{pattern}\". Narrow it with repositories, languages or pathPrefix.",
+            grep::TIME_BUDGET.as_secs(),
+            counted(response.files_searched, "file"),
+            counted(total, "matching line"),
+        )
+    } else if total == 0 {
+        format!(
+            "No lines match \"{pattern}\" in {}.",
+            counted(response.files_searched, "file")
+        )
+    } else if response.truncated {
+        format!(
+            "Showing {shown} of {} in {} for \"{pattern}\". Narrow it with repositories, languages or pathPrefix, or raise limit (max {}).",
+            counted(total, "matching line"),
+            counted(response.files_with_matches, "file"),
+            grep::MAX_LIMIT,
+        )
+    } else {
+        format!(
+            "{} in {} for \"{pattern}\" (complete, {} searched)",
+            counted(total, "matching line"),
+            counted(response.files_with_matches, "file"),
+            counted(response.files_searched, "file"),
+        )
+    };
+    let mut current: Option<(&str, &str)> = None;
+    for m in &response.matches {
+        let file = (m.repository.as_str(), m.path.as_str());
+        if current != Some(file) {
+            text.push_str(&format!("\n\n{} {}", m.repository, m.path));
+            current = Some(file);
+        }
+        text.push_str(&format!("\n  {}: {}", m.line, m.text));
+    }
+    let output = GrepOutput {
+        pattern,
+        regex,
+        case_sensitive,
+        response: &response,
+    };
+    ToolOutput::new(text, output)
+}
+
+/// `1 line`, `2 lines`.
+fn counted(n: u64, noun: &str) -> String {
+    if n == 1 {
+        format!("{n} {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
 /// `kind symbol_path`; chunks that group declarations (`block`, `block_part`) have no symbol
 /// path and show the names of the symbols they contain instead.
 fn hit_label(hit: &SearchHit) -> String {
@@ -746,19 +866,9 @@ fn hit_label(hit: &SearchHit) -> String {
 fn cap_lines(content: &str) -> String {
     content
         .split('\n')
-        .map(cap_line)
+        .map(|line| search::cap_line(line, MAX_LINE_CHARS))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn cap_line(line: &str) -> Cow<'_, str> {
-    match line.char_indices().nth(MAX_LINE_CHARS) {
-        None => Cow::Borrowed(line),
-        Some((at, _)) => {
-            let rest = line[at..].chars().count();
-            Cow::Owned(format!("{}… [+{rest} chars]", &line[..at]))
-        }
-    }
 }
 
 /// The first [`SEARCH_PREVIEW_LINES`] lines, fewer when they exceed [`SEARCH_PREVIEW_CHARS`]
@@ -933,7 +1043,7 @@ async fn get_code(
     } = page(path, start_arg, end_arg, line_count)?;
     let code = lines[start - 1..end]
         .iter()
-        .map(|line| cap_line(line))
+        .map(|line| search::cap_line(line, MAX_LINE_CHARS))
         .collect::<Vec<_>>()
         .join("\n");
     let mut text = format!(

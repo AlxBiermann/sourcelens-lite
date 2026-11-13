@@ -1282,6 +1282,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "mime_guess",
+ "regex",
  "reqwest",
  "ring",
  "rusqlite",
