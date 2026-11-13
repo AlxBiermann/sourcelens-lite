@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Rust tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Installs the channel pinned in rust-toolchain.toml.
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --locked
+
+  ui:
+    name: UI typecheck and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck and build
+        run: npm run build
