@@ -430,3 +430,7 @@ Use `127.0.0.1` (not `localhost`) in `SOURCELENS_PUBLIC_URL` so the session cook
 - Members share access: every member can search all connected repositories. Only the owner manages members and embedding settings.
 - Embeddings only through the OpenAI-compatible `/embeddings` API.
 - Early version (0.1.0). Expect changes.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
