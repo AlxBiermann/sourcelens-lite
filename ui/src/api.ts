@@ -193,7 +193,17 @@ export type SearchHit = {
   matchedBy: MatchChannel[];
 };
 
-export type SearchResult = { mode: 'lexical' | 'hybrid'; terms: string[]; results: SearchHit[] };
+export type SemanticUnavailable = 'timeout' | 'provider_error' | 'internal';
+
+export type SearchResult = {
+  mode: 'lexical' | 'hybrid';
+  terms: string[];
+  results: SearchHit[];
+  /** More hits follow the returned ones. */
+  hasMore: boolean;
+  /** Why search by meaning was skipped although embeddings are on. */
+  semanticUnavailable?: SemanticUnavailable;
+};
 
 export type SearchLanguages = { languages: string[] };
 
@@ -210,6 +220,21 @@ export class ApiError extends Error {
 
 const SIGN_IN_AGAIN: Record<string, true> = { unauthenticated: true, github_reauth_required: true };
 
+const REQUEST_TIMEOUT_MS = 90_000;
+
+/** Session storage key of the page a request was made from when the session had expired; `App` returns there after sign-in. */
+export const RETURN_TO_KEY = 'sl_return_to';
+
+function rememberReturnPath() {
+  try {
+    sessionStorage.setItem(RETURN_TO_KEY, JSON.stringify({ path: window.location.pathname + window.location.search, at: Date.now() }));
+  } catch {
+    // Storage can be unavailable (privacy settings, quota); the user then lands on the default page.
+  }
+}
+
+const TIMED_OUT = 'The request timed out. Try again.';
+
 export async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   let response: Response;
   try {
@@ -218,14 +243,24 @@ export async function request<T>(method: string, path: string, body?: unknown): 
       credentials: 'include',
       headers: body === undefined ? { accept: 'application/json' } : { accept: 'application/json', 'content-type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
-  } catch {
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'TimeoutError') throw new ApiError(0, 'network', TIMED_OUT);
     throw new ApiError(0, 'network', 'SourceLens is not reachable. Check your connection and try again.');
   }
 
   if (response.status === 204) return undefined as T;
 
-  const text = await response.text();
+  // The timeout also covers reading the body.
+  let text: string;
+  try {
+    text = await response.text();
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'TimeoutError') throw new ApiError(0, 'network', TIMED_OUT);
+    throw e;
+  }
+
   let payload: unknown = null;
   if (text) {
     try {
@@ -240,6 +275,7 @@ export async function request<T>(method: string, path: string, body?: unknown): 
     const code = error?.code ?? 'http_error';
     const message = error?.message ?? `The server answered ${response.status}.`;
     if (response.status === 401 && SIGN_IN_AGAIN[code] && window.location.pathname !== '/login') {
+      rememberReturnPath();
       window.location.assign('/login');
     }
     throw new ApiError(response.status, code, message);

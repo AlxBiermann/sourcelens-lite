@@ -1,6 +1,8 @@
+import { useEffect, useState } from 'react';
 import { Navigate, Route, Routes, useLocation, useSearchParams } from 'react-router';
+import { RETURN_TO_KEY } from './api';
 import { EntryPage } from './components/EntryPage';
-import { Notice, Shell } from './components/Shell';
+import { Loading, Notice, Shell } from './components/Shell';
 import { useSession } from './hooks/useSession';
 import { ApiKeys } from './pages/ApiKeys';
 import { Login } from './pages/Login';
@@ -16,14 +18,47 @@ import { SettingsSso } from './pages/SettingsSso';
 import { SettingsSync } from './pages/SettingsSync';
 import { Setup } from './pages/Setup';
 
+const RETURN_TO_MAX_AGE_MS = 10 * 60 * 1000;
+
+/** The page an expired session interrupted (stored by `api.request`), when it is recent and a page of this app. */
+function storedReturnPath(): string | null {
+  try {
+    const stored = JSON.parse(sessionStorage.getItem(RETURN_TO_KEY) ?? 'null') as { path?: unknown; at?: unknown } | null;
+    const path = stored?.path;
+    const at = stored?.at;
+    if (typeof path !== 'string' || typeof at !== 'number' || Date.now() - at >= RETURN_TO_MAX_AGE_MS) return null;
+    if (!path.startsWith('/') || path.startsWith('//') || path.startsWith('/login') || path.startsWith('/setup') || path === '/repositories') return null;
+    return path;
+  } catch {
+    return null;
+  }
+}
+
 function RequireUser({ setupDone, signedIn }: { setupDone: boolean; signedIn: boolean }) {
   const location = useLocation();
+  // Every sign-in lands on /repositories. Storage is only read here (twice under StrictMode, same result)
+  // and cleared in the effect; the location key makes the redirect happen once, on the landing entry.
+  const landing = setupDone && signedIn && location.pathname === '/repositories';
+  const [returnTo] = useState(() => {
+    const path = landing ? storedReturnPath() : null;
+    return path === null ? null : { path, key: location.key };
+  });
+  useEffect(() => {
+    if (!landing) return;
+    try {
+      sessionStorage.removeItem(RETURN_TO_KEY);
+    } catch {
+      // Unavailable storage holds no return path either.
+    }
+  }, [landing]);
+
   if (!setupDone) {
     // GitHub sends the installer back to /repositories?installed=1 while setup still lacks an owner.
     const installed = new URLSearchParams(location.search).get('installed') === '1';
     return <Navigate to={installed ? '/setup?step=signin' : '/setup'} replace />;
   }
   if (!signedIn) return <Navigate to="/login" replace />;
+  if (returnTo !== null && location.key === returnTo.key) return <Navigate to={returnTo.path} replace />;
   return <Shell />;
 }
 
@@ -41,7 +76,13 @@ export function App() {
   const { state, error, reload } = useSession();
 
   if (!state) {
-    if (!error) return null;
+    if (!error) {
+      return (
+        <EntryPage>
+          <Loading />
+        </EntryPage>
+      );
+    }
     return (
       <EntryPage>
         <Notice tone="error">{error.message}</Notice>

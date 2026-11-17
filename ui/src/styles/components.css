@@ -212,6 +212,11 @@
   padding: var(--space-7);
 }
 
+/* Focused by `Shell` after navigation so screen readers start on the new page; no ring around the whole page. */
+.sl-main:focus {
+  outline: none;
+}
+
 .sl-page {
   max-width: 1200px;
   display: flex;
@@ -1170,6 +1175,10 @@
   font-size: 14px;
   font-weight: 600;
   overflow-wrap: anywhere;
+}
+
+.sl-hit-repo .sl-link {
+  color: inherit;
 }
 
 .sl-hit-location {

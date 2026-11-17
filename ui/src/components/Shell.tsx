@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { NavLink, Outlet, useLocation } from 'react-router';
 import { api, canManageApiKeys, handle } from '../api';
+import { useDocumentTitle } from '../hooks/useDocumentTitle';
 import { useSession, useUser } from '../hooks/useSession';
 import { ThemeToggle } from './ThemeToggle';
 
@@ -17,6 +18,16 @@ export function Shell() {
   const user = useUser();
   const devMode = useSession().state?.devMode ?? false;
   const [signingOut, setSigningOut] = useState(false);
+  const { pathname } = useLocation();
+  const main = useRef<HTMLElement>(null);
+  const shownPath = useRef(pathname);
+
+  // After navigating, start screen readers and keyboard focus on the new page instead of the clicked link.
+  useEffect(() => {
+    if (shownPath.current === pathname) return;
+    shownPath.current = pathname;
+    main.current?.focus();
+  }, [pathname]);
 
   async function signOut() {
     setSigningOut(true);
@@ -54,7 +65,7 @@ export function Shell() {
           </div>
         </div>
       </header>
-      <main className="sl-main" id="main">
+      <main className="sl-main" id="main" ref={main} tabIndex={-1}>
         <Outlet />
       </main>
     </div>
@@ -62,6 +73,7 @@ export function Shell() {
 }
 
 export function PageHeader({ title, action, mono }: { title: string; action?: ReactNode; mono?: boolean }) {
+  useDocumentTitle(title);
   return (
     <div className="sl-page-header">
       <h1 className={mono ? 'sl-title sl-title-long' : 'sl-title'} title={mono ? title : undefined}>
