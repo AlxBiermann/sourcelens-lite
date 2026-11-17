@@ -1,10 +1,10 @@
 import type { CSSProperties, ReactNode } from 'react';
 import { Link } from 'react-router';
 import type { Repository } from '../api';
-import { ago, plural, shortSha } from '../format';
+import { ago, count, plural, shortSha } from '../format';
 import { StatusBlock, clampedProgress, jobProgressText, repoStatus, type RepoStatus } from './StatusBlock';
 
-function detail(repo: Repository, status: RepoStatus): ReactNode {
+function detail(repo: Repository, status: RepoStatus, embeddingsOn: boolean): ReactNode {
   switch (status) {
     case 'indexing':
       return repo.activeJob ? jobProgressText(repo.activeJob) : null;
@@ -19,6 +19,11 @@ function detail(repo: Repository, status: RepoStatus): ReactNode {
         <>
           {plural(repo.fileCount, 'file')}
           {repo.indexedAt ? <span className="sl-row-time">{ago(repo.indexedAt)}</span> : null}
+          {embeddingsOn && repo.chunkCount > 0 && repo.embeddedCount < repo.chunkCount ? (
+            <span className="sl-row-time">
+              {count(repo.embeddedCount)} of {count(repo.chunkCount)} chunks embedded
+            </span>
+          ) : null}
         </>
       );
   }
@@ -45,12 +50,12 @@ export function RepoRow({ repo, embeddingsOn, onSync, syncing }: { repo: Reposit
             {repo.effectiveBranch}
           </span>
           <span className="sl-row-commit">{shortSha(repo.indexedCommit)}</span>
-          <span className="sl-row-detail">{detail(repo, status)}</span>
+          <span className="sl-row-detail">{detail(repo, status, embeddingsOn)}</span>
         </span>
         <span className="sl-row-action">
           {repo.activeJob ? null : (
             <button type="button" className="sl-button sl-button-secondary sl-button-small sl-row-button" disabled={syncing} onClick={() => onSync(repo)}>
-              Sync now
+              {status === 'disconnected' ? 'Check access' : 'Sync now'}
             </button>
           )}
         </span>

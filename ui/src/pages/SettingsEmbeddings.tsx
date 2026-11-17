@@ -1,5 +1,6 @@
 import { useEffect, useState, type CSSProperties, type FormEvent } from 'react';
 import { api, type EmbeddingSettings, type EmbeddingSettingsInput, type EmbeddingTestResult } from '../api';
+import { ConfirmDialog } from '../components/Dialog';
 import { Choice, Field } from '../components/Field';
 import { LoadState } from '../components/LoadState';
 import { Notice, PageHeader, SettingsTabs } from '../components/Shell';
@@ -50,6 +51,18 @@ function toInput(form: Form): EmbeddingSettingsInput {
   };
 }
 
+/** Saving `input` discards the stored vectors: embeddings stay on and a value that shapes them changes. */
+function needsReembed(input: EmbeddingSettingsInput, saved: EmbeddingSettings): boolean {
+  return (
+    saved.embeddedChunks > 0 &&
+    input.enabled &&
+    (input.baseUrl.replace(/\/+$/, '') !== saved.baseUrl ||
+      input.model !== saved.model ||
+      input.requestDimensions !== saved.requestDimensions ||
+      input.documentPrefix !== saved.documentPrefix)
+  );
+}
+
 export function SettingsEmbeddings() {
   const user = useUser();
   const owner = user.role === 'owner';
@@ -58,6 +71,7 @@ export function SettingsEmbeddings() {
   const [form, setForm] = useState<Form | null>(null);
   const [test, setTest] = useState<EmbeddingTestResult | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [confirmReembed, setConfirmReembed] = useState(false);
 
   useEffect(() => {
     if (settings.data && form === null) setForm(toForm(settings.data));
@@ -83,6 +97,14 @@ export function SettingsEmbeddings() {
     event.preventDefault();
     if (!form) return;
     const input = toInput(form);
+    if (settings.data && needsReembed(input, settings.data)) {
+      setConfirmReembed(true);
+      return;
+    }
+    submit(input);
+  }
+
+  function submit(input: EmbeddingSettingsInput) {
     setSaveError(null);
     setTest(null);
     void action.run(
@@ -187,6 +209,20 @@ export function SettingsEmbeddings() {
             </div>
           ) : null}
         </form>
+      ) : null}
+      {data ? (
+        <ConfirmDialog
+          open={confirmReembed}
+          title="Re-embed all chunks?"
+          body={`Changing the provider, model, dimensions or document prefix discards ${count(data.embeddedChunks)} stored vectors and embeds every chunk again.`}
+          confirmLabel="Save and re-embed"
+          busy={busy}
+          onConfirm={() => {
+            setConfirmReembed(false);
+            if (form) submit(toInput(form));
+          }}
+          onClose={() => setConfirmReembed(false)}
+        />
       ) : null}
     </div>
   );

@@ -3,9 +3,13 @@ import { api, type Installation, type Repository } from '../api';
 import { Dialog } from '../components/Dialog';
 import { Field } from '../components/Field';
 import { LoadState } from '../components/LoadState';
+import { count } from '../format';
 import { useAction } from '../hooks/useAction';
 import { useApi } from '../hooks/useApi';
 import { useSession } from '../hooks/useSession';
+
+/** Rows rendered per installation; the filter narrows the rest. */
+const MAX_ROWS = 200;
 
 export function AddRepositories({ open, onClose, onConnected }: { open: boolean; onClose: () => void; onConnected: (repo: Repository) => void }) {
   const { state } = useSession();
@@ -29,10 +33,10 @@ export function AddRepositories({ open, onClose, onConnected }: { open: boolean;
     if (hasList) filterInput.current?.focus();
   }, [hasList]);
 
-  function connect(installationId: number, fullName: string) {
+  function connect(fullName: string) {
     void action.run(
       async () => {
-        const repo = await api.post<Repository>('/api/repositories', { fullName, installationId });
+        const repo = await api.post<Repository>('/api/repositories', { fullName });
         setConnected((current) => ({ ...current, [fullName]: true }));
         onConnected(repo);
       },
@@ -84,7 +88,7 @@ export function AddRepositories({ open, onClose, onConnected }: { open: boolean;
               </div>
               {installation.truncated ? <p className="sl-hint">Showing the first 1,000 repositories. Filter on GitHub to narrow access.</p> : null}
               <ul className="sl-picklist">
-                {repositories.map((repo) => {
+                {repositories.slice(0, MAX_ROWS).map((repo) => {
                   const isConnected = repo.connected || connected[repo.fullName] === true;
                   return (
                     <li key={repo.githubId} className="sl-pick">
@@ -97,7 +101,7 @@ export function AddRepositories({ open, onClose, onConnected }: { open: boolean;
                         type="button"
                         className={isConnected ? 'sl-button sl-button-quiet sl-button-small sl-pick-button' : 'sl-button sl-button-secondary sl-button-small sl-pick-button'}
                         disabled={isConnected || action.busy !== null}
-                        onClick={() => connect(installation.installationId, repo.fullName)}
+                        onClick={() => connect(repo.fullName)}
                       >
                         {isConnected ? 'Connected' : 'Connect'}
                       </button>
@@ -105,6 +109,11 @@ export function AddRepositories({ open, onClose, onConnected }: { open: boolean;
                   );
                 })}
               </ul>
+              {repositories.length > MAX_ROWS ? (
+                <p className="sl-muted">
+                  Showing {count(MAX_ROWS)} of {count(repositories.length)}. Type in the filter to narrow.
+                </p>
+              ) : null}
             </section>
           ))}
         </div>

@@ -44,6 +44,7 @@ export function RepositoryDetail() {
   const embeddingsOn = useEmbeddingsOn();
   const action = useAction();
   const [confirming, setConfirming] = useState(false);
+  const [confirmingRebuild, setConfirmingRebuild] = useState(false);
   // The branch picked in the select; null = unchanged. Applied only by the "Change branch" button.
   const [branchChoice, setBranchChoice] = useState<string | null>(null);
 
@@ -115,7 +116,7 @@ export function RepositoryDetail() {
         mono
         action={
           <button type="button" className="sl-button sl-button-primary" disabled={busy || job !== null} onClick={() => sync(false)}>
-            Sync now
+            {connected ? 'Sync now' : 'Check access'}
           </button>
         }
       />
@@ -148,7 +149,9 @@ export function RepositoryDetail() {
           </div>
           <div className="sl-fact">
             <dt className="sl-fact-label">Embedded chunks</dt>
-            <dd className="sl-fact-value">{count(repo.embeddedCount)}</dd>
+            <dd className="sl-fact-value">
+              {count(repo.embeddedCount)} of {count(repo.chunkCount)}
+            </dd>
           </div>
           {repo.indexedAt ? (
             <div className="sl-fact">
@@ -193,7 +196,7 @@ export function RepositoryDetail() {
             </button>
           </form>
           <div className="sl-actions">
-            <button type="button" className="sl-button sl-button-secondary" disabled={busy || job !== null} onClick={() => sync(true)}>
+            <button type="button" className="sl-button sl-button-secondary" disabled={busy || job !== null || !connected} onClick={() => setConfirmingRebuild(true)}>
               Rebuild index
             </button>
             <button type="button" className="sl-button sl-button-quiet-danger" disabled={busy} onClick={() => setConfirming(true)}>
@@ -251,6 +254,18 @@ export function RepositoryDetail() {
         )}
       </section>
 
+      <ConfirmDialog
+        open={confirmingRebuild}
+        title="Rebuild the index?"
+        body={`Downloads every file of ${repo.fullName} again and rebuilds its index.`}
+        confirmLabel="Rebuild index"
+        busy={busy}
+        onConfirm={() => {
+          setConfirmingRebuild(false);
+          sync(true);
+        }}
+        onClose={() => setConfirmingRebuild(false)}
+      />
       <ConfirmDialog
         open={confirming}
         title={`Disconnect ${repo.fullName}?`}

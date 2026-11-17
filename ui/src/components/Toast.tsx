@@ -84,7 +84,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           {items.map((item) => (
             <div key={item.id} className={item.tone === 'error' ? 'sl-toast sl-toast-error' : 'sl-toast'}>
               <span className="sl-toast-text">{item.message}</span>
-              <button type="button" className="sl-toast-close" onClick={() => dismiss(item.id)}>
+              <button type="button" className="sl-toast-close" aria-label={`Dismiss: ${item.message}`} onClick={() => dismiss(item.id)}>
                 Dismiss
               </button>
             </div>
