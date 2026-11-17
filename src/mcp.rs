@@ -20,13 +20,13 @@ use crate::http::oauth_server::ACCESS_PREFIX;
 use crate::repositories::{self, RepoRow, CONNECTED_IDS};
 use crate::search::grep::{self, GrepRequest, GrepResponse};
 use crate::search::symbols::{self, SymbolRow};
-use crate::search::{self, Filter, SearchHit, SearchRequest};
+use crate::search::{self, files, Filter, SearchHit, SearchRequest};
 use crate::state::{lock, now, AppState, SECS_PER_DAY};
 
 const SUPPORTED_VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "2025-03-26"];
 const LATEST_VERSION: &str = SUPPORTED_VERSIONS[0];
 
-const INSTRUCTIONS: &str = "SourceLens searches indexed GitHub repositories. Start with list_repositories, then search_code. Results give repository, path and line range; read more with get_code. Use find_symbol for a definition by name, grep_code to list every occurrence of an exact text or pattern (for example all usages of a function), and get_file_outline before reading a large file.";
+const INSTRUCTIONS: &str = "SourceLens searches indexed GitHub repositories. Start with list_repositories, then search_code. Results give repository, path and line range; read more with get_code. Use find_symbol for a definition by name, grep_code to list every occurrence of an exact text or pattern (for example all usages of a function), and get_file_outline before reading a large file. Use list_files to browse the directories of a repository.";
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
@@ -47,6 +47,8 @@ const GET_CODE_DEFAULT_LINES: usize = 400;
 const GET_CODE_MAX_LINES: usize = 800;
 const FIND_SYMBOL_DEFAULT: usize = 20;
 const FIND_SYMBOL_MAX: usize = 50;
+const LIST_FILES_DEFAULT: usize = 200;
+const LIST_FILES_MAX: usize = 500;
 /// `last_used_at` of an API key or OAuth grant is written at most this often.
 const TOUCH_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -394,7 +396,7 @@ struct ToolSpec {
     required: &'static [&'static str],
 }
 
-fn tool_specs() -> [ToolSpec; 6] {
+fn tool_specs() -> [ToolSpec; 7] {
     let repositories = json!({
         "type": "array",
         "items": { "type": "string" },
@@ -413,14 +415,25 @@ fn tool_specs() -> [ToolSpec; 6] {
             required: &[],
         },
         ToolSpec {
+            name: "list_files",
+            description: "List the directories and files directly under a path of an indexed repository, with file counts, languages and line counts. Use it to learn a repository's layout before reading files.",
+            properties: json!({
+                "repository": repository,
+                "pathPrefix": { "type": "string", "description": "Directory to list, e.g. src/api. Default: the top level." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": LIST_FILES_MAX, "default": LIST_FILES_DEFAULT, "description": "Most directories and files to return, directories first." },
+            }),
+            required: &["repository"],
+        },
+        ToolSpec {
             name: "search_code",
-            description: "Search code by meaning, keywords or identifiers across indexed repositories. Returns the best matching code blocks with repository, path and line range.",
+            description: "Search code by keywords, identifiers or meaning across indexed repositories. Returns ranked code blocks (functions, classes, sections) with repository, path and line range. Use short keywords or identifiers rather than full sentences. For every occurrence of an exact text use grep_code; for a definition by name use find_symbol.",
             properties: json!({
                 "query": { "type": "string", "description": "What to look for: words, identifiers or a description." },
                 "repositories": repositories,
                 "languages": languages,
                 "pathPrefix": path_prefix,
                 "limit": { "type": "integer", "minimum": 1, "maximum": search::MAX_LIMIT, "default": search::DEFAULT_LIMIT },
+                "offset": { "type": "integer", "minimum": 0, "maximum": search::MAX_OFFSET, "default": 0, "description": "Results to skip, to read the next page." },
             }),
             required: &["query"],
         },
@@ -539,6 +552,7 @@ async fn call_tool(
     let args = Args::new(arguments, &spec.properties)?;
     let output = match spec.name {
         "list_repositories" => list_repositories(state, scope).await,
+        "list_files" => list_files(state, scope, args).await,
         "search_code" => search_code(state, scope, args).await,
         "grep_code" => grep_code(state, scope, args).await,
         "get_code" => get_code(state, scope, args).await,
@@ -730,6 +744,116 @@ async fn list_repositories(state: &AppState, scope: &KeyScope) -> Result<ToolOut
     ToolOutput::new(text, json!({ "repositories": listed }))
 }
 
+/// `1 directory`, `2 directories`.
+fn directories(n: usize) -> String {
+    if n == 1 {
+        "1 directory".to_string()
+    } else {
+        format!("{n} directories")
+    }
+}
+
+async fn list_files(
+    state: &AppState,
+    scope: &KeyScope,
+    args: Args<'_>,
+) -> Result<ToolOutput, ToolError> {
+    let repository = args.string("repository")?;
+    let path_prefix = args.opt_string("pathPrefix")?;
+    let limit = args.limit("limit", LIST_FILES_DEFAULT, LIST_FILES_MAX)?;
+
+    let repos = scope_repositories(state, scope).await?;
+    let repo = resolve(&repos, repository)?;
+    let mut prefix = Filter::new(Vec::new(), std::iter::empty::<&str>(), path_prefix)?
+        .path_prefix
+        .unwrap_or_default();
+    if !prefix.is_empty() && !prefix.ends_with('/') {
+        prefix.push('/');
+    }
+    let repo_id = repo.id;
+    let lookup = prefix.clone();
+    let listing = state
+        .db
+        .read(move |conn| files::list_dir(conn, repo_id, &lookup))
+        .await?;
+
+    let total = listing.directories.len() + listing.files.len();
+    if total == 0 && !prefix.is_empty() {
+        return Err(ToolError::Failed(format!(
+            "No indexed files under \"{prefix}\" in {}. Call list_files without pathPrefix for the top level.",
+            repo.full_name
+        )));
+    }
+    let shown_directories = &listing.directories[..listing.directories.len().min(limit)];
+    let file_slots = limit - shown_directories.len();
+    let shown_files = &listing.files[..listing.files.len().min(file_slots)];
+    let hidden = total - shown_directories.len() - shown_files.len();
+
+    let mut text = format!(
+        "{} {}: {}, {}",
+        repo.full_name,
+        if prefix.is_empty() {
+            "/"
+        } else {
+            prefix.as_str()
+        },
+        directories(listing.directories.len()),
+        counted(listing.files.len() as u64, "file")
+    );
+    for (path, count) in shown_directories {
+        let name = &path[prefix.len()..];
+        text.push_str(&format!("\n{name}  ({})", counted(*count, "file")));
+    }
+    for file in shown_files {
+        text.push_str(&format!(
+            "\n{}  {}  {}",
+            &file.path[prefix.len()..],
+            file.language.as_deref().unwrap_or("-"),
+            counted(file.line_count, "line")
+        ));
+    }
+    if hidden > 0 {
+        text.push_str(&format!(
+            "\n… {hidden} more entries. Narrow with pathPrefix."
+        ));
+    }
+    let listed_directories: Vec<Value> = shown_directories
+        .iter()
+        .map(|(path, count)| json!({ "path": path, "files": count }))
+        .collect();
+    ToolOutput::new(
+        text,
+        json!({
+            "repository": repo.full_name,
+            "pathPrefix": prefix,
+            "directories": listed_directories,
+            "files": shown_files,
+            "truncated": hidden > 0,
+        }),
+    )
+}
+
+/// A `search_code` result in `structuredContent`; `truncated` when `content` holds only the
+/// preview that the text shows.
+#[derive(Serialize)]
+struct SearchResult {
+    #[serde(flatten)]
+    hit: SearchHit,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    truncated: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchOutput {
+    mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantic_unavailable: Option<&'static str>,
+    offset: usize,
+    has_more: bool,
+    results: Vec<SearchResult>,
+}
+
 async fn search_code(
     state: &AppState,
     scope: &KeyScope,
@@ -740,6 +864,11 @@ async fn search_code(
     let languages = args.strings("languages")?;
     let path_prefix = args.opt_string("pathPrefix")?;
     let limit = args.limit("limit", search::DEFAULT_LIMIT, search::MAX_LIMIT)?;
+    let offset = match args.integer("offset")? {
+        Some(n) => usize::try_from(n.max(0)).unwrap_or(usize::MAX),
+        None => 0,
+    }
+    .min(search::MAX_OFFSET);
 
     let repos = scope_repositories(state, scope).await?;
     let repo_ids = narrow(&repos, &repository_names)?;
@@ -749,7 +878,7 @@ async fn search_code(
             query: query.to_string(),
             filter: Filter::new(repo_ids, languages, path_prefix)?,
             limit: Some(limit),
-            offset: 0,
+            offset,
         },
     )
     .await?;
@@ -763,23 +892,35 @@ async fn search_code(
         .collect();
 
     let count = hits.len();
-    let noun = if count == 1 { "result" } else { "results" };
-    let mut text = format!(
-        "{count} {noun} for \"{}\" ({})",
-        query.trim(),
-        response.mode
-    );
+    let mode = match response.semantic_unavailable {
+        Some(reason) => format!("{}; semantic unavailable: {reason}", response.mode),
+        None => response.mode.to_string(),
+    };
+    let query = query.trim();
+    let mut text = if offset == 0 {
+        let noun = if count == 1 { "result" } else { "results" };
+        format!("{count} {noun} for \"{query}\" ({mode})")
+    } else if count == 0 {
+        format!("0 results for \"{query}\" beyond the first {offset} ({mode})")
+    } else {
+        format!(
+            "Results {}–{} for \"{query}\" ({mode})",
+            offset + 1,
+            offset + count
+        )
+    };
     let mut used = text.chars().count();
     let mut truncating = false;
-    for (n, hit) in hits.iter().enumerate() {
+    let mut results = Vec::with_capacity(count);
+    for (n, mut hit) in hits.into_iter().enumerate() {
         let heading = format!(
             "\n\n{}. {} {}:{}-{}  {}\n",
-            n + 1,
+            offset + n + 1,
             hit.repository,
             hit.path,
             hit.start_line,
             hit.end_line,
-            hit_label(hit)
+            hit_label(&hit)
         );
         let full = fenced(hit.language.as_deref(), &hit.content);
         let block_len = heading.chars().count() + full.chars().count();
@@ -787,14 +928,40 @@ async fn search_code(
             truncating = true;
         }
         text.push_str(&heading);
-        if truncating {
-            text.push_str(&preview(hit.language.as_deref(), &hit.content));
+        let preview = truncating
+            .then(|| preview_lines(&hit.content))
+            .filter(|&(_, more_lines)| more_lines > 0);
+        let truncated = preview.is_some();
+        if let Some((shown, more_lines)) = preview {
+            text.push_str(&fenced(hit.language.as_deref(), shown));
+            text.push_str(&format!("\n… {more_lines} more lines, read with get_code"));
+            hit.content = shown.to_string();
         } else {
             text.push_str(&full);
         }
         used += block_len;
+        results.push(SearchResult { hit, truncated });
     }
-    ToolOutput::new(text, json!({ "mode": response.mode, "results": hits }))
+    if response.has_more {
+        let next = offset + count;
+        if next <= search::MAX_OFFSET {
+            text.push_str(&format!(
+                "\n\nMore results: call search_code again with offset={next}."
+            ));
+        } else {
+            text.push_str(
+                "\n\nMore results exist. Narrow the search with repositories, languages or pathPrefix.",
+            );
+        }
+    }
+    let output = SearchOutput {
+        mode: response.mode,
+        semantic_unavailable: response.semantic_unavailable,
+        offset,
+        has_more: response.has_more,
+        results,
+    };
+    ToolOutput::new(text, output)
 }
 
 #[derive(Serialize)]
@@ -910,28 +1077,24 @@ fn cap_lines(content: &str) -> String {
         .join("\n")
 }
 
-/// The first [`SEARCH_PREVIEW_LINES`] lines, fewer when they exceed [`SEARCH_PREVIEW_CHARS`]
-/// (always at least one line).
-fn preview(language: Option<&str>, content: &str) -> String {
-    let lines: Vec<&str> = content.split('\n').collect();
+/// The first [`SEARCH_PREVIEW_LINES`] lines of `content`, fewer when they exceed
+/// [`SEARCH_PREVIEW_CHARS`] (always at least one line), and the number of lines left out.
+fn preview_lines(content: &str) -> (&str, usize) {
     let mut shown = 0;
     let mut chars = 0;
-    for line in &lines {
+    let mut end = 0;
+    for line in content.split('\n') {
         let len = line.chars().count() + 1;
         if shown == SEARCH_PREVIEW_LINES || (shown > 0 && chars + len > SEARCH_PREVIEW_CHARS) {
             break;
         }
         shown += 1;
         chars += len;
+        end += line.len() + 1;
     }
-    if shown == lines.len() {
-        return fenced(language, content);
-    }
-    format!(
-        "{}\n… {} more lines, read with get_code",
-        fenced(language, &lines[..shown].join("\n")),
-        lines.len() - shown
-    )
+    let total = content.split('\n').count();
+    // `end` includes the newline after the last shown line.
+    (&content[..end - 1], total - shown)
 }
 
 struct FileRow {
@@ -1304,5 +1467,19 @@ mod tests {
         assert_eq!(split_lines("a\nb\n"), vec!["a", "b"]);
         assert_eq!(split_lines("a\n\nb"), vec!["a", "", "b"]);
         assert!(split_lines("").is_empty());
+    }
+
+    #[test]
+    fn preview_keeps_the_first_lines_within_the_char_budget() {
+        assert_eq!(preview_lines("a\nb"), ("a\nb", 0));
+        assert_eq!(
+            preview_lines("1\n2\n3\n4\n5\n6\n7\n8"),
+            ("1\n2\n3\n4\n5\n6", 2)
+        );
+        let long = "x".repeat(SEARCH_PREVIEW_CHARS);
+        assert_eq!(
+            preview_lines(&format!("{long}\n{long}\nz")),
+            (long.as_str(), 2)
+        );
     }
 }

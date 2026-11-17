@@ -1,3 +1,4 @@
+pub mod files;
 pub mod fuse;
 pub mod grep;
 pub mod lexical;

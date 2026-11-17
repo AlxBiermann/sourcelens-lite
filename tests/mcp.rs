@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use sourcelens::http::keys::{self, NewKey};
 use sourcelens::mcp::authenticate;
 use sourcelens::state::{now, AppState};
+use std::collections::HashMap;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -228,7 +229,7 @@ async fn notification_ping_and_unknown_method() {
 }
 
 #[tokio::test]
-async fn tools_list_has_the_six_read_only_tools() {
+async fn tools_list_has_the_seven_read_only_tools() {
     let env = env();
     let key = create_key(&env.state, None).await;
     let response = rpc(&env.app, &key, "tools/list", json!({})).await;
@@ -242,6 +243,7 @@ async fn tools_list_has_the_six_read_only_tools() {
             "get_code",
             "get_file_outline",
             "grep_code",
+            "list_files",
             "list_repositories",
             "search_code"
         ]
@@ -1120,4 +1122,419 @@ async fn grep_code_reports_no_match_truncation_and_bad_input() {
         .as_str()
         .unwrap()
         .contains("\"pattern\""));
+}
+
+// ── search_code paging and budget ────────────────────────────────────────────
+
+/// One repository with 30 small `widget` handlers, and a key for all repositories.
+async fn widget_env() -> (Env, String) {
+    let env = env();
+    let r1 = insert_repo(&env.state, 1, "acme/api", "connected").await;
+    let files = (0..30)
+        .map(|i| {
+            let source = format!("def widget_handler_{i}():\n    return \"widget {i}\"\n");
+            (format!("handlers/widget_{i}.py"), source.into_bytes())
+        })
+        .collect();
+    index(&env.state, r1, files).await;
+    let key = create_key(&env.state, None).await;
+    (env, key)
+}
+
+fn result_paths(result: &Value) -> Vec<&str> {
+    result["structuredContent"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["path"].as_str().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn search_code_pages_with_offset() {
+    let (env, key) = widget_env().await;
+
+    let first = call(
+        &env.app,
+        &key,
+        "search_code",
+        json!({ "query": "widget", "limit": 4 }),
+    )
+    .await;
+    assert!(!is_error(&first), "{}", text(&first));
+    let body = text(&first);
+    assert!(body.starts_with("4 results for \"widget\""), "{body}");
+    assert!(
+        body.ends_with("\n\nMore results: call search_code again with offset=4."),
+        "{body}"
+    );
+    assert_eq!(first["structuredContent"]["hasMore"], true);
+    assert_eq!(first["structuredContent"]["offset"], 0);
+    assert!(first["structuredContent"]
+        .get("semanticUnavailable")
+        .is_none());
+
+    let page = call(
+        &env.app,
+        &key,
+        "search_code",
+        json!({ "query": "widget", "limit": 2, "offset": 2 }),
+    )
+    .await;
+    assert!(!is_error(&page), "{}", text(&page));
+    let body = text(&page);
+    assert!(
+        body.starts_with("Results 3–4 for \"widget\" (lexical)"),
+        "{body}"
+    );
+    assert!(body.contains("\n\n3. acme/api handlers/"), "{body}");
+    assert!(body.contains("\n\n4. acme/api handlers/"), "{body}");
+    assert!(!body.contains("\n\n1. acme/api"), "{body}");
+    assert!(body.ends_with("again with offset=4."), "{body}");
+    assert_eq!(result_paths(&page), result_paths(&first)[2..4]);
+    assert_eq!(page["structuredContent"]["offset"], 2);
+    assert_eq!(page["structuredContent"]["hasMore"], true);
+
+    let beyond = call(
+        &env.app,
+        &key,
+        "search_code",
+        json!({ "query": "widget", "limit": 20, "offset": 40 }),
+    )
+    .await;
+    assert!(!is_error(&beyond), "{}", text(&beyond));
+    let body = text(&beyond);
+    assert!(
+        body.starts_with("0 results for \"widget\" beyond the first 40"),
+        "{body}"
+    );
+    assert!(!body.contains("More results"), "{body}");
+    assert_eq!(beyond["structuredContent"]["hasMore"], false);
+
+    let all = call(
+        &env.app,
+        &key,
+        "search_code",
+        json!({ "query": "widget", "limit": 20, "offset": 20 }),
+    )
+    .await;
+    assert!(!text(&all).contains("More results"), "{}", text(&all));
+    assert_eq!(all["structuredContent"]["hasMore"], false);
+}
+
+#[tokio::test]
+async fn search_code_previews_over_budget_hits_in_structured_content() {
+    let env = env();
+    let r1 = insert_repo(&env.state, 1, "acme/api", "connected").await;
+    let sources: HashMap<String, String> = (0..20)
+        .map(|i| {
+            let mut source = format!("def budget_report_{i}(rows):\n");
+            // About 1,700 characters in 44 short lines: one chunk, previews of six lines.
+            for j in 0..42 {
+                source.push_str(&format!("    t_{j} = rows.count('budget kind {j}')\n"));
+            }
+            source.push_str("    return t_0\n");
+            (format!("pkg/budget_{i:02}.py"), source)
+        })
+        .collect();
+    let files = sources
+        .iter()
+        .map(|(path, source)| (path.clone(), source.clone().into_bytes()))
+        .collect();
+    index(&env.state, r1, files).await;
+    let key = create_key(&env.state, None).await;
+
+    let result = call(
+        &env.app,
+        &key,
+        "search_code",
+        json!({ "query": "budget", "limit": 20 }),
+    )
+    .await;
+    assert!(!is_error(&result), "{}", text(&result));
+    assert!(text(&result).contains("more lines, read with get_code"));
+    let structured = &result["structuredContent"];
+    let results = structured["results"].as_array().unwrap();
+    assert_eq!(results.len(), 20);
+    assert!(results[0].get("truncated").is_none(), "{}", results[0]);
+
+    let mut full_chars = 0;
+    let mut previewed = 0;
+    for hit in results {
+        let content = hit["content"].as_str().unwrap();
+        match hit.get("truncated") {
+            None => full_chars += content.len(),
+            Some(flag) => {
+                assert_eq!(flag, true, "{hit}");
+                previewed += 1;
+                let lines: Vec<&str> = sources[hit["path"].as_str().unwrap()].lines().collect();
+                let start = hit["startLine"].as_u64().unwrap() as usize;
+                let end = hit["endLine"].as_u64().unwrap() as usize;
+                let full = lines[start - 1..end].join("\n");
+                assert!(full.starts_with(content), "{content}");
+                assert!(content.lines().count() <= 6, "{content}");
+                assert!(content.len() < full.len());
+                full_chars += full.len();
+            }
+        }
+    }
+    assert!(previewed > 0);
+    let serialized = serde_json::to_string(structured).unwrap();
+    assert!(
+        serialized.len() < full_chars,
+        "structuredContent has {} bytes, the full hits {full_chars}",
+        serialized.len()
+    );
+}
+
+// ── list_files ───────────────────────────────────────────────────────────────
+
+/// `acme/api` with a small tree, `acme/orders` with one file, `acme/empty` without files.
+async fn tree_env() -> (Env, i64, i64) {
+    let env = env();
+    let r1 = insert_repo(&env.state, 1, "acme/api", "connected").await;
+    let r2 = insert_repo(&env.state, 2, "acme/orders", "connected").await;
+    insert_repo(&env.state, 3, "acme/empty", "connected").await;
+    let files: Vec<(String, Vec<u8>)> = [
+        ("README.md", "# Api\n\nService.\n".as_bytes().to_vec()),
+        ("notes.txt", b"one\ntwo\n".to_vec()),
+        ("docs/guide.md", b"# Guide\n".to_vec()),
+        ("src/users.ts", fixture("users.ts")),
+        ("src/api/routes.ts", b"export const routes = [];\n".to_vec()),
+        (
+            "src/api/handlers.py",
+            b"def handle():\n    return 1\n".to_vec(),
+        ),
+        ("lib/100%_done/a.py", b"x = 1\n".to_vec()),
+        ("lib/100x_done/b.py", b"y = 2\n".to_vec()),
+    ]
+    .into_iter()
+    .map(|(path, content)| (path.to_string(), content))
+    .collect();
+    index(&env.state, r1, files).await;
+    index(
+        &env.state,
+        r2,
+        vec![("orders.py".into(), fixture("orders.py"))],
+    )
+    .await;
+    (env, r1, r2)
+}
+
+#[tokio::test]
+async fn list_files_lists_the_top_level_and_nested_directories() {
+    let (env, _, _) = tree_env().await;
+    let key = create_key(&env.state, None).await;
+
+    let top = call(
+        &env.app,
+        &key,
+        "list_files",
+        json!({ "repository": "acme/api" }),
+    )
+    .await;
+    assert!(!is_error(&top), "{}", text(&top));
+    assert_eq!(
+        text(&top),
+        "acme/api /: 3 directories, 2 files\n\
+         docs/  (1 file)\n\
+         lib/  (2 files)\n\
+         src/  (3 files)\n\
+         README.md  markdown  3 lines\n\
+         notes.txt  -  2 lines"
+    );
+    assert_eq!(
+        top["structuredContent"],
+        json!({
+            "repository": "acme/api",
+            "pathPrefix": "",
+            "directories": [
+                { "path": "docs/", "files": 1 },
+                { "path": "lib/", "files": 2 },
+                { "path": "src/", "files": 3 },
+            ],
+            "files": [
+                { "path": "README.md", "language": "markdown", "lineCount": 3 },
+                { "path": "notes.txt", "language": null, "lineCount": 2 },
+            ],
+            "truncated": false,
+        })
+    );
+
+    let users_lines = String::from_utf8(fixture("users.ts"))
+        .unwrap()
+        .lines()
+        .count();
+    let src = call(
+        &env.app,
+        &key,
+        "list_files",
+        json!({ "repository": "acme/api", "pathPrefix": "src" }),
+    )
+    .await;
+    assert_eq!(
+        text(&src),
+        format!(
+            "acme/api src/: 1 directory, 1 file\napi/  (2 files)\nusers.ts  typescript  {users_lines} lines"
+        )
+    );
+    assert_eq!(src["structuredContent"]["pathPrefix"], "src/");
+    assert_eq!(
+        src["structuredContent"]["directories"][0]["path"],
+        "src/api/"
+    );
+
+    let api = call(
+        &env.app,
+        &key,
+        "list_files",
+        json!({ "repository": "acme/api", "pathPrefix": "/src/api/" }),
+    )
+    .await;
+    assert_eq!(
+        text(&api),
+        "acme/api src/api/: 0 directories, 2 files\n\
+         handlers.py  python  2 lines\n\
+         routes.ts  typescript  1 line"
+    );
+    assert_eq!(
+        api["structuredContent"]["files"],
+        json!([
+            { "path": "src/api/handlers.py", "language": "python", "lineCount": 2 },
+            { "path": "src/api/routes.ts", "language": "typescript", "lineCount": 1 },
+        ])
+    );
+
+    let empty = call(
+        &env.app,
+        &key,
+        "list_files",
+        json!({ "repository": "acme/empty" }),
+    )
+    .await;
+    assert!(!is_error(&empty), "{}", text(&empty));
+    assert_eq!(text(&empty), "acme/empty /: 0 directories, 0 files");
+}
+
+#[tokio::test]
+async fn list_files_matches_the_prefix_literally_and_truncates() {
+    let (env, _, _) = tree_env().await;
+    let key = create_key(&env.state, None).await;
+
+    let percent = call(
+        &env.app,
+        &key,
+        "list_files",
+        json!({ "repository": "acme/api", "pathPrefix": "lib/100%_done" }),
+    )
+    .await;
+    assert!(!is_error(&percent), "{}", text(&percent));
+    assert_eq!(
+        text(&percent),
+        "acme/api lib/100%_done/: 0 directories, 1 file\na.py  python  1 line"
+    );
+
+    let underscore = call(
+        &env.app,
+        &key,
+        "list_files",
+        json!({ "repository": "acme/api", "pathPrefix": "lib/100_" }),
+    )
+    .await;
+    assert!(is_error(&underscore));
+    assert_eq!(
+        text(&underscore),
+        "No indexed files under \"lib/100_/\" in acme/api. Call list_files without pathPrefix for the top level."
+    );
+
+    let unknown = call(
+        &env.app,
+        &key,
+        "list_files",
+        json!({ "repository": "acme/api", "pathPrefix": "nope" }),
+    )
+    .await;
+    assert!(is_error(&unknown));
+    assert_eq!(
+        text(&unknown),
+        "No indexed files under \"nope/\" in acme/api. Call list_files without pathPrefix for the top level."
+    );
+
+    let cut = call(
+        &env.app,
+        &key,
+        "list_files",
+        json!({ "repository": "acme/api", "limit": 2 }),
+    )
+    .await;
+    assert!(!is_error(&cut), "{}", text(&cut));
+    assert_eq!(
+        text(&cut),
+        "acme/api /: 3 directories, 2 files\n\
+         docs/  (1 file)\n\
+         lib/  (2 files)\n\
+         … 3 more entries. Narrow with pathPrefix."
+    );
+    assert_eq!(cut["structuredContent"]["truncated"], true);
+    assert_eq!(
+        cut["structuredContent"]["directories"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(cut["structuredContent"]["files"], json!([]));
+
+    let mixed = call(
+        &env.app,
+        &key,
+        "list_files",
+        json!({ "repository": "acme/api", "limit": 4 }),
+    )
+    .await;
+    assert!(text(&mixed).ends_with(
+        "src/  (3 files)\nREADME.md  markdown  3 lines\n… 1 more entries. Narrow with pathPrefix."
+    ));
+    assert_eq!(mixed["structuredContent"]["truncated"], true);
+}
+
+#[tokio::test]
+async fn list_files_stays_inside_the_key_scope() {
+    let (env, _, r2) = tree_env().await;
+    let key_b = create_key(&env.state, Some(vec![r2])).await;
+
+    let listed = call(
+        &env.app,
+        &key_b,
+        "list_files",
+        json!({ "repository": "acme/api" }),
+    )
+    .await;
+    assert!(is_error(&listed));
+    assert!(listed.get("structuredContent").is_none());
+    let read = call(
+        &env.app,
+        &key_b,
+        "get_code",
+        json!({ "repository": "acme/api", "path": "README.md" }),
+    )
+    .await;
+    assert_eq!(text(&listed), text(&read));
+    assert!(
+        text(&listed).starts_with("Unknown repository \"acme/api\""),
+        "{}",
+        text(&listed)
+    );
+
+    let own = call(
+        &env.app,
+        &key_b,
+        "list_files",
+        json!({ "repository": "acme/orders" }),
+    )
+    .await;
+    assert_eq!(
+        text(&own),
+        "acme/orders /: 0 directories, 1 file\norders.py  python  10 lines"
+    );
 }
