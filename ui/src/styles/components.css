@@ -524,9 +524,16 @@
   max-width: 14ch;
 }
 
+/* The native arrow sits at the browser's own inset; this one keeps the same 12px distance as the text on the left. */
 .sl-select {
   width: auto;
   max-width: 100%;
+  padding-right: calc(var(--space-3) + 12px + var(--space-2));
+  appearance: none;
+  background-image: var(--select-arrow);
+  background-repeat: no-repeat;
+  background-position: right var(--space-3) center;
+  background-size: 12px 12px;
   cursor: pointer;
 }
 

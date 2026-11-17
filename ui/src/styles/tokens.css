@@ -33,6 +33,8 @@
   --focus: #000000;
   --focus-on-ink: #ffffff;
   --scrim: rgb(255 255 255 / 0.6);
+  /* Chevron of select boxes; a data URL cannot read --fg, so each theme carries its own. */
+  --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%23000000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5'/%3E%3C/svg%3E");
 
   --font-ui: 'Archivo Variable', 'Archivo', system-ui, sans-serif;
   --font-code: 'Commit Mono', ui-monospace, 'SF Mono', Menlo, monospace;
@@ -71,4 +73,5 @@
   --focus: #ffd60a;
   --focus-on-ink: #ffd60a;
   --scrim: rgb(0 0 0 / 0.6);
+  --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%23ffffff' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5'/%3E%3C/svg%3E");
 }
