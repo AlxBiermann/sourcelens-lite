@@ -16,6 +16,7 @@ const TRIGGER: Record<JobTrigger, string> = {
   manual: 'Manual',
   startup: 'Restart',
   settings: 'Embedding settings',
+  schedule: 'Schedule',
 };
 
 const JOB_STATUS: Record<Job['status'], string> = {
@@ -121,7 +122,7 @@ export function RepositoryDetail() {
       <LoadState state={detail} />
       {repo.state === 'disconnected' ? (
         <Notice tone="error">
-          {sentence(repo.stateReason ?? 'GitHub no longer shares this repository')} Search and API keys skip it until access returns.
+          {sentence(repo.stateReason ?? 'GitHub no longer shares this repository')} Search and agents skip it until access returns.
         </Notice>
       ) : null}
       {status === 'failed' && repo.lastJob?.error ? <Notice tone="error">{repo.lastJob.error}</Notice> : null}
@@ -253,7 +254,7 @@ export function RepositoryDetail() {
       <ConfirmDialog
         open={confirming}
         title={`Disconnect ${repo.fullName}?`}
-        body="Its index is deleted. API keys keep working for other repositories."
+        body="Its index is deleted. Agents keep working for other repositories."
         confirmLabel="Disconnect repository"
         busy={busy}
         onConfirm={() => void disconnect()}

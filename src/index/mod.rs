@@ -6,5 +6,6 @@ pub mod jobs;
 pub mod languages;
 pub mod markdown;
 pub mod pipeline;
+pub mod schedule;
 pub mod select;
 pub mod store;

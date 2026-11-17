@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::crypto::{random_hex, sha256_hex};
 use crate::error::{ApiError, ApiResult};
 use crate::github::oauth::{self, GhToken, TokenError};
-use crate::model::Role;
+use crate::model::{Provider, Role};
 use crate::state::{lock, now, AppState, SECS_PER_DAY};
 
 /// Session cookie name with an http public URL.
@@ -29,17 +29,25 @@ pub const SESSION_MAX_AGE: i64 = 30 * SECS_PER_DAY;
 const REFRESH_MARGIN: i64 = 60;
 /// Bytes of randomness in a session cookie value.
 const SESSION_ID_BYTES: usize = 32;
+/// SQL expression for the [`Provider`] of a `users` row. `sso_sub` is unqualified, so it works with
+/// and without a table alias as long as no other table in the query has that column.
+pub const PROVIDER_SQL: &str = "CASE WHEN sso_sub IS NULL THEN 'github' ELSE 'sso' END";
 
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     pub id: i64,
     pub login: String,
     pub role: Role,
+    pub provider: Provider,
     pub session_hash: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct Owner(pub AuthUser);
+
+/// May manage API keys: admins and members who sign in with GitHub.
+#[derive(Debug, Clone)]
+pub struct KeyUser(pub AuthUser);
 
 impl FromRequestParts<AppState> for AuthUser {
     type Rejection = ApiError;
@@ -63,12 +71,27 @@ impl FromRequestParts<AppState> for Owner {
     ) -> Result<Self, Self::Rejection> {
         let user = AuthUser::from_request_parts(parts, state).await?;
         if user.role != Role::Owner {
-            return Err(ApiError::forbidden(
-                "owner_required",
-                "Only the owner can do this.",
-            ));
+            return Err(ApiError::forbidden("owner_required", "Only admins can do this."));
         }
         Ok(Owner(user))
+    }
+}
+
+impl FromRequestParts<AppState> for KeyUser {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let user = AuthUser::from_request_parts(parts, state).await?;
+        if user.provider == Provider::Sso && user.role == Role::Member {
+            return Err(ApiError::forbidden(
+                "api_keys_unavailable",
+                "API keys are not available to SSO members. Connect your agent with OAuth.",
+            ));
+        }
+        Ok(KeyUser(user))
     }
 }
 
@@ -101,15 +124,18 @@ pub async fn current_user(headers: &HeaderMap, state: &AppState) -> ApiResult<Op
         .db
         .read(move |conn| {
             conn.query_row(
-                "SELECT u.id, u.login, u.role
-                 FROM sessions s JOIN users u ON u.id = s.user_id
-                 WHERE s.id_hash = ?1 AND s.expires_at > ?2",
+                &format!(
+                    "SELECT u.id, u.login, u.role, {PROVIDER_SQL}
+                     FROM sessions s JOIN users u ON u.id = s.user_id
+                     WHERE s.id_hash = ?1 AND s.expires_at > ?2"
+                ),
                 params![hash, ts],
                 |row| {
                     Ok(AuthUser {
                         id: row.get(0)?,
                         login: row.get(1)?,
                         role: row.get(2)?,
+                        provider: row.get(3)?,
                         session_hash: hash.clone(),
                     })
                 },
@@ -120,11 +146,15 @@ pub async fn current_user(headers: &HeaderMap, state: &AppState) -> ApiResult<Op
     Ok(user)
 }
 
-/// Inserts the session row and returns the cookie value.
-pub async fn create_session(state: &AppState, user_id: i64, token: &GhToken) -> ApiResult<String> {
+/// Inserts the session row and returns the cookie value. SSO sessions have no GitHub token.
+pub async fn create_session(
+    state: &AppState,
+    user_id: i64,
+    token: Option<&GhToken>,
+) -> ApiResult<String> {
     let value = random_hex(SESSION_ID_BYTES);
     let hash = sha256_hex(value.as_bytes());
-    let sealed = seal_token(state, token)?;
+    let sealed = token.map(|t| seal_token(state, t)).transpose()?;
     let ts = now();
     state
         .db
@@ -225,21 +255,22 @@ fn is_fresh(token: &GhToken) -> bool {
     token.expires_at.saturating_sub(REFRESH_MARGIN) >= now()
 }
 
-/// The session's GitHub token; `None` when the row is gone or cannot be decrypted.
+/// The session's GitHub token; `None` when the row is gone, has no token or cannot be decrypted.
 async fn load_token(state: &AppState, session_hash: &str) -> ApiResult<Option<GhToken>> {
     let hash = session_hash.to_string();
-    let sealed: Option<Vec<u8>> = state
+    let sealed: Option<Option<Vec<u8>>> = state
         .db
         .read(move |conn| {
             conn.query_row(
                 "SELECT gh_token FROM sessions WHERE id_hash = ?1",
                 [hash],
-                |row| row.get(0),
+                |row| row.get::<_, Option<Vec<u8>>>(0),
             )
             .optional()
         })
         .await?;
     Ok(sealed
+        .flatten()
         .and_then(|sealed| state.key.open(&sealed))
         .and_then(|plain| serde_json::from_slice::<GhToken>(&plain).ok()))
 }

@@ -1,5 +1,5 @@
 use std::env;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::STANDARD;
@@ -9,6 +9,8 @@ use reqwest::Url;
 use crate::github::app::AppCredentials;
 
 const DEFAULT_BIND: &str = "0.0.0.0:3000";
+/// Default listen address in dev mode: this computer only.
+const DEV_DEFAULT_BIND: &str = "127.0.0.1:3000";
 const DEFAULT_DATA_DIR: &str = "./data";
 const DEFAULT_INDEX_CONCURRENCY: usize = 2;
 const DEFAULT_MAX_FILE_BYTES: u64 = 1_048_576;
@@ -39,6 +41,9 @@ pub struct Config {
     pub github: Option<AppCredentials>,
     /// GitHub REST API base URL without trailing slash; tests point it at a local fake.
     pub github_api_url: String,
+    /// `SOURCELENS_DEV_MODE`: sign-in without GitHub and demo data (see `dev`). Only allowed when
+    /// both the public URL and the listen address are on this computer.
+    pub dev_mode: bool,
 }
 
 impl Config {
@@ -48,9 +53,16 @@ impl Config {
         let public_url = var("SOURCELENS_PUBLIC_URL").ok_or("SOURCELENS_PUBLIC_URL is required")?;
         let public_url = normalize_public_url(&public_url)?;
         let mut cfg = Self::new(&public_url, Path::new(DEFAULT_DATA_DIR));
+        cfg.dev_mode = var("SOURCELENS_DEV_MODE")
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
 
-        if let Some(bind) = var("SOURCELENS_BIND") {
-            cfg.bind = bind;
+        cfg.bind = match var("SOURCELENS_BIND") {
+            Some(bind) => bind,
+            None if cfg.dev_mode => DEV_DEFAULT_BIND.to_string(),
+            None => DEFAULT_BIND.to_string(),
+        };
+        if cfg.dev_mode {
+            check_dev_mode(&cfg.public_url, &cfg.bind)?;
         }
         if let Some(dir) = var("SOURCELENS_DATA_DIR") {
             cfg.data_dir = PathBuf::from(dir);
@@ -90,6 +102,7 @@ impl Config {
             dev_origin: None,
             github: None,
             github_api_url: DEFAULT_GITHUB_API_URL.to_string(),
+            dev_mode: false,
         }
     }
 
@@ -102,22 +115,7 @@ impl Config {
     }
 
     pub fn public_host_is_local(&self) -> bool {
-        let Ok(url) = Url::parse(&self.public_url) else {
-            return false;
-        };
-        match url.host_str() {
-            Some(host) => {
-                let host = host.trim_start_matches('[').trim_end_matches(']');
-                host.eq_ignore_ascii_case("localhost")
-                    || host
-                        .parse::<Ipv4Addr>()
-                        .is_ok_and(|ip| ip == Ipv4Addr::LOCALHOST)
-                    || host
-                        .parse::<Ipv6Addr>()
-                        .is_ok_and(|ip| ip == Ipv6Addr::LOCALHOST)
-            }
-            None => false,
-        }
+        url_host_is_local(&self.public_url)
     }
 
     pub fn public_is_https(&self) -> bool {
@@ -132,6 +130,63 @@ impl Config {
     /// OAuth redirect target after GitHub sign-in.
     pub fn callback_url(&self) -> String {
         format!("{}/auth/github/callback", self.public_url)
+    }
+
+    /// OpenID Connect redirect target after SSO sign-in.
+    pub fn sso_callback_url(&self) -> String {
+        format!("{}/auth/sso/callback", self.public_url)
+    }
+
+    /// The MCP endpoint, also the OAuth resource identifier of its access tokens.
+    pub fn mcp_url(&self) -> String {
+        format!("{}/mcp", self.public_url)
+    }
+}
+
+/// Dev mode lets anyone who reaches the server sign in as admin, so it needs a public URL and a
+/// listen address that only this computer can use.
+pub fn check_dev_mode(public_url: &str, bind: &str) -> Result<(), String> {
+    if !url_host_is_local(public_url) {
+        return Err(format!(
+            "SOURCELENS_DEV_MODE needs SOURCELENS_PUBLIC_URL on this computer (localhost, 127.0.0.1 \
+             or [::1]), not {public_url}: in dev mode anyone who can open the URL signs in as admin."
+        ));
+    }
+    if !bind_is_loopback(bind) {
+        return Err(format!(
+            "SOURCELENS_DEV_MODE needs a loopback SOURCELENS_BIND such as 127.0.0.1:3000, not \
+             {bind}: in dev mode anyone who can reach the port signs in as admin."
+        ));
+    }
+    Ok(())
+}
+
+fn url_host_is_local(url: &str) -> bool {
+    let Ok(url) = Url::parse(url) else {
+        return false;
+    };
+    match url.host_str() {
+        Some(host) => {
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<Ipv4Addr>()
+                    .is_ok_and(|ip| ip == Ipv4Addr::LOCALHOST)
+                || host
+                    .parse::<Ipv6Addr>()
+                    .is_ok_and(|ip| ip == Ipv6Addr::LOCALHOST)
+        }
+        None => false,
+    }
+}
+
+/// `ip:port` with a loopback IP, or `localhost:port`.
+fn bind_is_loopback(bind: &str) -> bool {
+    match bind.parse::<SocketAddr>() {
+        Ok(addr) => addr.ip().is_loopback(),
+        Err(_) => bind
+            .rsplit_once(':')
+            .is_some_and(|(host, _)| host.eq_ignore_ascii_case("localhost")),
     }
 }
 
@@ -158,6 +213,11 @@ fn normalize_public_url(raw: &str) -> Result<String, String> {
         return Err("SOURCELENS_PUBLIC_URL must be an http or https URL".into());
     }
     Ok(trimmed.to_string())
+}
+
+/// Whether a URL host (as returned by `Url::host_str`) is this computer; plain http is accepted only there.
+pub fn is_loopback_host(host: Option<&str>) -> bool {
+    matches!(host, Some("localhost" | "127.0.0.1" | "[::1]"))
 }
 
 fn decode_secret_key(value: &str) -> Result<[u8; 32], String> {
@@ -206,4 +266,19 @@ fn github_from_env() -> Result<Option<AppCredentials>, String> {
         html_url,
         source: "env",
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_dev_mode;
+
+    #[test]
+    fn dev_mode_is_only_allowed_on_this_computer() {
+        assert!(check_dev_mode("https://code.example.com", "127.0.0.1:3000").is_err());
+        assert!(check_dev_mode("http://localhost:3000", "0.0.0.0:3000").is_err());
+        assert!(check_dev_mode("http://localhost:3000", "[::]:3000").is_err());
+        assert!(check_dev_mode("http://localhost:3000", "127.0.0.1:3000").is_ok());
+        assert!(check_dev_mode("http://127.0.0.1:3947", "[::1]:3947").is_ok());
+        assert!(check_dev_mode("http://[::1]:3000", "localhost:3000").is_ok());
+    }
 }

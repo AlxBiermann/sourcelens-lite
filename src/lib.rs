@@ -1,6 +1,7 @@
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod dev;
 pub mod error;
 pub mod github;
 pub mod http;
@@ -10,4 +11,5 @@ pub mod model;
 pub mod rate;
 pub mod repositories;
 pub mod search;
+pub mod sso;
 pub mod state;

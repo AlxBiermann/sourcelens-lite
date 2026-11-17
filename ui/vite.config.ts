@@ -17,6 +17,9 @@ export default defineConfig({
       '/auth': backend,
       '/mcp': backend,
       '/webhooks': backend,
+      '/.well-known': backend,
+      '/oauth/register': backend,
+      '/oauth/token': backend,
     },
   },
 });

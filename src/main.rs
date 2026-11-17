@@ -1,8 +1,9 @@
 use std::process::ExitCode;
 
 use sourcelens::config::Config;
+use sourcelens::dev;
 use sourcelens::http::{self, setup};
-use sourcelens::index::jobs;
+use sourcelens::index::{jobs, schedule};
 use sourcelens::state::AppState;
 use tracing_subscriber::EnvFilter;
 
@@ -27,6 +28,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cfg = Config::from_env()?;
     let state = AppState::new(cfg)?;
 
+    if state.cfg.dev_mode {
+        dev::prepare(&state).await?;
+        tracing::warn!(
+            "Dev mode is on: anyone who can reach {} can sign in as admin. Open {}/login",
+            state.cfg.bind,
+            state.cfg.public_url
+        );
+    }
+
     if !setup::owner_exists(&state).await? {
         tracing::info!(
             "Setup token: {} — open {}/setup",
@@ -39,6 +49,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::error!("startup reconcile failed: {err}");
     }
     jobs::spawn_workers(state.clone());
+    schedule::spawn(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&state.cfg.bind).await?;
     tracing::info!("listening on {} ({})", state.cfg.bind, state.cfg.public_url);

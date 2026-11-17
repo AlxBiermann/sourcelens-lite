@@ -169,11 +169,22 @@ pub fn apply_files(
     files: &[PreparedFile],
 ) -> rusqlite::Result<ApplyStats> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let has_vec = vec_table_exists(&tx)?;
+    let stats = write_files(&tx, repo_id, files)?;
+    tx.commit()?;
+    Ok(stats)
+}
+
+/// [`apply_files`] inside a transaction the caller holds.
+pub fn write_files(
+    tx: &Connection,
+    repo_id: i64,
+    files: &[PreparedFile],
+) -> rusqlite::Result<ApplyStats> {
+    let has_vec = vec_table_exists(tx)?;
     let mut stats = ApplyStats::default();
     for file in files {
-        let preserved = match file_id(&tx, repo_id, &file.path)? {
-            Some(file_id) => delete_file_rows(&tx, file_id, has_vec)?,
+        let preserved = match file_id(tx, repo_id, &file.path)? {
+            Some(file_id) => delete_file_rows(tx, file_id, has_vec)?,
             None => HashMap::new(),
         };
         let size = i64::try_from(file.size).unwrap_or(i64::MAX);
@@ -224,14 +235,13 @@ pub fn apply_files(
                     |row| row.get(0),
                 )?;
                 insert_chunks(
-                    &tx, repo_id, file_id, &file.path, content, chunks, &preserved,
+                    tx, repo_id, file_id, &file.path, content, chunks, &preserved,
                 )?;
-                insert_symbols(&tx, repo_id, file_id, symbols)?;
+                insert_symbols(tx, repo_id, file_id, symbols)?;
                 stats.indexed += 1;
             }
         }
     }
-    tx.commit()?;
     Ok(stats)
 }
 

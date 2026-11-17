@@ -4,12 +4,16 @@ import { Notice, Shell } from './components/Shell';
 import { useSession } from './hooks/useSession';
 import { ApiKeys } from './pages/ApiKeys';
 import { Login } from './pages/Login';
+import { OAuthAuthorize } from './pages/OAuthAuthorize';
 import { Playground } from './pages/Playground';
 import { Repositories } from './pages/Repositories';
 import { RepositoryDetail } from './pages/RepositoryDetail';
 import { SettingsEmbeddings } from './pages/SettingsEmbeddings';
 import { SettingsGithub } from './pages/SettingsGithub';
+import { SettingsMcpClients } from './pages/SettingsMcpClients';
 import { SettingsMembers } from './pages/SettingsMembers';
+import { SettingsSso } from './pages/SettingsSso';
+import { SettingsSync } from './pages/SettingsSync';
 import { Setup } from './pages/Setup';
 
 function RequireUser({ setupDone, signedIn }: { setupDone: boolean; signedIn: boolean }) {
@@ -25,7 +29,10 @@ function RequireUser({ setupDone, signedIn }: { setupDone: boolean; signedIn: bo
 
 function LoginRoute({ setupDone, signedIn }: { setupDone: boolean; signedIn: boolean }) {
   const [params] = useSearchParams();
-  if (signedIn) return <Navigate to="/repositories" replace />;
+  if (signedIn) {
+    const next = params.get('next');
+    return <Navigate to={next?.startsWith('/oauth/authorize?') ? next : '/repositories'} replace />;
+  }
   if (!setupDone && !params.get('error')) return <Navigate to="/setup" replace />;
   return <Login />;
 }
@@ -47,13 +54,15 @@ export function App() {
     );
   }
 
-  const setupDone = state.setup.appConfigured && state.setup.ownerExists;
+  // Dev mode has neither a GitHub App nor a setup: its dev accounts sign in without one.
+  const setupDone = state.devMode || (state.setup.appConfigured && state.setup.ownerExists);
   const signedIn = state.user !== null;
 
   return (
     <Routes>
       <Route path="/setup" element={setupDone ? <Navigate to={signedIn ? '/repositories' : '/login'} replace /> : <Setup />} />
       <Route path="/login" element={<LoginRoute setupDone={setupDone} signedIn={signedIn} />} />
+      <Route path="/oauth/authorize" element={<OAuthAuthorize />} />
       <Route element={<RequireUser setupDone={setupDone} signedIn={signedIn} />}>
         <Route path="/repositories" element={<Repositories />} />
         <Route path="/repositories/:id" element={<RepositoryDetail />} />
@@ -62,7 +71,10 @@ export function App() {
         <Route path="/settings" element={<Navigate to="/settings/embeddings" replace />} />
         <Route path="/settings/embeddings" element={<SettingsEmbeddings />} />
         <Route path="/settings/github" element={<SettingsGithub />} />
+        <Route path="/settings/sync" element={<SettingsSync />} />
+        <Route path="/settings/mcp-clients" element={<SettingsMcpClients />} />
         <Route path="/settings/members" element={<SettingsMembers />} />
+        <Route path="/settings/sso" element={<SettingsSso />} />
         <Route path="*" element={<Navigate to="/repositories" replace />} />
       </Route>
     </Routes>

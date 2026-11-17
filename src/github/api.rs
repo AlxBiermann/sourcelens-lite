@@ -15,9 +15,9 @@ const TARBALL_TIMEOUT: Duration = Duration::from_secs(600);
 #[cfg(unix)]
 const TARBALL_FILE_MODE: u32 = 0o600;
 const BYTES_PER_GIB: f64 = (1u64 << 30) as f64;
-const PER_PAGE: usize = 100;
+pub(crate) const PER_PAGE: usize = 100;
 const MAX_REPO_PAGES: u32 = 10;
-const MAX_INSTALLATION_PAGES: u32 = 10;
+pub(crate) const MAX_INSTALLATION_PAGES: u32 = 10;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawTreeEntry {
@@ -40,6 +40,8 @@ pub struct Installation {
     pub id: u64,
     pub account: GhAccount,
     pub html_url: String,
+    /// Set while the account owner has suspended the installation; its token requests fail.
+    pub suspended_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -217,6 +219,24 @@ pub async fn user_installation_repos(
     user_token: &str,
     installation_id: u64,
 ) -> ApiResult<(Vec<GhRepo>, bool)> {
+    let prefix = format!(
+        "{}/user/installations/{installation_id}/repositories",
+        gh.api_base()
+    );
+    repo_pages(gh, user_token, &prefix).await
+}
+
+/// Repositories an installation token can read, at most 1,000; `true` when more exist.
+pub async fn installation_repos(
+    gh: &GitHub,
+    installation_token: &str,
+) -> ApiResult<(Vec<GhRepo>, bool)> {
+    let prefix = format!("{}/installation/repositories", gh.api_base());
+    repo_pages(gh, installation_token, &prefix).await
+}
+
+/// Pages of `{url_prefix}?per_page=100&page=N` answering `{ total_count, repositories }`.
+async fn repo_pages(gh: &GitHub, token: &str, url_prefix: &str) -> ApiResult<(Vec<GhRepo>, bool)> {
     #[derive(Deserialize)]
     struct Page {
         total_count: u64,
@@ -225,11 +245,8 @@ pub async fn user_installation_repos(
     let mut all = Vec::new();
     let mut total = 0;
     for page in 1..=MAX_REPO_PAGES {
-        let url = format!(
-            "{}/user/installations/{installation_id}/repositories?per_page={PER_PAGE}&page={page}",
-            gh.api_base()
-        );
-        let batch: Page = get_json(gh, user_token, &url).await?;
+        let url = format!("{url_prefix}?per_page={PER_PAGE}&page={page}");
+        let batch: Page = get_json(gh, token, &url).await?;
         total = batch.total_count;
         let count = batch.repositories.len();
         all.extend(batch.repositories);
@@ -241,10 +258,10 @@ pub async fn user_installation_repos(
     Ok((all, truncated))
 }
 
-/// Repository as seen with the user's token; 404 → 404 `repository_not_accessible`.
-pub async fn user_repo(gh: &GitHub, user_token: &str, full_name: &str) -> ApiResult<GhRepo> {
+/// Repository as seen with `token`; 404 → 404 `repository_not_accessible`.
+pub async fn repo(gh: &GitHub, token: &str, full_name: &str) -> ApiResult<GhRepo> {
     let url = format!("{}/repos/{full_name}", gh.api_base());
-    get_json(gh, user_token, &url).await.map_err(|err| {
+    get_json(gh, token, &url).await.map_err(|err| {
         map_not_found(err, || {
             ApiError::not_found(
                 "repository_not_accessible",

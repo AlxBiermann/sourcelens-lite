@@ -100,7 +100,7 @@ export function Setup() {
   const signInHref = `/auth/github/login?setup_token=${encodeURIComponent(token.trim())}`;
 
   return (
-    <EntryPage lead="Three steps connect this instance to GitHub and make you its owner.">
+    <EntryPage lead="Three steps connect this instance to GitHub and make you its admin.">
       {error && ERRORS[error] ? <Notice tone="error">{ERRORS[error]}</Notice> : null}
       {formError ? <Notice tone="error">{formError}</Notice> : null}
       <ol className="sl-steps">
@@ -134,7 +134,7 @@ export function Setup() {
           ) : null}
         </Step>
         <Step number={3} title="Sign in" state={stepState(3)}>
-          <p className="sl-prose">The first person to sign in with the setup token becomes the owner of this instance.</p>
+          <p className="sl-prose">The first person to sign in with the setup token becomes the first admin of this instance.</p>
           {appConfigured ? (
             <div className="sl-form">
               {tokenField}

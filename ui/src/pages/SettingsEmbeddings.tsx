@@ -116,7 +116,7 @@ export function SettingsEmbeddings() {
       <p className="sl-prose sl-muted">
         Embeddings add search by meaning next to keyword and identifier search. SourceLens calls any server that speaks the OpenAI embeddings API, such as OpenAI, Ollama or LM Studio.
       </p>
-      {!owner ? <Notice>Only the owner can change embedding settings.</Notice> : null}
+      {!owner ? <Notice>Only admins can change embedding settings.</Notice> : null}
       <LoadState state={settings} />
 
       {data ? (

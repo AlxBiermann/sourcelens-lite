@@ -6,7 +6,10 @@ use axum::http::{header, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use common::{api, credentials, error_code, new_state, owner_session, serve, sign_webhook};
+use common::{
+    api, credentials, error_code, insert_repo_async, new_state, owner_session, serve, sign_webhook,
+    sso_session,
+};
 use serde_json::{json, Value};
 use sourcelens::http;
 use sourcelens::state::AppState;
@@ -54,14 +57,57 @@ async fn repo_installation(Path((owner, repo)): Path<(String, String)>) -> Respo
     }
 }
 
+/// Installation 98 cannot mint tokens; every other installation can.
+async fn access_token(Path(id): Path<u64>) -> Response {
+    if id == 98 {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "Resource not accessible by integration" })),
+        )
+            .into_response()
+    } else {
+        (StatusCode::CREATED, Json(json!({ "token": "ghs_fake" }))).into_response()
+    }
+}
+
 async fn start_fake() -> String {
     let app = Router::new()
-        .route(
-            "/app/installations/{id}/access_tokens",
-            post(|| async { (StatusCode::CREATED, Json(json!({ "token": "ghs_fake" }))) }),
-        )
+        .route("/app/installations/{id}/access_tokens", post(access_token))
         .route("/repos/{o}/{r}", get(user_repo))
         .route("/repos/{o}/{r}/installation", get(repo_installation))
+        .route(
+            "/app/installations",
+            get(|| async {
+                Json(json!([
+                    {
+                        "id": 98,
+                        "account": { "login": "broken", "avatar_url": null },
+                        "html_url": "https://github.com/organizations/broken/settings/installations/98",
+                        "suspended_at": null
+                    },
+                    {
+                        "id": 99,
+                        "account": { "login": "acme", "avatar_url": "https://avatars.example/acme" },
+                        "html_url": "https://github.com/organizations/acme/settings/installations/99",
+                        "suspended_at": null
+                    },
+                    {
+                        "id": 97,
+                        "account": { "login": "paused", "avatar_url": null },
+                        "html_url": "https://github.com/organizations/paused/settings/installations/97",
+                        "suspended_at": "2026-11-01T00:00:00Z"
+                    }
+                ]))
+            }),
+        )
+        .route(
+            "/installation/repositories",
+            get(|| async {
+                Json(json!({ "total_count": 1, "repositories": [
+                    { "id": 5001, "full_name": "acme/api", "private": true, "default_branch": "main" }
+                ] }))
+            }),
+        )
         .route(
             "/repos/{o}/{r}/branches",
             get(|| async { Json(json!([{ "name": "main" }, { "name": "develop" }])) }),
@@ -197,6 +243,45 @@ async fn connect_without_access_is_not_found() {
 }
 
 #[tokio::test]
+async fn sso_member_lists_and_connects_through_the_app_installations() {
+    let env = setup().await;
+    let cookie = sso_session(&env.state, "dana", "member").await;
+    let app = http::router(env.state.clone());
+
+    // Installation 98 fails to mint a token and 97 is suspended: both are left out.
+    let (status, body, _) = api(&app, "GET", "/api/github/repositories", &cookie, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().map(Vec::len), Some(1), "{body}");
+    assert_eq!(body[0]["installationId"], 99);
+    assert_eq!(body[0]["account"]["login"], "acme");
+    assert_eq!(body[0]["repositories"][0]["fullName"], "acme/api");
+    assert_eq!(body[0]["repositories"][0]["connected"], false);
+
+    let (status, body, _) = api(
+        &app,
+        "POST",
+        "/api/repositories",
+        &cookie,
+        Some(json!({ "fullName": "acme/secret", "installationId": 99 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(error_code(&body), "repository_not_accessible");
+
+    let (status, body, _) = api(
+        &app,
+        "POST",
+        "/api/repositories",
+        &cookie,
+        Some(json!({ "fullName": "acme/api", "installationId": 42 })),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    let id = body["id"].as_i64().unwrap();
+    assert_eq!(env.repo_state(id).await, ("connected".into(), None, 99));
+}
+
+#[tokio::test]
 async fn branch_change_is_verified_and_queues_a_job() {
     let env = setup().await;
     let (_, body) = env.connect().await;
@@ -281,6 +366,25 @@ async fn sync_with_force_queues_a_forced_job() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(env.jobs(id).await.len(), 1);
+}
+
+#[tokio::test]
+async fn sync_all_queues_a_manual_job_per_connected_repository() {
+    let env = setup().await;
+    let first = insert_repo_async(&env.state, 1, "acme/one", "connected").await;
+    let second = insert_repo_async(&env.state, 2, "acme/two", "connected").await;
+    let skipped = insert_repo_async(&env.state, 3, "acme/three", "disconnected").await;
+
+    let (status, body) = env.call("POST", "/api/repositories/sync", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({ "queued": 2 }));
+    for id in [first, second] {
+        assert_eq!(
+            env.jobs(id).await,
+            vec![("queued".into(), "manual".into(), false)]
+        );
+    }
+    assert!(env.jobs(skipped).await.is_empty());
 }
 
 #[tokio::test]

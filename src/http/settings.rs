@@ -10,10 +10,13 @@ use crate::http::session::{AuthUser, Owner};
 use crate::http::setup::install_url;
 use crate::http::Body;
 use crate::index::embed::{self, EmbeddingSettings, EmbeddingSettingsInput};
+use crate::index::schedule::{self, AutoSync};
 use crate::model::{EMBED_DONE, EMBED_REJECTED};
-use crate::state::AppState;
+use crate::sso::{self, SsoInput, SsoView};
+use crate::state::{now, AppState};
 
-/// `/api/settings/github`, `/api/settings/embeddings[/test]`.
+/// `/api/settings/github`, `/api/settings/embeddings[/test]`, `/api/settings/sync`,
+/// `/api/settings/sso`.
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/settings/github", get(github_settings))
@@ -22,6 +25,8 @@ pub fn routes() -> Router<AppState> {
             get(get_embeddings).put(put_embeddings),
         )
         .route("/api/settings/embeddings/test", post(test_embeddings))
+        .route("/api/settings/sync", get(get_sync).put(put_sync))
+        .route("/api/settings/sso", get(get_sso).put(put_sso))
 }
 
 #[derive(Serialize)]
@@ -139,4 +144,53 @@ async fn test_embeddings(
         }
         Err(error) => json!({ "ok": false, "error": error }),
     }))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncView {
+    #[serde(flatten)]
+    settings: AutoSync,
+    /// `None` when the stored expression does not parse.
+    description: Option<String>,
+    /// `None` when automatic sync is off.
+    next_run_at: Option<i64>,
+}
+
+fn sync_view(settings: AutoSync) -> SyncView {
+    let cron = schedule::parse(&settings.cron).ok();
+    let next_run_at = if settings.enabled {
+        cron.as_ref().and_then(|cron| schedule::next_run(cron, now()))
+    } else {
+        None
+    };
+    SyncView {
+        description: cron.map(|cron| cron.describe()),
+        next_run_at,
+        settings,
+    }
+}
+
+async fn get_sync(State(state): State<AppState>, _user: AuthUser) -> ApiResult<Json<SyncView>> {
+    Ok(Json(sync_view(schedule::settings(&state).await?)))
+}
+
+async fn put_sync(
+    State(state): State<AppState>,
+    _owner: Owner,
+    Body(input): Body<AutoSync>,
+) -> ApiResult<Json<SyncView>> {
+    Ok(Json(sync_view(schedule::apply(&state, input).await?)))
+}
+
+async fn get_sso(State(state): State<AppState>, _owner: Owner) -> ApiResult<Json<SsoView>> {
+    Ok(Json(sso::view(&state).await?))
+}
+
+async fn put_sso(
+    State(state): State<AppState>,
+    _owner: Owner,
+    Body(input): Body<SsoInput>,
+) -> ApiResult<Json<SsoView>> {
+    Ok(Json(sso::apply(&state, input).await?))
 }

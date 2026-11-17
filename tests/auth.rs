@@ -23,7 +23,7 @@ use sourcelens::error::{ApiError, GitHubFailure};
 use sourcelens::github::app::GitHub;
 use sourcelens::github::oauth::{resolve_user, GhToken, GhUser, Resolution, TokenError};
 use sourcelens::http::session::{create_session, user_token_with, AuthUser};
-use sourcelens::model::Role;
+use sourcelens::model::{Provider, Role};
 use sourcelens::state::{now, AppState};
 
 const HTTPS_PUBLIC_URL: &str = "https://sourcelens.example.com";
@@ -88,6 +88,46 @@ async fn state_with_session() {
     assert_eq!(body["user"]["id"], owner);
     assert_eq!(body["user"]["login"], "octocat");
     assert_eq!(body["user"]["role"], "owner");
+}
+
+#[tokio::test]
+async fn state_counts_accounts_awaiting_approval_for_admins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = new_state(&tmp, |_| {});
+    let owner = insert_user(&state, "octocat", "owner", Some(1)).await;
+    let member = insert_user(&state, "hubot", "member", Some(2)).await;
+    state
+        .db
+        .write(|c| {
+            c.execute(
+                "INSERT INTO users (login, role, status, sso_issuer, sso_sub, created_at)
+                 VALUES ('kim', 'member', 'pending', 'https://idp.example', 'kim', ?1)",
+                [now()],
+            )
+        })
+        .await
+        .unwrap();
+    for (user, expected) in [(owner, 1), (member, 0)] {
+        let cookie = session_for(&state, user).await;
+        let (status, _, body) =
+            call(&state, request("GET", "/api/state", Some(&cookie), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["user"]["pendingApprovals"], expected, "user {user}");
+    }
+}
+
+#[tokio::test]
+async fn state_loads_when_the_sso_setting_is_unreadable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = new_state(&tmp, |_| {});
+    state
+        .db
+        .write(|c| sourcelens::db::put_setting(c, "sso", "not json"))
+        .await
+        .unwrap();
+    let (status, _, body) = call(&state, request("GET", "/api/state", None, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["sso"], Value::Null);
 }
 
 // ── Manifest flow ─────────────────────────────────────────────────────────────
@@ -1044,11 +1084,12 @@ async fn expired_session(state: &AppState) -> AuthUser {
         refresh_token: Some("ghr_once".into()),
         expires_at: now() - 10,
     };
-    let cookie = create_session(state, owner, &token).await.unwrap();
+    let cookie = create_session(state, owner, Some(&token)).await.unwrap();
     AuthUser {
         id: owner,
         login: "octocat".into(),
         role: Role::Owner,
+        provider: Provider::Github,
         session_hash: sha256_hex(cookie.as_bytes()),
     }
 }

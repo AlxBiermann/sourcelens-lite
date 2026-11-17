@@ -3,6 +3,7 @@ use axum::http::HeaderMap;
 use axum::response::Redirect;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -11,9 +12,10 @@ use crate::db;
 use crate::error::{ApiError, ApiResult};
 use crate::github::app::{AppCredentials, GitHub};
 use crate::http::members::valid_github_name;
-use crate::http::session::current_user;
+use crate::http::session::{current_user, PROVIDER_SQL};
 use crate::http::Body;
-use crate::model::Role;
+use crate::model::{Provider, Role};
+use crate::sso;
 use crate::state::{lock, AppState};
 
 /// Bytes of randomness in the manifest-flow `state`.
@@ -36,6 +38,16 @@ struct StateResponse {
     public_url: String,
     setup: SetupState,
     user: Option<StateUser>,
+    /// The SSO sign-in button; `None` when SSO is off.
+    sso: Option<StateSso>,
+    /// `SOURCELENS_DEV_MODE`: the UI shows the dev sign-in and skips the setup.
+    dev_mode: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StateSso {
+    name: String,
 }
 
 #[derive(Serialize)]
@@ -55,6 +67,9 @@ struct StateUser {
     name: Option<String>,
     avatar_url: Option<String>,
     role: Role,
+    provider: Provider,
+    /// Accounts awaiting approval; always 0 for members, who cannot approve.
+    pending_approvals: i64,
 }
 
 async fn get_state(
@@ -70,8 +85,14 @@ async fn get_state(
                 .db
                 .read(move |conn| {
                     conn.query_row(
-                        "SELECT id, login, name, avatar_url, role FROM users WHERE id = ?1",
-                        [id],
+                        &format!(
+                            "SELECT id, login, name, avatar_url, role, {PROVIDER_SQL},
+                                    CASE WHEN role = ?2
+                                         THEN (SELECT count(*) FROM users WHERE status = 'pending')
+                                         ELSE 0 END
+                             FROM users WHERE id = ?1"
+                        ),
+                        params![id, Role::Owner],
                         |row| {
                             Ok(StateUser {
                                 id: row.get(0)?,
@@ -79,6 +100,8 @@ async fn get_state(
                                 name: row.get(2)?,
                                 avatar_url: row.get(3)?,
                                 role: row.get(4)?,
+                                provider: row.get(5)?,
+                                pending_approvals: row.get(6)?,
                             })
                         },
                     )
@@ -87,6 +110,14 @@ async fn get_state(
                 .map(Some)?
         }
         None => None,
+    };
+    // A broken SSO setting must not keep the app from loading; the sign-in button is then hidden.
+    let sso = match sso::button_name(&state).await {
+        Ok(name) => name.map(|name| StateSso { name }),
+        Err(err) => {
+            tracing::error!("reading the SSO settings failed: {err}");
+            None
+        }
     };
     Ok(Json(StateResponse {
         version: env!("CARGO_PKG_VERSION"),
@@ -98,6 +129,8 @@ async fn get_state(
             app_slug: creds.map(|c| c.slug),
         },
         user,
+        sso,
+        dev_mode: state.cfg.dev_mode,
     }))
 }
 

@@ -633,6 +633,15 @@ async fn idle_startup_job_is_discarded() {
 }
 
 #[tokio::test]
+async fn idle_schedule_job_is_discarded() {
+    let env = setup().await;
+    first_commit(&mut env.fake());
+    env.run("connect", false).await.unwrap();
+
+    assert!(env.run("schedule", false).await.is_none());
+}
+
+#[tokio::test]
 async fn failed_job_keeps_the_error_message() {
     let env = setup().await;
     first_commit(&mut env.fake());
@@ -683,6 +692,41 @@ async fn enqueue_keeps_one_queued_job_per_repository() {
         (count, target.as_str(), force, trigger.as_str()),
         (1, "b", true, "manual")
     );
+}
+
+#[tokio::test]
+async fn scheduled_sync_keeps_a_queued_manual_job() {
+    let env = setup().await;
+    first_commit(&mut env.fake());
+    env.run("connect", false).await.unwrap();
+
+    let job_id = jobs::enqueue(&env.state, env.repo_id, Trigger::Manual, None, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        jobs::enqueue_all(&env.state, Trigger::Schedule).await.unwrap(),
+        1
+    );
+    let trigger: String = env
+        .query("SELECT trigger FROM jobs WHERE repo_id = ?1 AND status = 'queued'")
+        .await;
+    assert_eq!(trigger, "manual");
+
+    // Nothing changed since the connect job; the manual job still keeps its row.
+    assert!(jobs::run_next(&env.state).await.unwrap());
+    let (status, trigger): (String, String) = env
+        .state
+        .db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT status, trigger FROM jobs WHERE id = ?1",
+                [job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!((status.as_str(), trigger.as_str()), ("succeeded", "manual"));
 }
 
 #[tokio::test]

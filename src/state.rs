@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::crypto::{random_hex, SecretKey};
 use crate::db::Db;
 use crate::github::app::GitHub;
+use crate::http::oauth_server::PendingCode;
 use crate::rate::RateLimiter;
 
 pub const SECS_PER_DAY: i64 = 86_400;
@@ -21,8 +22,12 @@ pub struct AppState {
     pub db: Db,
     pub key: Arc<SecretKey>,
     pub http: reqwest::Client,
+    /// Like `http`, but never follows redirects; used for SSO discovery and the token exchange.
+    pub sso_http: reqwest::Client,
     pub github: Arc<GitHub>,
     pub job_notify: Arc<tokio::sync::Notify>,
+    /// Wakes the auto-sync scheduler after its settings changed; owned by `index::schedule`.
+    pub schedule_notify: Arc<tokio::sync::Notify>,
     pub setup_token: Arc<String>,
     /// Last `api_keys.last_used_at` write per key id; owned by `mcp`.
     pub key_touch: Arc<Mutex<HashMap<i64, Instant>>>,
@@ -30,6 +35,8 @@ pub struct AppState {
     pub manifest_state: Arc<Mutex<Option<String>>>,
     /// One lock per session hash while its GitHub token is refreshed; owned by `http::session`.
     pub refresh_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Unredeemed OAuth authorization codes by sha256 hex; owned by `http::oauth_server`.
+    pub oauth_codes: Arc<Mutex<HashMap<String, PendingCode>>>,
     /// Request budget per API key on `/mcp`.
     pub mcp_rate: Arc<RateLimiter>,
     /// Request budget per user on `POST /api/search`.
@@ -43,10 +50,15 @@ impl AppState {
         prepare_data_dir(&cfg.data_dir)?;
         let db = Db::open(&cfg.data_dir.join("sourcelens.db"))?;
         let key = Arc::new(SecretKey::load(&cfg)?);
-        let http = reqwest::Client::builder()
-            .user_agent("sourcelens")
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(60))
+        let http_client = || {
+            reqwest::Client::builder()
+                .user_agent("sourcelens")
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(60))
+        };
+        let http = http_client().build()?;
+        let sso_http = http_client()
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let github = Arc::new(GitHub::new(
             http.clone(),
@@ -60,12 +72,15 @@ impl AppState {
             db,
             key,
             http,
+            sso_http,
             github,
             job_notify: Arc::new(tokio::sync::Notify::new()),
+            schedule_notify: Arc::new(tokio::sync::Notify::new()),
             setup_token: Arc::new(random_hex(SETUP_TOKEN_BYTES)),
             key_touch: Arc::new(Mutex::new(HashMap::new())),
             manifest_state: Arc::new(Mutex::new(None)),
             refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+            oauth_codes: Arc::new(Mutex::new(HashMap::new())),
             mcp_rate: Arc::new(RateLimiter::default()),
             search_rate: Arc::new(RateLimiter::default()),
         })

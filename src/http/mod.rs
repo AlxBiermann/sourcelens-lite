@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod keys;
 pub mod members;
+pub mod oauth_server;
 pub mod repos;
 pub mod search;
 pub mod session;
@@ -42,7 +43,7 @@ const SECURITY_HEADERS: [(HeaderName, &str); 4] = [
 ];
 
 pub fn router(state: AppState) -> Router {
-    let app_routes = Router::new()
+    let mut app_routes = Router::new()
         .merge(setup::routes())
         .merge(auth::routes())
         .merge(members::routes())
@@ -50,7 +51,11 @@ pub fn router(state: AppState) -> Router {
         .merge(keys::routes())
         .merge(settings::routes())
         .merge(search::routes())
-        .layer(DefaultBodyLimit::max(API_BODY_LIMIT));
+        .merge(oauth_server::routes());
+    if state.cfg.dev_mode {
+        app_routes = app_routes.merge(crate::dev::routes());
+    }
+    let app_routes = app_routes.layer(DefaultBodyLimit::max(API_BODY_LIMIT));
     let webhook_routes =
         crate::github::webhook::routes().layer(DefaultBodyLimit::max(WEBHOOK_BODY_LIMIT));
     let mcp_routes = crate::mcp::routes().layer(DefaultBodyLimit::max(MCP_BODY_LIMIT));

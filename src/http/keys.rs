@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::crypto::{random_hex, sha256_hex};
 use crate::error::{ApiError, ApiResult};
-use crate::http::session::AuthUser;
+use crate::http::session::KeyUser;
 use crate::http::{Body, PathId};
 use crate::repositories::{self, LISTED_IDS};
 use crate::state::{lock, now, AppState, SECS_PER_DAY};
@@ -77,14 +77,14 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
-async fn list(State(state): State<AppState>, _user: AuthUser) -> ApiResult<Json<Vec<ApiKey>>> {
+async fn list(State(state): State<AppState>, _user: KeyUser) -> ApiResult<Json<Vec<ApiKey>>> {
     let keys = state.db.read(|conn| load_keys(conn, None)).await?;
     Ok(Json(keys))
 }
 
 async fn create(
     State(state): State<AppState>,
-    user: AuthUser,
+    KeyUser(user): KeyUser,
     Body(input): Body<NewKey>,
 ) -> ApiResult<Json<CreatedKey>> {
     let (key, secret) = create_key(&state, input, Some(user.id)).await?;
@@ -93,7 +93,7 @@ async fn create(
 
 async fn update(
     State(state): State<AppState>,
-    _user: AuthUser,
+    _user: KeyUser,
     PathId(id): PathId,
     Body(input): Body<KeyUpdate>,
 ) -> ApiResult<Json<ApiKey>> {
@@ -134,7 +134,7 @@ async fn update(
 
 async fn remove(
     State(state): State<AppState>,
-    _user: AuthUser,
+    _user: KeyUser,
     PathId(id): PathId,
 ) -> ApiResult<StatusCode> {
     let deleted = state

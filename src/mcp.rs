@@ -8,13 +8,15 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
+use crate::config::Config;
 use crate::crypto::sha256_hex;
 use crate::error::{ApiError, ApiResult};
 use crate::http::keys::KEY_PREFIX;
+use crate::http::oauth_server::ACCESS_PREFIX;
 use crate::repositories::{self, RepoRow, CONNECTED_IDS};
 use crate::search::grep::{self, GrepRequest, GrepResponse};
 use crate::search::symbols::{self, SymbolRow};
@@ -45,7 +47,7 @@ const GET_CODE_DEFAULT_LINES: usize = 400;
 const GET_CODE_MAX_LINES: usize = 800;
 const FIND_SYMBOL_DEFAULT: usize = 20;
 const FIND_SYMBOL_MAX: usize = 50;
-/// `api_keys.last_used_at` is written at most this often per key.
+/// `last_used_at` of an API key or OAuth grant is written at most this often.
 const TOUCH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// `/mcp` (POST; GET/DELETE → 405).
@@ -69,7 +71,7 @@ async fn method_not_allowed() -> Response {
 async fn handle(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     match serve(&state, &headers, &body).await {
         Ok(response) => response,
-        Err(reject) => reject.into_response(),
+        Err(reject) => reject.respond(&state.cfg),
     }
 }
 
@@ -111,8 +113,8 @@ enum Reject {
     Internal(ApiError),
 }
 
-impl IntoResponse for Reject {
-    fn into_response(self) -> Response {
+impl Reject {
+    fn respond(self, cfg: &Config) -> Response {
         match self {
             Self::Origin => rpc_error(
                 StatusCode::FORBIDDEN,
@@ -127,10 +129,15 @@ impl IntoResponse for Reject {
                     UNAUTHORIZED,
                     "Unauthorized: invalid or missing API key",
                 );
-                response.headers_mut().insert(
-                    header::WWW_AUTHENTICATE,
-                    HeaderValue::from_static("Bearer realm=\"sourcelens\""),
+                let challenge = format!(
+                    "Bearer realm=\"sourcelens\", resource_metadata=\"{}/.well-known/oauth-protected-resource/mcp\"",
+                    cfg.public_url
                 );
+                if let Ok(value) = HeaderValue::from_str(&challenge) {
+                    response
+                        .headers_mut()
+                        .insert(header::WWW_AUTHENTICATE, value);
+                }
                 response
             }
             Self::RateLimited(seconds) => {
@@ -248,54 +255,77 @@ fn parse_envelope(message: &Value) -> Result<Option<Envelope<'_>>, Reject> {
     }))
 }
 
-/// What an API key may read.
+/// What an API key or OAuth access token may read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyScope {
+    /// API key id, or the negated OAuth grant id, so both share `mcp_rate` and `key_touch`
+    /// without colliding.
     pub key_id: i64,
     /// Connected repositories in the key's scope, ascending.
     pub repo_ids: Vec<i64>,
 }
 
-/// Resolves an API key secret (`sl_…`) to the connected repositories it may read.
+/// Resolves an API key secret (`sl_…`) or an OAuth access token (`slo_…`) to the connected
+/// repositories it may read.
 pub async fn authenticate(state: &AppState, secret: &str) -> ApiResult<KeyScope> {
     let secret = secret.trim();
-    if !secret.starts_with(KEY_PREFIX) {
+    let hash = sha256_hex(secret.as_bytes());
+    let found = if secret.starts_with(ACCESS_PREFIX) {
+        state.db.read(move |conn| grant_scope(conn, &hash)).await?
+    } else if secret.starts_with(KEY_PREFIX) {
+        state.db.read(move |conn| key_scope(conn, &hash)).await?
+    } else {
         return Err(invalid_key());
-    }
-    let key_hash = sha256_hex(secret.as_bytes());
-    let found = state
-        .db
-        .read(move |conn| {
-            let row: Option<(i64, bool, Option<i64>)> = conn
-                .query_row(
-                    "SELECT id, all_repos, expires_at FROM api_keys WHERE key_hash = ?1",
-                    [&key_hash],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .optional()?;
-            let Some((key_id, all_repos, expires_at)) = row else {
-                return Ok(None);
-            };
-            if expires_at.is_some_and(|at| at <= now()) {
-                return Ok(None);
-            }
-            let repo_ids = if all_repos {
-                repositories::connected_ids(conn)?
-            } else {
-                conn.prepare(&format!(
-                    "SELECT repo_id FROM api_key_repos
-                     WHERE key_id = ?1 AND repo_id IN ({CONNECTED_IDS})
-                     ORDER BY repo_id"
-                ))?
-                .query_map([key_id], |r| r.get(0))?
-                .collect::<rusqlite::Result<Vec<i64>>>()?
-            };
-            Ok::<_, rusqlite::Error>(Some(KeyScope { key_id, repo_ids }))
-        })
-        .await?;
+    };
     let scope = found.ok_or_else(invalid_key)?;
     touch(state, scope.key_id);
     Ok(scope)
+}
+
+fn key_scope(conn: &Connection, key_hash: &str) -> rusqlite::Result<Option<KeyScope>> {
+    let row: Option<(i64, bool, Option<i64>)> = conn
+        .query_row(
+            "SELECT id, all_repos, expires_at FROM api_keys WHERE key_hash = ?1",
+            [key_hash],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((key_id, all_repos, expires_at)) = row else {
+        return Ok(None);
+    };
+    if expires_at.is_some_and(|at| at <= now()) {
+        return Ok(None);
+    }
+    let repo_ids = if all_repos {
+        repositories::connected_ids(conn)?
+    } else {
+        conn.prepare(&format!(
+            "SELECT repo_id FROM api_key_repos
+             WHERE key_id = ?1 AND repo_id IN ({CONNECTED_IDS})
+             ORDER BY repo_id"
+        ))?
+        .query_map([key_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<i64>>>()?
+    };
+    Ok(Some(KeyScope { key_id, repo_ids }))
+}
+
+/// An unexpired OAuth access token reads every connected repository.
+fn grant_scope(conn: &Connection, access_hash: &str) -> rusqlite::Result<Option<KeyScope>> {
+    let grant_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM oauth_grants WHERE access_hash = ?1 AND access_expires_at > ?2",
+            params![access_hash, now()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(grant_id) = grant_id else {
+        return Ok(None);
+    };
+    Ok(Some(KeyScope {
+        key_id: -grant_id,
+        repo_ids: repositories::connected_ids(conn)?,
+    }))
 }
 
 /// Records `last_used_at` at most once per [`TOUCH_INTERVAL`] per key, in the background: it is
@@ -316,17 +346,25 @@ fn touch(state: &AppState, key_id: i64) {
         return;
     }
     let db = state.db.clone();
+    let (sql, id, what) = if key_id < 0 {
+        (
+            "UPDATE oauth_grants SET last_used_at = ?1 WHERE id = ?2",
+            -key_id,
+            "OAuth grant",
+        )
+    } else {
+        (
+            "UPDATE api_keys SET last_used_at = ?1 WHERE id = ?2",
+            key_id,
+            "API key",
+        )
+    };
     tokio::spawn(async move {
         let written: rusqlite::Result<usize> = db
-            .write(move |conn| {
-                conn.execute(
-                    "UPDATE api_keys SET last_used_at = ?1 WHERE id = ?2",
-                    params![now(), key_id],
-                )
-            })
+            .write(move |conn| conn.execute(sql, params![now(), id]))
             .await;
         if let Err(err) = written {
-            tracing::warn!("Could not record the use of API key {key_id}: {err}");
+            tracing::warn!("Could not record the use of {what} {id}: {err}");
         }
     });
 }

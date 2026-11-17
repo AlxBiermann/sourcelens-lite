@@ -173,7 +173,7 @@ pub async fn session_for(state: &AppState, user_id: i64) -> String {
         refresh_token: None,
         expires_at: i64::MAX,
     };
-    create_session(state, user_id, &token).await.unwrap()
+    create_session(state, user_id, Some(&token)).await.unwrap()
 }
 
 /// Session cookie value of a new owner.
@@ -190,6 +190,27 @@ async fn signed_in(state: &AppState, login: &str, role: &str) -> String {
     let github_id = scalar(state, "SELECT count(*) + 1000 FROM users").await;
     let user_id = insert_user(state, login, role, Some(github_id)).await;
     session_for(state, user_id).await
+}
+
+/// Session cookie value of a new, approved account that signs in with SSO; `role` is `owner` or
+/// `member`. SSO sessions have no GitHub token.
+pub async fn sso_session(state: &AppState, login: &str, role: &str) -> String {
+    let login = login.to_string();
+    let role = role.to_string();
+    let user_id: i64 = state
+        .db
+        .write(move |conn| {
+            conn.query_row(
+                "INSERT INTO users (login, role, status, sso_issuer, sso_sub, email, created_at, last_login_at)
+                 VALUES (?1, ?2, 'active', 'https://idp.example', ?1, ?1 || '@example.com', ?3, ?3)
+                 RETURNING id",
+                rusqlite::params![login, role, now()],
+                |row| row.get(0),
+            )
+        })
+        .await
+        .unwrap();
+    create_session(state, user_id, None).await.unwrap()
 }
 
 // ── HTTP ─────────────────────────────────────────────────────────────────────

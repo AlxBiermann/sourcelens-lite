@@ -29,7 +29,7 @@ async fn migration_applies_and_sqlite_vec_is_loaded() {
         })
         .await
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     assert!(
         vec_version.starts_with('v'),
         "vec_version() = {vec_version}"
@@ -161,7 +161,7 @@ async fn version_1_database_is_migrated_to_version_2() {
         })
         .await
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     assert!(
         indexes.contains(&"chunks_repo_state".to_string()),
         "{indexes:?}"
@@ -180,6 +180,64 @@ async fn version_1_database_is_migrated_to_version_2() {
         .await
         .unwrap();
     assert_eq!(fresh_indexes, indexes);
+}
+
+#[tokio::test]
+async fn version_2_database_is_migrated_to_version_3() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("old.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(include_str!("../migrations/0001_init.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../migrations/0002_indexes.sql"))
+            .unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 2;
+             INSERT INTO users (id, github_id, login, role, created_at) VALUES (1, 1, 'octocat', 'owner', 0);
+             INSERT INTO sessions (id_hash, user_id, gh_token, created_at, expires_at) VALUES ('s1', 1, x'01', 0, 100);
+             INSERT INTO repositories (id, github_id, installation_id, full_name, private, default_branch, created_at)
+               VALUES (1, 10, 99, 'acme/api', 0, 'main', 0);
+             INSERT INTO jobs (id, repo_id, status, trigger, created_at) VALUES (7, 1, 'succeeded', 'manual', 0);",
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let (version, sessions, job, status) = db
+        .read(|c| {
+            let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            let sessions: i64 = c.query_row(
+                "SELECT count(*) FROM sessions WHERE id_hash = 's1' AND user_id = 1 AND gh_token = x'01'",
+                [],
+                |r| r.get(0),
+            )?;
+            let job: (i64, String) =
+                c.query_row("SELECT id, trigger FROM jobs", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let status: String =
+                c.query_row("SELECT status FROM users WHERE id = 1", [], |r| r.get(0))?;
+            Ok::<_, rusqlite::Error>((version, sessions, job, status))
+        })
+        .await
+        .unwrap();
+    assert_eq!(version, 3);
+    assert_eq!(sessions, 1);
+    assert_eq!(job, (7, "manual".to_string()));
+    assert_eq!(status, "active");
+
+    db.write(|c| {
+        c.execute(
+            "INSERT INTO jobs (repo_id, trigger, created_at) VALUES (1, 'schedule', 0)",
+            [],
+        )?;
+        c.execute(
+            "INSERT INTO sessions (id_hash, user_id, gh_token, created_at, expires_at)
+             VALUES ('s2', 1, NULL, 0, 100)",
+            [],
+        )
+    })
+    .await
+    .unwrap();
 }
 
 #[cfg(unix)]

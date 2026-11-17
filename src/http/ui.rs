@@ -9,7 +9,7 @@ use crate::error::ApiError;
 struct Assets;
 
 const NOT_BUILT: &str = "UI not built. Run: npm --prefix ui ci && npm --prefix ui run build";
-const BACKEND_PREFIXES: [&str; 4] = ["/api/", "/auth/", "/webhooks/", "/mcp"];
+const BACKEND_PREFIXES: [&str; 5] = ["/api/", "/auth/", "/webhooks/", "/mcp", "/.well-known/"];
 
 /// Router fallback: embedded UI assets for GET/HEAD, `index.html` for client-side routes.
 pub async fn fallback(method: Method, uri: Uri) -> Response {

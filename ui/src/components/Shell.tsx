@@ -1,7 +1,7 @@
-import { useState, type ReactNode } from 'react';
-import { NavLink, Outlet } from 'react-router';
-import { api } from '../api';
-import { useUser } from '../hooks/useSession';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { NavLink, Outlet, useLocation } from 'react-router';
+import { api, canManageApiKeys, handle } from '../api';
+import { useSession, useUser } from '../hooks/useSession';
 import { ThemeToggle } from './ThemeToggle';
 
 const NAV = [
@@ -15,6 +15,7 @@ const tabClass = ({ isActive }: { isActive: boolean }) => (isActive ? 'sl-tab sl
 
 export function Shell() {
   const user = useUser();
+  const devMode = useSession().state?.devMode ?? false;
   const [signingOut, setSigningOut] = useState(false);
 
   async function signOut() {
@@ -36,7 +37,7 @@ export function Shell() {
           SourceLens
         </NavLink>
         <nav className="sl-nav" aria-label="Main">
-          {NAV.map((item) => (
+          {NAV.filter((item) => item.to !== '/keys' || canManageApiKeys(user)).map((item) => (
             <NavLink key={item.to} to={item.to} className={({ isActive }) => (isActive ? 'sl-nav-link sl-nav-link-active' : 'sl-nav-link')}>
               {item.label}
             </NavLink>
@@ -45,7 +46,8 @@ export function Shell() {
         <div className="sl-rail-footer">
           <ThemeToggle />
           <div className="sl-rail-user">
-            <span className="sl-rail-login">@{user.login}</span>
+            {devMode ? <span className="sl-pending">Dev mode</span> : null}
+            <span className="sl-rail-login">{handle(user)}</span>
             <button type="button" className="sl-rail-signout" disabled={signingOut} onClick={() => void signOut()}>
               Sign out
             </button>
@@ -71,18 +73,54 @@ export function PageHeader({ title, action, mono }: { title: string; action?: Re
 }
 
 export function SettingsTabs({ owner }: { owner: boolean }) {
+  const { pendingApprovals } = useUser();
+  const { pathname } = useLocation();
+  const ref = useRef<HTMLElement>(null);
+  const [more, setMore] = useState(false);
+
+  // Centred, so the active tab never sits under the fade at the right edge.
+  useEffect(() => {
+    ref.current?.querySelector('.sl-tab-active')?.scrollIntoView({ inline: 'center', block: 'nearest' });
+  }, [pathname]);
+
+  // `more`: tabs continue past the right edge; on phones the row then fades out there (see `.sl-tabs-more`).
+  useEffect(() => {
+    const nav = ref.current;
+    if (!nav) return;
+    const update = () => setMore(nav.scrollLeft + nav.clientWidth < nav.scrollWidth - 1);
+    update();
+    nav.addEventListener('scroll', update, { passive: true });
+    const observer = new ResizeObserver(update);
+    observer.observe(nav);
+    return () => {
+      nav.removeEventListener('scroll', update);
+      observer.disconnect();
+    };
+  }, [owner, pendingApprovals]);
+
   return (
-    <nav className="sl-tabs" aria-label="Settings">
+    <nav ref={ref} className={more ? 'sl-tabs sl-tabs-more' : 'sl-tabs'} aria-label="Settings">
       <NavLink to="/settings/embeddings" className={tabClass}>
         Embeddings
       </NavLink>
       <NavLink to="/settings/github" className={tabClass}>
         GitHub
       </NavLink>
+      <NavLink to="/settings/sync" className={tabClass}>
+        Sync
+      </NavLink>
+      <NavLink to="/settings/mcp-clients" className={tabClass}>
+        MCP clients
+      </NavLink>
       {owner ? (
-        <NavLink to="/settings/members" className={tabClass}>
-          Members
-        </NavLink>
+        <>
+          <NavLink to="/settings/members" className={tabClass}>
+            {pendingApprovals > 0 ? `Members (${pendingApprovals})` : 'Members'}
+          </NavLink>
+          <NavLink to="/settings/sso" className={tabClass}>
+            Sign-in
+          </NavLink>
+        </>
       ) : null}
     </nav>
   );

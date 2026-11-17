@@ -1004,12 +1004,14 @@
   line-height: 1.2;
   font-weight: 700;
   font-stretch: 112%;
+  overflow-wrap: anywhere;
 }
 
 .sl-dialog-content {
   min-height: 0;
   flex: 1 1 auto;
   overflow-y: auto;
+  overflow-wrap: anywhere;
   padding: var(--space-2) var(--space-6);
 }
 
@@ -1412,6 +1414,15 @@
   gap: var(--space-6);
 }
 
+/* Entry buttons may carry a long target ("Return to …"): they wrap instead of running past the edge.
+   The block padding only shows once a label wraps; one line stays at the control height. */
+.sl-entry-content .sl-button {
+  padding-block: var(--space-2);
+  white-space: normal;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
 .sl-entry-wordmark {
   font-size: clamp(2.5rem, 1.6rem + 3.2vw, 4.5rem);
   line-height: 0.95;
@@ -1425,6 +1436,7 @@
   font-size: 24px;
   line-height: 1.3;
   font-weight: 500;
+  overflow-wrap: anywhere;
 }
 
 .sl-steps {
@@ -1714,6 +1726,15 @@
 /* ── Phones: tables become stacked blocks, the search button moves under the input ── */
 
 @media (max-width: 599px) {
+  .sl-tabs {
+    gap: var(--space-4);
+  }
+
+  /* Only while tabs continue past the right edge, so the last tab is never faded once scrolled into view. */
+  .sl-tabs-more {
+    mask-image: linear-gradient(to right, #000 calc(100% - var(--space-7)), transparent);
+  }
+
   .sl-table {
     display: block;
     min-width: 0;

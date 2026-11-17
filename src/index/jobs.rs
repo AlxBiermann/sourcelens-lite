@@ -23,6 +23,8 @@ const FINISH_FIRST_PAUSE: Duration = Duration::from_secs(1);
 const RESULT_NOT_SAVED: &str = "The job result could not be saved.";
 
 /// Queues a job; a repository has at most one queued job, a newer request replaces its target.
+/// A `schedule` or `startup` request keeps the trigger of an already queued job, so a job queued
+/// by a user or a webhook keeps its label and is not discarded as an idle background run.
 pub async fn enqueue(
     state: &AppState,
     repo_id: i64,
@@ -38,7 +40,8 @@ pub async fn enqueue(
                 "INSERT INTO jobs (repo_id, trigger, target_commit, force, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT (repo_id) WHERE status = 'queued' DO UPDATE SET
-                   trigger = excluded.trigger,
+                   trigger = CASE WHEN excluded.trigger IN ('schedule', 'startup')
+                     THEN jobs.trigger ELSE excluded.trigger END,
                    target_commit = excluded.target_commit,
                    force = max(force, excluded.force),
                    created_at = excluded.created_at
@@ -52,11 +55,25 @@ pub async fn enqueue(
     Ok(id)
 }
 
-/// Startup: fails interrupted jobs, queues a `startup` job per connected repository and starts
-/// pending deletions in the background. A failure for one repository does not stop the others.
+/// Queues a job for every connected repository; a failure for one does not stop the others.
+pub async fn enqueue_all(state: &AppState, trigger: Trigger) -> ApiResult<usize> {
+    let connected = state.db.read(repositories::connected_ids).await?;
+    let mut queued = 0;
+    for repo_id in connected {
+        match enqueue(state, repo_id, trigger, None, false).await {
+            Ok(_) => queued += 1,
+            Err(err) => tracing::error!(repo_id, "queueing the {trigger} job failed: {err}"),
+        }
+    }
+    Ok(queued)
+}
+
+/// Startup: fails interrupted jobs, queues a `startup` job per connected repository (not in dev
+/// mode) and starts pending deletions in the background. A failure for one repository does not
+/// stop the others.
 pub async fn recover_and_reconcile(state: &AppState) -> ApiResult<()> {
     let finished_at = now();
-    let (deleting, connected) = state
+    let deleting = state
         .db
         .write(move |conn| {
             conn.execute(
@@ -64,14 +81,14 @@ pub async fn recover_and_reconcile(state: &AppState) -> ApiResult<()> {
                  WHERE status = ?3",
                 params![finished_at, JobStatus::Failed, JobStatus::Running],
             )?;
-            let deleting = repositories::ids_in_state(conn, RepoState::Deleting)?;
-            let connected = repositories::connected_ids(conn)?;
-            Ok::<_, rusqlite::Error>((deleting, connected))
+            repositories::ids_in_state(conn, RepoState::Deleting)
         })
         .await?;
-    for repo_id in connected {
-        if let Err(err) = enqueue(state, repo_id, Trigger::Startup, None, false).await {
-            tracing::error!(repo_id, "queueing the startup job failed: {err}");
+    // Dev mode's demo repositories have no GitHub installation behind them: startup jobs would
+    // fail on every start.
+    if !state.cfg.dev_mode {
+        if let Err(err) = enqueue_all(state, Trigger::Startup).await {
+            tracing::error!("queueing the startup jobs failed: {err}");
         }
     }
     for repo_id in deleting {
@@ -241,7 +258,7 @@ async fn finish(
     trigger: Trigger,
     result: ApiResult<JobOutcome>,
 ) -> ApiResult<()> {
-    let discard = trigger == Trigger::Startup
+    let discard = matches!(trigger, Trigger::Startup | Trigger::Schedule)
         && matches!(&result, Ok(o) if o.files_changed == 0 && o.files_deleted == 0 && o.files_skipped == 0 && o.embedded == 0);
     let (status, error) = match result {
         Ok(_) => (JobStatus::Succeeded, None),

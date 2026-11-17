@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -113,6 +113,11 @@ fn fill_random(buf: &mut [u8]) {
 
 pub fn sha256_hex(data: &[u8]) -> String {
     hex(digest::digest(&digest::SHA256, data).as_ref())
+}
+
+/// PKCE `S256` code challenge of `verifier` (RFC 7636 §4.2).
+pub fn pkce_challenge(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(digest::digest(&digest::SHA256, verifier.as_bytes()))
 }
 
 /// Constant-time check of a hex HMAC-SHA256 signature; a leading `sha256=` is accepted.

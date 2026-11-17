@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::crypto::SecretKey;
 use crate::db::{self, Db};
 use crate::error::{ApiError, ApiResult, GitHubFailure};
+use crate::github::api;
 use crate::state::{lock, now};
 
 const SETTINGS_KEY: &str = "github_app";
@@ -194,6 +195,28 @@ impl GitHub {
         }
         let body: InstallationResponse = Self::json(response, &url).await?;
         Ok(body.id)
+    }
+
+    /// Every installation of this app (`GET /app/installations` with the app JWT), at most 10 pages.
+    pub async fn app_installations(&self) -> ApiResult<Vec<api::Installation>> {
+        let creds = self.credentials().await?.ok_or_else(app_not_configured)?;
+        let jwt = Self::app_jwt(&creds)?;
+        let mut all = Vec::new();
+        for page in 1..=api::MAX_INSTALLATION_PAGES {
+            let url = format!(
+                "{}/app/installations?per_page={}&page={page}",
+                self.api_base,
+                api::PER_PAGE
+            );
+            let response = self.send(|| self.http.get(&url).bearer_auth(&jwt)).await?;
+            let batch: Vec<api::Installation> = Self::json(response, &url).await?;
+            let count = batch.len();
+            all.extend(batch);
+            if count < api::PER_PAGE {
+                break;
+            }
+        }
+        Ok(all)
     }
 
     /// Parses a 2xx GitHub response body; a body that does not parse is 502 `github_error`.

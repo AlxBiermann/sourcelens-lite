@@ -1,5 +1,6 @@
 import { useId, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
-import { api, type ApiKey, type Repository } from '../api';
+import { Navigate } from 'react-router';
+import { api, canManageApiKeys, type ApiKey, type Repository } from '../api';
 import { Snippet } from '../components/CodeBlock';
 import { CopyButton } from '../components/CopyButton';
 import { ConfirmDialog, Dialog } from '../components/Dialog';
@@ -8,7 +9,7 @@ import { LoadState } from '../components/LoadState';
 import { CellLabel, PageHeader } from '../components/Shell';
 import { useAction } from '../hooks/useAction';
 import { useApi } from '../hooks/useApi';
-import { useSession } from '../hooks/useSession';
+import { useSession, useUser } from '../hooks/useSession';
 import { ago, date, plural } from '../format';
 
 const EXPIRY: { label: string; days: number | null }[] = [
@@ -125,8 +126,9 @@ function CreatedKey({ created, publicUrl, titleId }: { created: Created; publicU
 
 export function ApiKeys() {
   const { state } = useSession();
-  const keys = useApi<ApiKey[]>('/api/keys');
-  const repos = useApi<Repository[]>('/api/repositories');
+  const allowed = canManageApiKeys(useUser());
+  const keys = useApi<ApiKey[]>(allowed ? '/api/keys' : null);
+  const repos = useApi<Repository[]>(allowed ? '/api/repositories' : null);
   const action = useAction();
   const titleId = useId();
 
@@ -138,6 +140,8 @@ export function ApiKeys() {
   const [all, setAll] = useState(true);
   const [selected, setSelected] = useState<number[]>([]);
   const [formError, setFormError] = useState<string | null>(null);
+
+  if (!allowed) return <Navigate to="/repositories" replace />;
 
   const repoList = repos.data ?? [];
   const busy = action.busy !== null;

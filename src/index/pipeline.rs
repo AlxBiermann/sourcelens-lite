@@ -32,7 +32,8 @@ const MAX_ARCHIVE_WORKERS: usize = 4;
 const ARCHIVE_ENTRY_BUFFER: usize = 16;
 /// Git modes of regular and executable files; symlinks (`120000`) and submodules are not indexed.
 const INDEXED_FILE_MODES: [&str; 2] = ["100644", "100755"];
-const NO_ACCESS_REASON: &str = "GitHub App has no access";
+/// `state_reason` of a repository the GitHub App lost access to.
+pub(crate) const NO_ACCESS_REASON: &str = "GitHub App has no access";
 
 /// Threads of archive pipelines that are still running.
 static ARCHIVE_THREADS: AtomicUsize = AtomicUsize::new(0);

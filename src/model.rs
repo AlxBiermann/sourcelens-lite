@@ -75,6 +75,7 @@ text_enum! {
         Manual => "manual",
         Startup => "startup",
         Settings => "settings",
+        Schedule => "schedule",
     }
 }
 
@@ -111,6 +112,14 @@ text_enum! {
     Role {
         Owner => "owner",
         Member => "member",
+    }
+}
+
+text_enum! {
+    /// How an account signs in.
+    Provider {
+        Github => "github",
+        Sso => "sso",
     }
 }
 

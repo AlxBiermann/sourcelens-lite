@@ -2,7 +2,10 @@ mod common;
 
 use axum::body::Body;
 use axum::http::StatusCode;
-use common::{api, insert_repo_async, mcp_request, member_session, new_state, send};
+use common::{
+    api, insert_repo_async, mcp_request, member_session, new_state, owner_session, scalar, send,
+    sso_session,
+};
 use serde_json::json;
 use sourcelens::crypto;
 use sourcelens::http::keys::{self, NewKey};
@@ -181,4 +184,45 @@ async fn keys_api_through_the_router() {
     assert_eq!(send(app, request).await.status, StatusCode::UNAUTHORIZED);
     let (status, _, _) = api(app, "DELETE", &format!("/api/keys/{id}"), &cookie, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn demoting_an_sso_admin_revokes_their_api_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = new_state(&tmp, |_| {});
+    insert_repo_async(&state, 1, "acme/api", "connected").await;
+    let admin = owner_session(&state, "octocat").await;
+    let sso_admin = sso_session(&state, "kim", "owner").await;
+    let kim = scalar(&state, "SELECT id FROM users WHERE login = 'kim'").await;
+    let app = &sourcelens::http::router(state.clone());
+    let new_key = json!({ "name": "agent", "expiresInDays": null, "repositoryIds": null });
+
+    let (status, created, _) =
+        api(app, "POST", "/api/keys", &sso_admin, Some(new_key.clone())).await;
+    assert!(status.is_success(), "{created}");
+    let kim_secret = created["secret"].as_str().unwrap().to_string();
+    let (status, created, _) = api(app, "POST", "/api/keys", &admin, Some(new_key)).await;
+    assert!(status.is_success(), "{created}");
+    let admin_key = created["key"]["id"].clone();
+    let ping = || {
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }).to_string();
+        mcp_request(Some(&kim_secret)).body(Body::from(body)).unwrap()
+    };
+    assert_eq!(send(app, ping()).await.status, StatusCode::OK);
+
+    let (status, member, _) = api(
+        app,
+        "PATCH",
+        &format!("/api/members/{kim}"),
+        &admin,
+        Some(json!({ "role": "member" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{member}");
+    assert_eq!(member["role"], "member");
+    assert_eq!(send(app, ping()).await.status, StatusCode::UNAUTHORIZED);
+    let (status, listed, _) = api(app, "GET", "/api/keys", &admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<_> = listed.as_array().unwrap().iter().map(|k| &k["id"]).collect();
+    assert_eq!(ids, vec![&admin_key]);
 }

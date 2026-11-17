@@ -1,16 +1,32 @@
 export type Role = 'owner' | 'member';
 
-export type SessionUser = { id: number; login: string; name: string | null; avatarUrl: string | null; role: Role };
+export type Provider = 'github' | 'sso';
+
+/** `pendingApprovals`: accounts waiting for approval; always 0 for members. */
+export type SessionUser = { id: number; login: string; name: string | null; avatarUrl: string | null; role: Role; provider: Provider; pendingApprovals: number };
 
 export type AppStateDto = {
   version: string;
   publicUrl: string;
   setup: { appConfigured: boolean; ownerExists: boolean; appSlug: string | null; installUrl: string | null };
+  sso: { name: string } | null;
   user: SessionUser | null;
+  /** SOURCELENS_DEV_MODE: dev sign-in and demo data, no setup required. */
+  devMode: boolean;
 };
 
+/** API keys are open to admins and to members who sign in with GitHub. */
+export function canManageApiKeys(user: SessionUser): boolean {
+  return user.provider !== 'sso' || user.role === 'owner';
+}
+
+/** GitHub logins are shown with a leading @; SSO logins are usually e-mail addresses and are shown as they are. */
+export function handle(user: Pick<SessionUser, 'login' | 'provider'>): string {
+  return user.provider === 'github' ? `@${user.login}` : user.login;
+}
+
 export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed';
-export type JobTrigger = 'connect' | 'webhook' | 'manual' | 'startup' | 'settings';
+export type JobTrigger = 'connect' | 'webhook' | 'manual' | 'startup' | 'settings' | 'schedule';
 export type JobPhase = 'resolve' | 'index' | 'embed';
 
 export type Job = {
@@ -114,13 +130,49 @@ export type GithubSettings = {
   lastDeliveryEvent: string | null;
 };
 
+export type SyncSettings = {
+  enabled: boolean;
+  cron: string;
+  description: string | null;
+  nextRunAt: number | null;
+};
+
+export type SsoSettings = {
+  enabled: boolean;
+  name: string;
+  issuer: string;
+  clientId: string;
+  clientSecretSet: boolean;
+  redirectUrl: string;
+};
+
+export type SsoSettingsInput = {
+  enabled: boolean;
+  name: string;
+  issuer: string;
+  clientId: string;
+  clientSecret?: string;
+};
+
+/**
+ * Consent page data. `redirectTarget` is where the browser goes afterwards, for display: a host, `host:port` for an
+ * app on this computer (`redirectLocal`), or `scheme://host` for an app link. `error` and `redirectTo` are set when
+ * the request is invalid and can only be returned to the client; the page never follows `redirectTo` by itself.
+ */
+export type OAuthAuthorizeView = { clientName: string; redirectTarget: string; redirectLocal: boolean; redirectTo: string | null; error: string | null };
+
+export type OAuthGrant = { id: number; clientName: string; user: string; createdAt: number; lastUsedAt: number | null };
+
 export type Member = {
   id: number;
   login: string;
   name: string | null;
   avatarUrl: string | null;
   role: Role;
+  provider: Provider;
+  email: string | null;
   pending: boolean;
+  awaitingApproval: boolean;
   lastLoginAt: number | null;
 };
 

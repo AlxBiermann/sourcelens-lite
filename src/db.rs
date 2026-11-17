@@ -10,9 +10,10 @@ use crate::model::Role;
 use crate::state::{lock, now};
 
 /// Schema migrations in order; after applying `MIGRATIONS[i]`, `user_version` is `i + 1`.
-const MIGRATIONS: [&str; 2] = [
+const MIGRATIONS: [&str; 3] = [
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_indexes.sql"),
+    include_str!("../migrations/0003_sso_oauth_schedule.sql"),
 ];
 
 /// Reader connections in use at the same time; further reads wait for a free one.

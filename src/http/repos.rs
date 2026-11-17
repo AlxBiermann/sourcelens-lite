@@ -3,15 +3,18 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::StreamExt;
 use rusqlite::{Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::error::{ApiError, ApiResult, GitHubFailure};
 use crate::github::api;
+use crate::github::app::GitHub;
 use crate::http::session::{user_token, AuthUser};
 use crate::http::{Body, PathId};
 use crate::index::jobs;
-use crate::model::{JobPhase, JobStatus, RepoState, SkipReason, Trigger, EMBED_DONE};
+use crate::model::{JobPhase, JobStatus, Provider, RepoState, SkipReason, Trigger, EMBED_DONE};
 use crate::repositories::{self, NewRepository, RepoRow, Target};
 use crate::state::{now, AppState};
 
@@ -19,12 +22,15 @@ use crate::state::{now, AppState};
 const MAX_BRANCH_NAME_BYTES: usize = 255;
 /// Jobs listed in a repository's activity.
 const DETAIL_JOBS: i64 = 20;
+/// Installations whose repositories are listed at the same time for SSO accounts.
+const INSTALLATION_CONCURRENCY: usize = 8;
 
-/// `/api/github/repositories`, `/api/repositories[/{id}[/branches|/sync]]`.
+/// `/api/github/repositories`, `/api/repositories[/sync|/{id}[/branches|/sync]]`.
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/github/repositories", get(github_repositories))
         .route("/api/repositories", get(list).post(connect))
+        .route("/api/repositories/sync", post(sync_all))
         .route(
             "/api/repositories/{id}",
             get(detail).patch(update_branch).delete(disconnect),
@@ -147,22 +153,54 @@ struct SyncBody {
 const JOB_COLUMNS: &str = "id, status, trigger, phase, target_commit, files_total, files_done, files_changed,
     files_deleted, files_skipped, embed_total, embed_done, error, created_at, started_at, finished_at";
 
+/// Installations and their repositories: those the user can access for GitHub accounts, every
+/// installation of the app for SSO accounts (they have no GitHub token). For SSO accounts,
+/// suspended installations and installations whose listing fails are left out.
 async fn github_repositories(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> ApiResult<Json<Vec<InstallationView>>> {
-    let token = user_token(&state, &user).await?;
-    let installations = api::user_installations(&state.github, &token).await?;
-    let listings =
-        futures_util::future::try_join_all(installations.iter().map(|installation| {
-            api::user_installation_repos(&state.github, &token, installation.id)
-        }))
-        .await?;
+    let github = &state.github;
+    let listed: Vec<(api::Installation, (Vec<api::GhRepo>, bool))> = match user.provider {
+        Provider::Github => {
+            let token = user_token(&state, &user).await?;
+            let installations = api::user_installations(github, &token).await?;
+            let listings =
+                futures_util::future::try_join_all(installations.iter().map(|installation| {
+                    api::user_installation_repos(github, &token, installation.id)
+                }))
+                .await?;
+            installations.into_iter().zip(listings).collect()
+        }
+        Provider::Sso => {
+            let installations = github.app_installations().await?;
+            futures_util::stream::iter(
+                installations
+                    .into_iter()
+                    .filter(|installation| installation.suspended_at.is_none()),
+            )
+            .map(|installation| async move {
+                match app_installation_repos(github, installation.id).await {
+                    Ok(listing) => Some((installation, listing)),
+                    Err(err) => {
+                        tracing::warn!(
+                            installation_id = installation.id,
+                            "listing the repositories of the installation failed: {err}"
+                        );
+                        None
+                    }
+                }
+            })
+            .buffered(INSTALLATION_CONCURRENCY)
+            .filter_map(std::future::ready)
+            .collect()
+            .await
+        }
+    };
     let connected = state.db.read(repositories::listed_github_ids).await?;
 
-    let views = installations
+    let views = listed
         .into_iter()
-        .zip(listings)
         .map(|(installation, (repos, truncated))| InstallationView {
             installation_id: installation.id,
             account: AccountView {
@@ -186,6 +224,15 @@ async fn github_repositories(
     Ok(Json(views))
 }
 
+/// Repositories of one installation, read with its installation token.
+async fn app_installation_repos(
+    github: &GitHub,
+    installation_id: u64,
+) -> ApiResult<(Vec<api::GhRepo>, bool)> {
+    let token = github.installation_token(installation_id).await?;
+    api::installation_repos(github, &token).await
+}
+
 async fn list(State(state): State<AppState>, _user: AuthUser) -> ApiResult<Json<Vec<Repository>>> {
     let repos = state.db.read(|conn| load_repositories(conn, None)).await?;
     Ok(Json(repos))
@@ -203,11 +250,27 @@ async fn connect(
             "Use the form owner/repository.",
         ));
     }
-    let token = user_token(&state, &user).await?;
-    let gh_repo = api::user_repo(&state.github, &token, &full_name).await?;
+    let (token, installation_id) = match user.provider {
+        Provider::Github => (user_token(&state, &user).await?, body.installation_id),
+        Provider::Sso => {
+            let installation_id = match state.github.repo_installation(&full_name).await {
+                Ok(installation_id) => installation_id,
+                Err(err) if matches!(err.github, Some(GitHubFailure::Status(403 | 404))) => {
+                    return Err(ApiError::not_found(
+                        "repository_not_accessible",
+                        format!("{full_name} is not shared with the GitHub App."),
+                    ));
+                }
+                Err(err) => return Err(err),
+            };
+            let token = state.github.installation_token(installation_id).await?;
+            (token, installation_id)
+        }
+    };
+    let gh_repo = api::repo(&state.github, &token, &full_name).await?;
     let new = NewRepository {
         github_id: i64::try_from(gh_repo.id).map_err(ApiError::internal)?,
-        installation_id: body.installation_id,
+        installation_id,
         full_name: gh_repo.full_name,
         private: gh_repo.private,
         default_branch: gh_repo.default_branch,
@@ -359,6 +422,12 @@ async fn sync(
         .await?
         .ok_or_else(|| ApiError::internal(format!("job {job_id} vanished after enqueue")))?;
     Ok(Json(job))
+}
+
+/// Queues a manual job for every connected repository; disconnected ones are skipped.
+async fn sync_all(State(state): State<AppState>, _user: AuthUser) -> ApiResult<Json<Value>> {
+    let queued = jobs::enqueue_all(&state, Trigger::Manual).await?;
+    Ok(Json(json!({ "queued": queued })))
 }
 
 async fn disconnect(
