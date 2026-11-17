@@ -41,6 +41,8 @@ pub struct AppState {
     pub mcp_rate: Arc<RateLimiter>,
     /// Request budget per user on `POST /api/search`.
     pub search_rate: Arc<RateLimiter>,
+    /// Exhaustive searches running at once; owned by `search::grep`.
+    pub grep_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -83,6 +85,9 @@ impl AppState {
             oauth_codes: Arc::new(Mutex::new(HashMap::new())),
             mcp_rate: Arc::new(RateLimiter::default()),
             search_rate: Arc::new(RateLimiter::default()),
+            grep_slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::search::grep::MAX_CONCURRENT,
+            )),
         })
     }
 }

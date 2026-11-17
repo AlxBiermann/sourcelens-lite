@@ -19,6 +19,8 @@ pub const MAX_PATTERN_CHARS: usize = 1_000;
 /// Matched lines are cut to this length (worst case 200 lines × 240 chars stays near 50k chars).
 pub const MAX_LINE_CHARS: usize = 240;
 pub const TIME_BUDGET: Duration = Duration::from_secs(5);
+/// Exhaustive searches that may scan at the same time; the rest wait for a slot.
+pub const MAX_CONCURRENT: usize = 2;
 const REGEX_SIZE_LIMIT: usize = 1 << 20;
 
 #[derive(Debug, Clone)]
