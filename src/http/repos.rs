@@ -133,7 +133,6 @@ struct BranchList {
 #[serde(rename_all = "camelCase")]
 struct ConnectBody {
     full_name: String,
-    installation_id: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -250,22 +249,20 @@ async fn connect(
             "Use the form owner/repository.",
         ));
     }
-    let (token, installation_id) = match user.provider {
-        Provider::Github => (user_token(&state, &user).await?, body.installation_id),
-        Provider::Sso => {
-            let installation_id = match state.github.repo_installation(&full_name).await {
-                Ok(installation_id) => installation_id,
-                Err(err) if matches!(err.github, Some(GitHubFailure::Status(403 | 404))) => {
-                    return Err(ApiError::not_found(
-                        "repository_not_accessible",
-                        format!("{full_name} is not shared with the GitHub App."),
-                    ));
-                }
-                Err(err) => return Err(err),
-            };
-            let token = state.github.installation_token(installation_id).await?;
-            (token, installation_id)
+    let installation_id = match state.github.repo_installation(&full_name).await {
+        Ok(installation_id) => installation_id,
+        Err(err) if matches!(err.github, Some(GitHubFailure::Status(403 | 404))) => {
+            return Err(ApiError::not_found(
+                "repository_not_accessible",
+                format!("{full_name} is not shared with the GitHub App."),
+            ));
         }
+        Err(err) => return Err(err),
+    };
+    // GitHub accounts read the repository with their own token, which proves they can see it.
+    let token = match user.provider {
+        Provider::Github => user_token(&state, &user).await?,
+        Provider::Sso => state.github.installation_token(installation_id).await?,
     };
     let gh_repo = api::repo(&state.github, &token, &full_name).await?;
     let new = NewRepository {

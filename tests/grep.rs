@@ -276,3 +276,40 @@ async fn an_exhausted_time_budget_is_reported() {
     assert_eq!(response.files_searched, 0);
     assert!(response.matches.is_empty());
 }
+
+#[tokio::test]
+async fn a_literal_found_nowhere_still_counts_every_file() {
+    let f = fixture().await;
+    let response = run(
+        &f.state,
+        request("zebraQuokkaNowhere", vec![f.api, f.orders], &[], None),
+    )
+    .await;
+    assert_eq!(response.files_searched, 2);
+    assert_eq!(response.total_matches, 0);
+    assert_eq!(response.files_with_matches, 0);
+    assert!(response.matches.is_empty());
+}
+
+#[tokio::test]
+async fn busy_slots_reject_after_the_queue_wait() {
+    let f = fixture().await;
+    let slots = u32::try_from(grep::MAX_CONCURRENT).unwrap();
+    let held = f
+        .state
+        .grep_slots
+        .clone()
+        .acquire_many_owned(slots)
+        .await
+        .unwrap();
+
+    let err = grep::grep(&f.state, request("return", vec![f.api], &[], None))
+        .await
+        .unwrap_err();
+    assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(err.code, "grep_busy");
+
+    drop(held);
+    let response = run(&f.state, request("return", vec![f.api], &[], None)).await;
+    assert_eq!(response.files_searched, 1);
+}

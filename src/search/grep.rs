@@ -3,6 +3,7 @@
 
 use std::time::{Duration, Instant};
 
+use axum::http::StatusCode;
 use regex::bytes::{Regex, RegexBuilder};
 use rusqlite::params_from_iter;
 use rusqlite::types::{Value, ValueRef};
@@ -22,6 +23,10 @@ pub const TIME_BUDGET: Duration = Duration::from_secs(5);
 /// Exhaustive searches that may scan at the same time; the rest wait for a slot.
 pub const MAX_CONCURRENT: usize = 2;
 const REGEX_SIZE_LIMIT: usize = 1 << 20;
+/// How long a search waits for one of the [`MAX_CONCURRENT`] slots before it gives up.
+const QUEUE_WAIT: Duration = Duration::from_secs(2);
+/// Lines scanned between two budget checks inside one file.
+const LINES_PER_BUDGET_CHECK: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct GrepRequest {
@@ -96,8 +101,8 @@ pub async fn grep(state: &AppState, req: GrepRequest) -> ApiResult<GrepResponse>
 }
 
 /// Every matching line of the files in `req.filter`, by repository name, path and line; the
-/// first `limit` are returned, the rest only counted. Stops before the next file once `budget`
-/// has passed.
+/// first `limit` are returned, the rest only counted. Waits at most [`QUEUE_WAIT`] for a slot
+/// (`grep_busy` otherwise); stops once `budget` has passed since the scan started.
 pub async fn grep_within(
     state: &AppState,
     req: GrepRequest,
@@ -105,11 +110,26 @@ pub async fn grep_within(
 ) -> ApiResult<GrepResponse> {
     let re = compile(&req.pattern, req.regex, req.case_sensitive)?;
     let limit = req.limit.clamp(1, MAX_LIMIT);
+    let literal = !req.regex;
     let filter = req.filter;
-    let started = Instant::now();
+    let slot = tokio::time::timeout(QUEUE_WAIT, state.grep_slots.clone().acquire_owned()).await;
+    let permit = match slot {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(err)) => return Err(ApiError::internal(format!("grep slots closed: {err}"))),
+        Err(_) => {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "grep_busy",
+                "Other exhaustive searches are running. Retry in a few seconds.",
+            ));
+        }
+    };
     let response = state
         .db
         .read(move |conn| -> rusqlite::Result<GrepResponse> {
+            // Held until the scan ends, even when the request is dropped meanwhile.
+            let _permit = permit;
+            let started = Instant::now();
             let mut response = GrepResponse {
                 matches: Vec::new(),
                 total_matches: 0,
@@ -148,8 +168,17 @@ pub async fn grep_within(
                     if content.is_empty() {
                         continue;
                     }
+                    if literal && !re.is_match(content) {
+                        continue;
+                    }
                     let mut file_matched = false;
                     for (index, line) in content.split(|&b| b == b'\n').enumerate() {
+                        if index % LINES_PER_BUDGET_CHECK == LINES_PER_BUDGET_CHECK - 1
+                            && started.elapsed() >= budget
+                        {
+                            response.timed_out = true;
+                            break;
+                        }
                         if !re.is_match(line) {
                             continue;
                         }
@@ -167,6 +196,9 @@ pub async fn grep_within(
                     }
                     if file_matched {
                         response.files_with_matches += 1;
+                    }
+                    if response.timed_out {
+                        break 'repos;
                     }
                 }
             }

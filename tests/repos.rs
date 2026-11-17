@@ -18,10 +18,15 @@ use tower::ServiceExt;
 
 // ── Fake GitHub ──────────────────────────────────────────────────────────────
 
+/// The user can see `acme/api` and `acme/private`; the app is installed on `acme/api` only.
 async fn user_repo(Path((owner, repo)): Path<(String, String)>) -> Response {
     match (owner.as_str(), repo.as_str()) {
         ("acme", "api") => Json(json!({
             "id": 5001, "full_name": "acme/api", "private": true, "default_branch": "main"
+        }))
+        .into_response(),
+        ("acme", "private") => Json(json!({
+            "id": 5002, "full_name": "acme/private", "private": true, "default_branch": "main"
         }))
         .into_response(),
         _ => (
@@ -168,7 +173,7 @@ impl Env {
         self.call(
             "POST",
             "/api/repositories",
-            Some(json!({ "fullName": "acme/api", "installationId": 42 })),
+            Some(json!({ "fullName": "acme/api" })),
         )
         .await
     }
@@ -222,6 +227,10 @@ async fn connect_inserts_repository_and_queues_job() {
         env.jobs(repo_id).await,
         vec![("queued".into(), "connect".into(), false)]
     );
+    assert_eq!(
+        env.repo_state(repo_id).await,
+        ("connected".into(), None, 99)
+    );
 
     let (status, body) = env.connect().await;
     assert_eq!(status, StatusCode::CONFLICT);
@@ -235,11 +244,47 @@ async fn connect_without_access_is_not_found() {
         .call(
             "POST",
             "/api/repositories",
-            Some(json!({ "fullName": "acme/secret", "installationId": 42 })),
+            Some(json!({ "fullName": "acme/secret" })),
         )
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(error_code(&body), "repository_not_accessible");
+}
+
+#[tokio::test]
+async fn connect_without_the_app_installed_is_not_accessible() {
+    let env = setup().await;
+    let (status, body) = env
+        .call(
+            "POST",
+            "/api/repositories",
+            Some(json!({ "fullName": "acme/private" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(error_code(&body), "repository_not_accessible");
+    let count: i64 = env
+        .state
+        .db
+        .read(|conn| conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0)))
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn connect_ignores_a_client_installation_id() {
+    let env = setup().await;
+    let (status, body) = env
+        .call(
+            "POST",
+            "/api/repositories",
+            Some(json!({ "fullName": "acme/api", "installationId": 42 })),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {body}");
+    let id = body["id"].as_i64().unwrap();
+    assert_eq!(env.repo_state(id).await, ("connected".into(), None, 99));
 }
 
 #[tokio::test]
@@ -262,7 +307,7 @@ async fn sso_member_lists_and_connects_through_the_app_installations() {
         "POST",
         "/api/repositories",
         &cookie,
-        Some(json!({ "fullName": "acme/secret", "installationId": 99 })),
+        Some(json!({ "fullName": "acme/secret" })),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
@@ -273,7 +318,7 @@ async fn sso_member_lists_and_connects_through_the_app_installations() {
         "POST",
         "/api/repositories",
         &cookie,
-        Some(json!({ "fullName": "acme/api", "installationId": 42 })),
+        Some(json!({ "fullName": "acme/api" })),
     )
     .await;
     assert!(status.is_success(), "{status} {body}");

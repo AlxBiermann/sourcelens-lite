@@ -223,6 +223,7 @@ fn register_sqlite_vec() {
 fn open_connection(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch(CONNECTION_PRAGMAS)?;
+    conn.set_prepared_statement_cache_capacity(64);
     Ok(conn)
 }
 
