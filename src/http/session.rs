@@ -25,6 +25,9 @@ pub const SECURE_SESSION_COOKIE: &str = "__Host-sl_session";
 pub const OAUTH_COOKIE: &str = "sl_oauth";
 pub const SECURE_OAUTH_COOKIE: &str = "__Host-sl_oauth";
 pub const SESSION_MAX_AGE: i64 = 30 * SECS_PER_DAY;
+/// Lifetime of a session started through single sign-on: shorter, so a deprovisioned account at
+/// the identity provider loses access to SourceLens soon.
+pub const SSO_SESSION_MAX_AGE: i64 = 7 * SECS_PER_DAY;
 /// Refresh this many seconds before the access token expires.
 const REFRESH_MARGIN: i64 = 60;
 /// Bytes of randomness in a session cookie value.
@@ -149,12 +152,20 @@ pub async fn current_user(headers: &HeaderMap, state: &AppState) -> ApiResult<Op
     Ok(user)
 }
 
-/// Inserts the session row and returns the cookie value. SSO sessions have no GitHub token.
+/// A new session: the cookie value and its lifetime in seconds.
+#[derive(Debug, Clone)]
+pub struct NewSession {
+    pub value: String,
+    pub max_age: i64,
+}
+
+/// Inserts the session row, valid for `max_age` seconds. SSO sessions have no GitHub token.
 pub async fn create_session(
     state: &AppState,
     user_id: i64,
     token: Option<&GhToken>,
-) -> ApiResult<String> {
+    max_age: i64,
+) -> ApiResult<NewSession> {
     let value = random_hex(SESSION_ID_BYTES);
     let hash = sha256_hex(value.as_bytes());
     let sealed = token.map(|t| seal_token(state, t)).transpose()?;
@@ -166,11 +177,11 @@ pub async fn create_session(
             conn.execute(
                 "INSERT INTO sessions (id_hash, user_id, gh_token, created_at, expires_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![hash, user_id, sealed, ts, ts + SESSION_MAX_AGE],
+                params![hash, user_id, sealed, ts, ts + max_age],
             )
         })
         .await?;
-    Ok(value)
+    Ok(NewSession { value, max_age })
 }
 
 /// Deletes the session with this cookie hash.

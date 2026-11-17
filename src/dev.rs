@@ -122,8 +122,8 @@ async fn login(State(state): State<AppState>, Query(query): Query<LoginQuery>) -
     };
     let target = safe_next(query.next).unwrap_or_else(|| HOME.to_string());
     match sign_in(&state, account).await {
-        Ok(session_value) => (
-            AppendHeaders([session_header(&state, &session_value)]),
+        Ok(session) => (
+            AppendHeaders([session_header(&state, &session)]),
             Redirect::to(&target),
         )
             .into_response(),
@@ -134,8 +134,8 @@ async fn login(State(state): State<AppState>, Query(query): Query<LoginQuery>) -
     }
 }
 
-/// Session cookie value of a new session of the dev account.
-async fn sign_in(state: &AppState, account: &'static DevAccount) -> ApiResult<String> {
+/// A new session of the dev account.
+async fn sign_in(state: &AppState, account: &'static DevAccount) -> ApiResult<session::NewSession> {
     let id = state
         .db
         .write(move |conn| -> rusqlite::Result<i64> {
@@ -147,7 +147,7 @@ async fn sign_in(state: &AppState, account: &'static DevAccount) -> ApiResult<St
             Ok(id)
         })
         .await?;
-    session::create_session(state, id, None).await
+    session::create_session(state, id, None, session::SESSION_MAX_AGE).await
 }
 
 // ── Demo data ────────────────────────────────────────────────────────────────

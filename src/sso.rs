@@ -580,13 +580,14 @@ fn identity(settings: &StoredSettings, id_token: &str, nonce: &str) -> ApiResult
         return Err(sso_error("The ID token has no subject."));
     }
 
-    // Only an explicit "not verified" disqualifies the address; providers differ in its type.
-    let unverified = match &claims.email_verified {
-        Some(Value::Bool(false)) => true,
-        Some(Value::String(value)) => value == "false",
+    // The address counts only when the provider marks it verified, as a boolean or, with some
+    // providers, the string "true"; a missing claim does not count.
+    let verified = match &claims.email_verified {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::String(value)) => value.eq_ignore_ascii_case("true"),
         _ => false,
     };
-    let email = non_empty(claims.email).filter(|_| !unverified);
+    let email = non_empty(claims.email).filter(|_| verified);
     let login = match &email {
         Some(email) => email.to_lowercase(),
         None => non_empty(claims.preferred_username).unwrap_or_else(|| claims.sub.clone()),

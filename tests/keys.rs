@@ -187,6 +187,86 @@ async fn keys_api_through_the_router() {
 }
 
 #[tokio::test]
+async fn members_manage_only_their_own_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = new_state(&tmp, |_| {});
+    insert_repo_async(&state, 1, "acme/api", "connected").await;
+    let admin = owner_session(&state, "octocat").await;
+    let member = member_session(&state, "alex").await;
+    let app = &sourcelens::http::router(state.clone());
+    let new_key =
+        |name: &str| json!({ "name": name, "expiresInDays": null, "repositoryIds": null });
+
+    let (status, created, _) = api(app, "POST", "/api/keys", &admin, Some(new_key("admin"))).await;
+    assert!(status.is_success(), "{created}");
+    let admin_key = created["key"]["id"].as_i64().unwrap();
+    let (status, created, _) = api(app, "POST", "/api/keys", &member, Some(new_key("own"))).await;
+    assert!(status.is_success(), "{created}");
+    let own_key = created["key"]["id"].as_i64().unwrap();
+
+    let ids = |listed: &serde_json::Value| -> Vec<i64> {
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k["id"].as_i64().unwrap())
+            .collect()
+    };
+    let (status, listed, _) = api(app, "GET", "/api/keys", &member, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&listed), vec![own_key]);
+    let (status, listed, _) = api(app, "GET", "/api/keys", &admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&listed), vec![own_key, admin_key]);
+
+    let admin_uri = format!("/api/keys/{admin_key}");
+    let rename = json!({ "name": "taken over" });
+    let (status, body, _) = api(app, "PATCH", &admin_uri, &member, Some(rename.clone())).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "key_not_found");
+    let (status, body, _) = api(app, "DELETE", &admin_uri, &member, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "key_not_found");
+    let name: String = state
+        .db
+        .read(move |c| {
+            c.query_row(
+                "SELECT name FROM api_keys WHERE id = ?1",
+                [admin_key],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(name, "admin");
+
+    let own_uri = format!("/api/keys/{own_key}");
+    let (status, patched, _) = api(app, "PATCH", &own_uri, &member, Some(rename.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    assert_eq!(patched["name"], "taken over");
+    let (status, _, _) = api(app, "DELETE", &own_uri, &member, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Admins change any key, also one without a creator.
+    let (status, patched, _) = api(app, "PATCH", &admin_uri, &admin, Some(rename)).await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    let input = NewKey {
+        name: "orphan".into(),
+        expires_in_days: None,
+        repository_ids: None,
+    };
+    let (orphan, _) = keys::create_key(&state, input, None).await.unwrap();
+    let orphan_uri = format!("/api/keys/{}", orphan.id);
+    let (status, listed, _) = api(app, "GET", "/api/keys", &member, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(ids(&listed).is_empty());
+    let (status, _, _) = api(app, "DELETE", &orphan_uri, &member, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = api(app, "DELETE", &orphan_uri, &admin, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn demoting_an_sso_admin_revokes_their_api_keys() {
     let tmp = tempfile::tempdir().unwrap();
     let state = new_state(&tmp, |_| {});

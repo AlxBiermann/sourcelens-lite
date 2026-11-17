@@ -11,6 +11,7 @@ use crate::crypto::{random_hex, sha256_hex};
 use crate::error::{ApiError, ApiResult};
 use crate::http::session::KeyUser;
 use crate::http::{Body, PathId};
+use crate::model::Role;
 use crate::repositories::{self, LISTED_IDS};
 use crate::state::{lock, now, AppState, SECS_PER_DAY};
 
@@ -77,8 +78,16 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
-async fn list(State(state): State<AppState>, _user: KeyUser) -> ApiResult<Json<Vec<ApiKey>>> {
-    let keys = state.db.read(|conn| load_keys(conn, None)).await?;
+/// The caller's own keys; admins see all.
+async fn list(
+    State(state): State<AppState>,
+    KeyUser(user): KeyUser,
+) -> ApiResult<Json<Vec<ApiKey>>> {
+    let created_by = (user.role != Role::Owner).then_some(user.id);
+    let keys = state
+        .db
+        .read(move |conn| load_keys(conn, None, created_by))
+        .await?;
     Ok(Json(keys))
 }
 
@@ -91,9 +100,10 @@ async fn create(
     Ok(Json(CreatedKey { key, secret }))
 }
 
+/// Changes one of the caller's own keys; admins may change any key.
 async fn update(
     State(state): State<AppState>,
-    _user: KeyUser,
+    KeyUser(user): KeyUser,
     PathId(id): PathId,
     Body(input): Body<KeyUpdate>,
 ) -> ApiResult<Json<ApiKey>> {
@@ -105,12 +115,17 @@ async fn update(
         Some(Some(ids)) => Some(Some(valid_repository_ids(ids)?)),
         other => other,
     };
+    let all = user.role == Role::Owner;
     let key = state
         .db
         .write(move |conn| -> ApiResult<ApiKey> {
             let tx = conn.transaction()?;
             let exists: Option<i64> = tx
-                .query_row("SELECT id FROM api_keys WHERE id = ?1", [id], |r| r.get(0))
+                .query_row(
+                    "SELECT id FROM api_keys WHERE id = ?1 AND (?2 OR created_by = ?3)",
+                    params![id, all, user.id],
+                    |r| r.get(0),
+                )
                 .optional()?;
             if exists.is_none() {
                 return Err(key_not_found());
@@ -124,7 +139,7 @@ async fn update(
             if let Some(scope) = &scope {
                 replace_scope(&tx, id, scope.as_deref())?;
             }
-            let key = load_keys(&tx, Some(id))?.pop();
+            let key = load_keys(&tx, Some(id), None)?.pop();
             tx.commit()?;
             key.ok_or_else(key_not_found)
         })
@@ -132,14 +147,21 @@ async fn update(
     Ok(Json(key))
 }
 
+/// Deletes one of the caller's own keys; admins may delete any key.
 async fn remove(
     State(state): State<AppState>,
-    _user: KeyUser,
+    KeyUser(user): KeyUser,
     PathId(id): PathId,
 ) -> ApiResult<StatusCode> {
+    let all = user.role == Role::Owner;
     let deleted = state
         .db
-        .write(move |conn| conn.execute("DELETE FROM api_keys WHERE id = ?1", [id]))
+        .write(move |conn| {
+            conn.execute(
+                "DELETE FROM api_keys WHERE id = ?1 AND (?2 OR created_by = ?3)",
+                params![id, all, user.id],
+            )
+        })
         .await?;
     if deleted == 0 {
         return Err(key_not_found());
@@ -186,7 +208,7 @@ pub async fn create_key(
             if let Some(ids) = &repository_ids {
                 replace_scope(&tx, id, Some(ids))?;
             }
-            let key = load_keys(&tx, Some(id))?.pop();
+            let key = load_keys(&tx, Some(id), None)?.pop();
             tx.commit()?;
             key.ok_or_else(key_not_found)
         })
@@ -238,15 +260,23 @@ fn replace_scope(tx: &Transaction<'_>, key_id: i64, ids: Option<&[i64]>) -> ApiR
     Ok(())
 }
 
-/// All keys (newest first), or the key with `only_id`.
-fn load_keys(conn: &Connection, only_id: Option<i64>) -> rusqlite::Result<Vec<ApiKey>> {
+/// All keys (newest first), or the key with `only_id`; with `created_by`, only keys of that user.
+fn load_keys(
+    conn: &Connection,
+    only_id: Option<i64>,
+    created_by: Option<i64>,
+) -> rusqlite::Result<Vec<ApiKey>> {
     let mut scopes: HashMap<i64, Vec<i64>> = HashMap::new();
     {
         let mut stmt = conn.prepare(&format!(
             "SELECT key_id, repo_id FROM api_key_repos
-             WHERE (?1 IS NULL OR key_id = ?1) AND repo_id IN ({LISTED_IDS}) ORDER BY repo_id"
+             WHERE (?1 IS NULL OR key_id = ?1)
+               AND (?2 IS NULL OR key_id IN (SELECT id FROM api_keys WHERE created_by = ?2))
+               AND repo_id IN ({LISTED_IDS}) ORDER BY repo_id"
         ))?;
-        let rows = stmt.query_map([only_id], |r| Ok((r.get::<_, i64>(0)?, r.get(1)?)))?;
+        let rows = stmt.query_map(params![only_id, created_by], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get(1)?))
+        })?;
         for row in rows {
             let (key_id, repo_id) = row?;
             scopes.entry(key_id).or_default().push(repo_id);
@@ -256,11 +286,11 @@ fn load_keys(conn: &Connection, only_id: Option<i64>) -> rusqlite::Result<Vec<Ap
         "SELECT k.id, k.name, k.last4, k.all_repos, u.login, k.created_at, k.expires_at,
                 k.last_used_at
          FROM api_keys k LEFT JOIN users u ON u.id = k.created_by
-         WHERE ?1 IS NULL OR k.id = ?1
+         WHERE (?1 IS NULL OR k.id = ?1) AND (?2 IS NULL OR k.created_by = ?2)
          ORDER BY k.id DESC",
     )?;
     let keys = stmt
-        .query_map([only_id], |r| {
+        .query_map(params![only_id, created_by], |r| {
             let id: i64 = r.get(0)?;
             let all_repositories: bool = r.get(3)?;
             Ok(ApiKey {

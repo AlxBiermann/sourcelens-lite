@@ -22,7 +22,7 @@ use sourcelens::crypto::{random_hex, sha256_hex};
 use sourcelens::error::{ApiError, GitHubFailure};
 use sourcelens::github::app::GitHub;
 use sourcelens::github::oauth::{resolve_user, GhToken, GhUser, Resolution, TokenError};
-use sourcelens::http::session::{create_session, user_token_with, AuthUser};
+use sourcelens::http::session::{create_session, user_token_with, AuthUser, SESSION_MAX_AGE};
 use sourcelens::model::{Provider, Role};
 use sourcelens::state::{now, AppState};
 
@@ -1084,7 +1084,10 @@ async fn expired_session(state: &AppState) -> AuthUser {
         refresh_token: Some("ghr_once".into()),
         expires_at: now() - 10,
     };
-    let cookie = create_session(state, owner, Some(&token)).await.unwrap();
+    let cookie = create_session(state, owner, Some(&token), SESSION_MAX_AGE)
+        .await
+        .unwrap()
+        .value;
     AuthUser {
         id: owner,
         login: "octocat".into(),

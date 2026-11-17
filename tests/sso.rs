@@ -448,6 +448,24 @@ async fn sso_accounts_wait_for_approval_and_can_become_admins() {
     assert_eq!(location(&reply), "/repositories");
     let session = set_cookie_value(&reply.headers, SESSION_COOKIE).expect("session cookie");
     assert_eq!(set_cookie_value(&reply.headers, OAUTH_COOKIE), None);
+    let session_cookie = reply
+        .headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with(&format!("{SESSION_COOKIE}=")))
+        .unwrap();
+    assert!(
+        session_cookie.contains("Max-Age=604800"),
+        "SSO sessions last 7 days: {session_cookie}"
+    );
+    let lifetime = scalar(
+        &inst.state,
+        "SELECT s.expires_at - s.created_at FROM sessions s JOIN users u ON u.id = s.user_id
+         WHERE u.sso_sub = 'user-1'",
+    )
+    .await;
+    assert_eq!(lifetime, 604_800);
 
     let (status, body, _) = api(app, "GET", "/api/state", &session, None).await;
     assert_eq!(status, StatusCode::OK);
@@ -506,11 +524,14 @@ async fn sso_accounts_wait_for_approval_and_can_become_admins() {
     assert_eq!(error_code(&body), "cannot_change_own_role");
 }
 
+/// Changes the claims of an otherwise valid ID token.
+type Mutation = Box<dyn Fn(&mut Value)>;
+
 #[tokio::test]
 async fn id_token_claims_are_checked() {
     let inst = instance().await;
     let issuer = inst.idp.base().to_string();
-    let cases: [(&str, Box<dyn Fn(&mut Value)>); 5] = [
+    let cases: [(&str, Mutation); 5] = [
         (
             "issuer",
             Box::new(|c: &mut Value| c["iss"] = json!("https://evil.example")),
@@ -564,6 +585,27 @@ async fn id_token_claims_are_checked() {
     assert_eq!(
         (login.as_str(), email, status.as_str()),
         ("Grace", None, "pending")
+    );
+
+    // A missing `email_verified` claim counts as unverified too.
+    let reply = sign_in(&inst, |nonce| {
+        json!({
+            "iss": issuer,
+            "sub": "user-4",
+            "aud": CLIENT_ID,
+            "exp": now() + 300,
+            "nonce": nonce,
+            "email": "linus@example.com",
+            "preferred_username": "Linus",
+        })
+    })
+    .await;
+    assert_eq!(location(&reply), "/login?error=pending_approval");
+    let id = sso_user_id(&inst.state, "user-4").await;
+    let (login, email, status, _) = user_row(&inst.state, id).await;
+    assert_eq!(
+        (login.as_str(), email, status.as_str()),
+        ("Linus", None, "pending")
     );
 }
 

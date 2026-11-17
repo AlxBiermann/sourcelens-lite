@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::crypto::{pkce_challenge, random_hex, sha256_hex};
 use crate::error::{ApiError, ApiResult};
 use crate::github::oauth::{self, Resolution};
-use crate::http::session::{self, clear_cookie, cookie, oauth_cookie, session_cookie, set_cookie};
+use crate::http::session::{
+    self, clear_cookie, cookie, oauth_cookie, session_cookie, set_cookie, NewSession,
+};
 use crate::http::setup::setup_token_valid;
 use crate::sso::{self, SignIn};
 use crate::state::AppState;
@@ -158,15 +160,15 @@ fn checked_callback<T: DeserializeOwned>(
     (returned_state == saved_state(&saved)).then_some((saved, code))
 }
 
-/// `Set-Cookie` header that starts the session with this cookie value.
-pub(crate) fn session_header(state: &AppState, session_value: &str) -> (HeaderName, String) {
+/// `Set-Cookie` header that starts this session.
+pub(crate) fn session_header(state: &AppState, session: &NewSession) -> (HeaderName, String) {
     (
         SET_COOKIE,
         set_cookie(
             state,
             session_cookie(&state.cfg),
-            session_value,
-            session::SESSION_MAX_AGE,
+            &session.value,
+            session.max_age,
         ),
     )
 }
@@ -175,15 +177,15 @@ pub(crate) fn session_header(state: &AppState, session_value: &str) -> (HeaderNa
 /// `target`, goes to the refusal redirect, or logs the error and goes to `failure`.
 fn finish_callback(
     state: &AppState,
-    outcome: ApiResult<Result<String, &'static str>>,
+    outcome: ApiResult<Result<NewSession, &'static str>>,
     target: &str,
     failure: &'static str,
     provider: &str,
 ) -> Response {
     let clear_oauth = (SET_COOKIE, clear_cookie(state, oauth_cookie(&state.cfg)));
     match outcome {
-        Ok(Ok(session_value)) => (
-            AppendHeaders([clear_oauth, session_header(state, &session_value)]),
+        Ok(Ok(session)) => (
+            AppendHeaders([clear_oauth, session_header(state, &session)]),
             Redirect::to(target),
         )
             .into_response(),
@@ -218,12 +220,12 @@ async fn callback(
     finish_callback(&state, outcome, target, "/login?error=github", "GitHub")
 }
 
-/// `Ok(Ok(cookie value))` on success, `Ok(Err(redirect target))` when the user may not sign in.
+/// `Ok(Ok(new session))` on success, `Ok(Err(redirect target))` when the user may not sign in.
 async fn finish_login(
     state: &AppState,
     code: &str,
     claim: bool,
-) -> ApiResult<Result<String, &'static str>> {
+) -> ApiResult<Result<NewSession, &'static str>> {
     let creds = state
         .github
         .credentials()
@@ -232,7 +234,13 @@ async fn finish_login(
     let token = oauth::exchange_code(state, &creds, code).await?;
     let user = oauth::fetch_user(state, &token.access_token).await?;
     match oauth::resolve_user(&state.db, &user, claim).await? {
-        Resolution::User(id) => Ok(Ok(session::create_session(state, id, Some(&token)).await?)),
+        Resolution::User(id) => Ok(Ok(session::create_session(
+            state,
+            id,
+            Some(&token),
+            session::SESSION_MAX_AGE,
+        )
+        .await?)),
         Resolution::NotInvited => Ok(Err("/login?error=not_invited")),
         Resolution::SetupRequired => Ok(Err("/login?error=setup_required")),
     }
@@ -285,15 +293,21 @@ async fn sso_callback(
     finish_callback(&state, outcome, target, "/login?error=sso", "SSO")
 }
 
-/// `Ok(Ok(cookie value))` on success, `Ok(Err(redirect target))` when the user may not sign in.
+/// `Ok(Ok(new session))` on success, `Ok(Err(redirect target))` when the user may not sign in.
 async fn finish_sso_login(
     state: &AppState,
     code: &str,
     saved: &SsoCookie,
-) -> ApiResult<Result<String, &'static str>> {
+) -> ApiResult<Result<NewSession, &'static str>> {
     let identity = sso::exchange(state, code, &saved.verifier, &saved.nonce).await?;
     match sso::resolve_user(&state.db, &identity).await? {
-        SignIn::User(id) => Ok(Ok(session::create_session(state, id, None).await?)),
+        SignIn::User(id) => Ok(Ok(session::create_session(
+            state,
+            id,
+            None,
+            session::SSO_SESSION_MAX_AGE,
+        )
+        .await?)),
         SignIn::Pending => Ok(Err("/login?error=pending_approval")),
         SignIn::SetupRequired => Ok(Err("/login?error=setup_required")),
     }

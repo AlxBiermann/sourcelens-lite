@@ -11,7 +11,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use common::{
     api, credentials, error_code, mcp_request, member_session, new_state, owner_session, request,
-    send, serve, Reply, PUBLIC_URL,
+    scalar, send, serve, sso_session, Reply, PUBLIC_URL,
 };
 use reqwest::Url;
 use serde_json::{json, Value};
@@ -725,6 +725,64 @@ async fn expired_refresh_token_is_refused() {
     )
     .await;
     assert_eq!(oauth_error(&reply), "invalid_grant");
+}
+
+/// Sets `last_login_at` of the user `login` to `days` days ago.
+async fn signed_in_days_ago(state: &AppState, login: &'static str, days: i64) {
+    state
+        .db
+        .write(move |conn| {
+            conn.execute(
+                "UPDATE users SET last_login_at = ?1 WHERE login = ?2",
+                rusqlite::params![now() - days * 86_400, login],
+            )
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn sso_grants_stop_refreshing_30_days_after_the_last_sign_in() {
+    let env = env();
+    let kim = sso_session(&env.state, "kim", "member").await;
+    let (client_id, tokens) = connect(&env.app, &kim).await;
+    let refresh_token = tokens["refresh_token"].as_str().unwrap();
+
+    signed_in_days_ago(&env.state, "kim", 31).await;
+    let reply = refresh(&env.app, &client_id, refresh_token).await;
+    assert_eq!(oauth_error(&reply), "invalid_grant");
+    assert_eq!(
+        reply.body["error_description"],
+        "Your single sign-on is older than 30 days. Sign in to SourceLens again, then retry."
+    );
+    // The grant stays, with the same refresh token.
+    assert_eq!(
+        scalar(&env.state, "SELECT count(*) FROM oauth_grants").await,
+        1
+    );
+
+    // After a new SSO sign-in the same refresh token works again.
+    signed_in_days_ago(&env.state, "kim", 0).await;
+    let reply = refresh(&env.app, &client_id, refresh_token).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    let access = reply.body["access_token"].as_str().unwrap();
+    assert_eq!(tools_list(&env.app, access).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn github_grants_refresh_regardless_of_the_last_sign_in() {
+    let env = env();
+    let owner = owner_session(&env.state, "octocat").await;
+    let (client_id, tokens) = connect(&env.app, &owner).await;
+
+    signed_in_days_ago(&env.state, "octocat", 31).await;
+    let reply = refresh(
+        &env.app,
+        &client_id,
+        tokens["refresh_token"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
 }
 
 #[tokio::test]

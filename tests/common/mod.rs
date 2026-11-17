@@ -14,7 +14,9 @@ use sourcelens::db::Db;
 use sourcelens::github::app::AppCredentials;
 use sourcelens::github::oauth::GhToken;
 use sourcelens::http;
-use sourcelens::http::session::{create_session, SESSION_COOKIE};
+use sourcelens::http::session::{
+    create_session, SESSION_COOKIE, SESSION_MAX_AGE, SSO_SESSION_MAX_AGE,
+};
 use sourcelens::index::store;
 use sourcelens::state::{now, AppState};
 use tempfile::TempDir;
@@ -173,7 +175,10 @@ pub async fn session_for(state: &AppState, user_id: i64) -> String {
         refresh_token: None,
         expires_at: i64::MAX,
     };
-    create_session(state, user_id, Some(&token)).await.unwrap()
+    create_session(state, user_id, Some(&token), SESSION_MAX_AGE)
+        .await
+        .unwrap()
+        .value
 }
 
 /// Session cookie value of a new owner.
@@ -210,7 +215,10 @@ pub async fn sso_session(state: &AppState, login: &str, role: &str) -> String {
         })
         .await
         .unwrap();
-    create_session(state, user_id, None).await.unwrap()
+    create_session(state, user_id, None, SSO_SESSION_MAX_AGE)
+        .await
+        .unwrap()
+        .value
 }
 
 // ── HTTP ─────────────────────────────────────────────────────────────────────

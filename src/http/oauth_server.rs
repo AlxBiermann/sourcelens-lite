@@ -28,6 +28,9 @@ pub const REFRESH_PREFIX: &str = "slr_";
 pub const CLIENT_PREFIX: &str = "slc_";
 const ACCESS_TTL: i64 = 3600;
 const REFRESH_TTL: i64 = 30 * SECS_PER_DAY;
+/// Grants of SSO users stop refreshing this long after the user's last SSO sign-in, so access ends
+/// once the identity provider no longer lets the user in.
+const SSO_SIGN_IN_MAX_AGE: i64 = 30 * SECS_PER_DAY;
 const CODE_TTL: i64 = 60;
 const MAX_REDIRECT_URIS: usize = 5;
 const MAX_REDIRECT_URI_BYTES: usize = 512;
@@ -688,6 +691,9 @@ async fn redeem_code(state: &AppState, form: TokenForm) -> Result<Value, Failure
 enum Presented {
     /// The current, unexpired refresh token of the grant.
     Current(i64),
+    /// The current refresh token of a grant whose SSO user last signed in more than
+    /// [`SSO_SIGN_IN_MAX_AGE`] ago.
+    SignInTooOld,
     /// The refresh token the grant's last rotation replaced.
     Replaced(i64),
 }
@@ -709,19 +715,23 @@ async fn refresh(state: &AppState, form: TokenForm) -> Result<Value, Failure> {
         .read({
             let old_hash = old_hash.clone();
             move |conn| {
+                let ts = now();
                 conn.query_row(
-                    "SELECT id, refresh_hash = ?1 FROM oauth_grants
-                     WHERE client_hash = ?2
-                       AND ((refresh_hash = ?1 AND refresh_expires_at > ?3)
-                            OR prev_refresh_hash = ?1)",
-                    params![old_hash, client_hash, now()],
+                    "SELECT g.id, g.refresh_hash = ?1,
+                            u.sso_sub IS NULL OR COALESCE(u.last_login_at, 0) > ?4
+                     FROM oauth_grants g JOIN users u ON u.id = g.user_id
+                     WHERE g.client_hash = ?2
+                       AND ((g.refresh_hash = ?1 AND g.refresh_expires_at > ?3)
+                            OR g.prev_refresh_hash = ?1)",
+                    params![old_hash, client_hash, ts, ts - SSO_SIGN_IN_MAX_AGE],
                     |row| {
                         let id: i64 = row.get(0)?;
                         let current: bool = row.get(1)?;
-                        Ok(if current {
-                            Presented::Current(id)
-                        } else {
-                            Presented::Replaced(id)
+                        let signed_in: bool = row.get(2)?;
+                        Ok(match (current, signed_in) {
+                            (true, true) => Presented::Current(id),
+                            (true, false) => Presented::SignInTooOld,
+                            (false, _) => Presented::Replaced(id),
                         })
                     },
                 )
@@ -732,6 +742,11 @@ async fn refresh(state: &AppState, form: TokenForm) -> Result<Value, Failure> {
         .ok_or_else(rejected)?;
     let grant_id = match presented {
         Presented::Current(grant_id) => grant_id,
+        Presented::SignInTooOld => {
+            return Err(invalid_grant(
+                "Your single sign-on is older than 30 days. Sign in to SourceLens again, then retry.",
+            ));
+        }
         Presented::Replaced(grant_id) => {
             state
                 .db
