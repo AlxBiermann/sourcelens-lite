@@ -42,10 +42,38 @@ const GRANT_TYPES: [&str; 2] = ["authorization_code", "refresh_token"];
 /// Redirect URI schemes that would run or read content in the browser, or start a system handler
 /// or another protocol, instead of returning to an app.
 const FORBIDDEN_SCHEMES: &[&str] = &[
-    "javascript", "data", "vbscript", "file", "blob", "about", "search", "search-ms", "shell",
-    "res", "mk", "view-source", "jar", "ftp", "ws", "wss", "mailto", "tel", "sms", "chrome",
-    "chrome-extension", "moz-extension", "filesystem", "intent", "microsoft-edge", "onenote",
-    "smb", "itms-services", "mhtml", "its", "ldap", "telnet",
+    "javascript",
+    "data",
+    "vbscript",
+    "file",
+    "blob",
+    "about",
+    "search",
+    "search-ms",
+    "shell",
+    "res",
+    "mk",
+    "view-source",
+    "jar",
+    "ftp",
+    "ws",
+    "wss",
+    "mailto",
+    "tel",
+    "sms",
+    "chrome",
+    "chrome-extension",
+    "moz-extension",
+    "filesystem",
+    "intent",
+    "microsoft-edge",
+    "onenote",
+    "smb",
+    "itms-services",
+    "mhtml",
+    "its",
+    "ldap",
+    "telnet",
 ];
 /// Windows protocol handlers (`ms-msdt:`, `ms-officecmd:`, …) are all refused.
 const FORBIDDEN_SCHEME_PREFIX: &str = "ms-";
@@ -68,10 +96,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/oauth/register", post(register))
         .route("/oauth/token", post(token))
-        .route(
-            "/api/oauth/authorize",
-            get(authorize_info).post(authorize),
-        )
+        .route("/api/oauth/authorize", get(authorize_info).post(authorize))
         .route("/api/oauth/grants", get(list_grants))
         .route("/api/oauth/grants/{id}", delete(revoke_grant))
 }
@@ -198,7 +223,12 @@ fn registered_client(state: &AppState, body: &[u8]) -> Result<Value, Failure> {
     }
     let name = input
         .client_name
-        .map(|name| name.trim().chars().take(MAX_CLIENT_NAME_CHARS).collect::<String>())
+        .map(|name| {
+            name.trim()
+                .chars()
+                .take(MAX_CLIENT_NAME_CHARS)
+                .collect::<String>()
+        })
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| DEFAULT_CLIENT_NAME.to_string());
     let sealed = SealedClient {
@@ -329,7 +359,12 @@ fn target(state: &AppState, params: &AuthorizeParams) -> ApiResult<Target> {
     let redirect = params
         .redirect_uri
         .as_deref()
-        .filter(|uri| client.redirect_uris.iter().any(|registered| registered == *uri))
+        .filter(|uri| {
+            client
+                .redirect_uris
+                .iter()
+                .any(|registered| registered == *uri)
+        })
         .filter(|uri| valid_redirect_uri(uri))
         .and_then(|uri| Url::parse(uri).ok())
         .ok_or_else(|| {
@@ -615,7 +650,9 @@ async fn redeem_code(state: &AppState, form: TokenForm) -> Result<Value, Failure
                 .optional()?
                 .is_some();
             if !user_exists {
-                return Err(invalid_grant("The user who allowed this client no longer exists."));
+                return Err(invalid_grant(
+                    "The user who allowed this client no longer exists.",
+                ));
             }
             tx.execute(
                 "DELETE FROM oauth_grants WHERE refresh_expires_at <= ?1",
@@ -660,9 +697,7 @@ enum Presented {
 /// revoked, so neither the client nor the copy keeps access.
 async fn refresh(state: &AppState, form: TokenForm) -> Result<Value, Failure> {
     let (Some(refresh_token), Some(client_id)) = (form.refresh_token, form.client_id) else {
-        return Err(invalid_grant(
-            "refresh_token and client_id are required.",
-        ));
+        return Err(invalid_grant("refresh_token and client_id are required."));
     };
     let old_hash = sha256_hex(refresh_token.as_bytes());
     let client_hash = sha256_hex(client_id.as_bytes());

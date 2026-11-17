@@ -245,7 +245,10 @@ async fn metadata_documents_describe_the_server() {
         meta["grant_types_supported"],
         json!(["authorization_code", "refresh_token"])
     );
-    assert_eq!(meta["token_endpoint_auth_methods_supported"], json!(["none"]));
+    assert_eq!(
+        meta["token_endpoint_auth_methods_supported"],
+        json!(["none"])
+    );
     assert_eq!(meta["code_challenge_methods_supported"], json!(["S256"]));
 
     let reply = send(
@@ -276,8 +279,14 @@ async fn registration_checks_redirect_uris_and_stores_nothing() {
         json!(["https://example.com/callback#fragment"]),
         json!([format!("https://example.com/{}", "a".repeat(520))]),
         json!([]),
-        json!(["https://a.example/1", "https://a.example/2", "https://a.example/3",
-               "https://a.example/4", "https://a.example/5", "https://a.example/6"]),
+        json!([
+            "https://a.example/1",
+            "https://a.example/2",
+            "https://a.example/3",
+            "https://a.example/4",
+            "https://a.example/5",
+            "https://a.example/6"
+        ]),
     ] {
         let reply = register(&env.app, json!({ "redirect_uris": uris })).await;
         assert_eq!(oauth_error(&reply), "invalid_redirect_uri", "{uris}");
@@ -369,7 +378,11 @@ async fn consent_page_separates_page_errors_from_redirect_errors() {
         ("response_type", json!("token"), "unsupported_response_type"),
         ("code_challenge_method", json!("plain"), "invalid_request"),
         ("code_challenge", json!("too-short"), "invalid_request"),
-        ("resource", json!("https://other.example/mcp"), "invalid_target"),
+        (
+            "resource",
+            json!("https://other.example/mcp"),
+            "invalid_target",
+        ),
     ] {
         let mut params = authorize_params(&client_id);
         params[field] = value;
@@ -393,7 +406,10 @@ async fn consent_page_separates_page_errors_from_redirect_errors() {
 
     let denied = decide(&env.app, &owner, authorize_params(&client_id), false).await;
     assert!(denied.as_str().starts_with(REDIRECT_URI), "{denied}");
-    assert_eq!(query_param(&denied, "error").as_deref(), Some("access_denied"));
+    assert_eq!(
+        query_param(&denied, "error").as_deref(),
+        Some("access_denied")
+    );
     assert_eq!(query_param(&denied, "state").as_deref(), Some(CLIENT_STATE));
     assert_eq!(query_param(&denied, "code"), None);
 }
@@ -403,7 +419,11 @@ async fn request_errors_of_an_attacker_client_wait_for_the_user() {
     let env = env();
     let owner = owner_session(&env.state, "octocat").await;
     let evil = "https://evil.example/cb";
-    let reply = register(&env.app, json!({ "redirect_uris": [evil], "client_name": "Evil" })).await;
+    let reply = register(
+        &env.app,
+        json!({ "redirect_uris": [evil], "client_name": "Evil" }),
+    )
+    .await;
     assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.text);
     let mut params = authorize_params(reply.body["client_id"].as_str().unwrap());
     params["redirect_uri"] = json!(evil);
@@ -499,9 +519,7 @@ async fn full_flow_gives_access_to_mcp() {
     let stored: String = env
         .state
         .db
-        .read(|conn| {
-            conn.query_row("SELECT access_hash FROM oauth_grants", [], |row| row.get(0))
-        })
+        .read(|conn| conn.query_row("SELECT access_hash FROM oauth_grants", [], |row| row.get(0)))
         .await
         .unwrap();
     assert_eq!(stored, access_hash);
@@ -524,7 +542,13 @@ async fn wrong_verifier_or_client_spends_the_code() {
     let client_id = register_client(&env.app).await;
 
     let code = allow(&env.app, &owner, &client_id).await;
-    let reply = redeem(&env.app, &client_id, &code, "another-verifier-0123456789-0123456789-01").await;
+    let reply = redeem(
+        &env.app,
+        &client_id,
+        &code,
+        "another-verifier-0123456789-0123456789-01",
+    )
+    .await;
     assert_eq!(oauth_error(&reply), "invalid_grant");
     let reply = redeem(&env.app, &client_id, &code, VERIFIER).await;
     assert_eq!(oauth_error(&reply), "invalid_grant");
@@ -564,7 +588,9 @@ async fn token_endpoint_rejects_unknown_grants_and_bodies() {
 
     let req = Request::post("/oauth/token")
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(json!({ "grant_type": "refresh_token" }).to_string()))
+        .body(Body::from(
+            json!({ "grant_type": "refresh_token" }).to_string(),
+        ))
         .unwrap();
     let reply = send(&env.app, req).await;
     assert_eq!(oauth_error(&reply), "invalid_request");
@@ -594,7 +620,10 @@ async fn refresh_rotates_both_tokens() {
     assert!(new_refresh.starts_with("slr_") && new_refresh != old_refresh);
     assert_eq!(reply.body["expires_in"], 3600);
 
-    assert_eq!(tools_list(&env.app, old_access).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        tools_list(&env.app, old_access).await,
+        StatusCode::UNAUTHORIZED
+    );
     assert_eq!(tools_list(&env.app, new_access).await, StatusCode::OK);
 
     // An expired access token is refused; the refresh token still works.
@@ -603,7 +632,10 @@ async fn refresh_rotates_both_tokens() {
         .write(|conn| conn.execute("UPDATE oauth_grants SET access_expires_at = 0", []))
         .await
         .unwrap();
-    assert_eq!(tools_list(&env.app, new_access).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        tools_list(&env.app, new_access).await,
+        StatusCode::UNAUTHORIZED
+    );
     let reply = refresh(&env.app, &client_id, new_refresh).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
     let newest = reply.body["access_token"].as_str().unwrap();
@@ -667,7 +699,10 @@ async fn reusing_a_replaced_refresh_token_revokes_the_grant() {
 
     let reply = refresh(&env.app, &client_id, old_refresh).await;
     assert_eq!(oauth_error(&reply), "invalid_grant");
-    assert_eq!(tools_list(&env.app, new_access).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        tools_list(&env.app, new_access).await,
+        StatusCode::UNAUTHORIZED
+    );
     let reply = refresh(&env.app, &client_id, new_refresh).await;
     assert_eq!(oauth_error(&reply), "invalid_grant");
     assert!(grants(&env.app, &owner).await.is_empty());
@@ -683,7 +718,12 @@ async fn expired_refresh_token_is_refused() {
         .write(|conn| conn.execute("UPDATE oauth_grants SET refresh_expires_at = 0", []))
         .await
         .unwrap();
-    let reply = refresh(&env.app, &client_id, tokens["refresh_token"].as_str().unwrap()).await;
+    let reply = refresh(
+        &env.app,
+        &client_id,
+        tokens["refresh_token"].as_str().unwrap(),
+    )
+    .await;
     assert_eq!(oauth_error(&reply), "invalid_grant");
 }
 
@@ -698,7 +738,10 @@ async fn connecting_the_same_client_again_replaces_its_grant() {
 
     assert_eq!(grants(&env.app, &owner).await.len(), 1);
     let old_access = first["access_token"].as_str().unwrap();
-    assert_eq!(tools_list(&env.app, old_access).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        tools_list(&env.app, old_access).await,
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 // ── Grants ────────────────────────────────────────────────────────────────────
@@ -808,7 +851,11 @@ async fn github_sign_in_keeps_only_a_consent_page_next() {
             request("GET", &login_uri("/auth/github/login", next), None, None),
         )
         .await;
-        assert_eq!(sign_in_cookie(&state, &reply).1["next"], Value::Null, "{next}");
+        assert_eq!(
+            sign_in_cookie(&state, &reply).1["next"],
+            Value::Null,
+            "{next}"
+        );
     }
 }
 
@@ -908,7 +955,9 @@ async fn sso_sign_in_returns_to_the_consent_page() {
         );
         let oauth_state = query_param(&provider, "state").unwrap();
         let req = Request::builder()
-            .uri(format!("/auth/sso/callback?code=the-code&state={oauth_state}"))
+            .uri(format!(
+                "/auth/sso/callback?code=the-code&state={oauth_state}"
+            ))
             .header(header::COOKIE, format!("{OAUTH_COOKIE}={cookie}"))
             .body(Body::empty())
             .unwrap();

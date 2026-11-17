@@ -71,7 +71,10 @@ impl FromRequestParts<AppState> for Owner {
     ) -> Result<Self, Self::Rejection> {
         let user = AuthUser::from_request_parts(parts, state).await?;
         if user.role != Role::Owner {
-            return Err(ApiError::forbidden("owner_required", "Only admins can do this."));
+            return Err(ApiError::forbidden(
+                "owner_required",
+                "Only admins can do this.",
+            ));
         }
         Ok(Owner(user))
     }

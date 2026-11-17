@@ -92,10 +92,12 @@ impl Embedder {
     /// One request without retries, for a caller that waits on the answer (the search query):
     /// a failing provider must not hold up the search.
     pub async fn embed_once(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
-        self.request(inputs, 1).await.map_err(|failure| match failure {
-            Failure::Refused(message) => EmbedError::Rejected(message),
-            Failure::Provider(message) => EmbedError::Provider(message),
-        })
+        self.request(inputs, 1)
+            .await
+            .map_err(|failure| match failure {
+                Failure::Refused(message) => EmbedError::Rejected(message),
+                Failure::Provider(message) => EmbedError::Provider(message),
+            })
     }
 
     /// Like `embed`, but a refused single input yields `Err(message)` in its slot instead of failing
@@ -123,7 +125,11 @@ impl Embedder {
     }
 
     /// One batch with up to `max_attempts` attempts; network errors, 429 and 5xx are retried.
-    async fn request(&self, inputs: &[String], max_attempts: u32) -> Result<Vec<Vec<f32>>, Failure> {
+    async fn request(
+        &self,
+        inputs: &[String],
+        max_attempts: u32,
+    ) -> Result<Vec<Vec<f32>>, Failure> {
         let mut body = serde_json::json!({ "model": self.model, "input": inputs });
         if let Some(dimensions) = self.request_dimensions {
             body["dimensions"] = dimensions.into();

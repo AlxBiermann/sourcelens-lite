@@ -198,7 +198,9 @@ async fn start_sign_in(app: &Router) -> (Url, String) {
 
 async fn finish_sign_in(app: &Router, oauth_state: &str, cookie: &str) -> Reply {
     let req = Request::builder()
-        .uri(format!("/auth/sso/callback?code=the-code&state={oauth_state}"))
+        .uri(format!(
+            "/auth/sso/callback?code=the-code&state={oauth_state}"
+        ))
         .header(header::COOKIE, format!("{OAUTH_COOKIE}={cookie}"))
         .body(Body::empty())
         .unwrap();
@@ -254,7 +256,10 @@ async fn settings_are_validated_and_discovered() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["enabled"], false);
     assert_eq!(body["clientSecretSet"], false);
-    assert_eq!(body["redirectUrl"], format!("{PUBLIC_URL}/auth/sso/callback"));
+    assert_eq!(
+        body["redirectUrl"],
+        format!("{PUBLIC_URL}/auth/sso/callback")
+    );
 
     for (method, input) in [("GET", None), ("PUT", Some(settings_body(&base)))] {
         let (status, body, _) = api(&app, method, "/api/settings/sso", &member, input).await;
@@ -269,16 +274,33 @@ async fn settings_are_validated_and_discovered() {
         json!({ "enabled": true, "name": "", "issuer": base, "clientId": CLIENT_ID }),
     ];
     for input in invalid {
-        let (status, body, _) = api(&app, "PUT", "/api/settings/sso", &owner, Some(input.clone())).await;
+        let (status, body, _) = api(
+            &app,
+            "PUT",
+            "/api/settings/sso",
+            &owner,
+            Some(input.clone()),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{input}");
         assert_eq!(error_code(&body), "invalid_sso_settings", "{input}");
     }
 
     // The provider reports another issuer, has no discovery document there, or cannot be reached.
     let unreachable = "http://127.0.0.1:1".to_string();
-    for issuer in [format!("{base}/other"), format!("{base}/missing"), unreachable.clone()] {
-        let (status, body, _) =
-            api(&app, "PUT", "/api/settings/sso", &owner, Some(settings_body(&issuer))).await;
+    for issuer in [
+        format!("{base}/other"),
+        format!("{base}/missing"),
+        unreachable.clone(),
+    ] {
+        let (status, body, _) = api(
+            &app,
+            "PUT",
+            "/api/settings/sso",
+            &owner,
+            Some(settings_body(&issuer)),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{issuer}");
         assert_eq!(error_code(&body), "sso_discovery_failed", "{issuer}");
         if issuer == unreachable {
@@ -324,7 +346,8 @@ async fn settings_are_validated_and_discovered() {
     assert_eq!(body["clientSecretSet"], true);
 
     // Turning SSO off skips discovery; the changed issuer drops the saved secret.
-    let off = json!({ "enabled": false, "name": " ", "issuer": "not a url", "clientId": CLIENT_ID });
+    let off =
+        json!({ "enabled": false, "name": " ", "issuer": "not a url", "clientId": CLIENT_ID });
     let (status, body, _) = api(&app, "PUT", "/api/settings/sso", &owner, Some(off)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["name"], "SSO");
@@ -488,9 +511,18 @@ async fn id_token_claims_are_checked() {
     let inst = instance().await;
     let issuer = inst.idp.base().to_string();
     let cases: [(&str, Box<dyn Fn(&mut Value)>); 5] = [
-        ("issuer", Box::new(|c: &mut Value| c["iss"] = json!("https://evil.example"))),
-        ("audience", Box::new(|c: &mut Value| c["aud"] = json!("other-client"))),
-        ("expiry", Box::new(|c: &mut Value| c["exp"] = json!(now() - 1))),
+        (
+            "issuer",
+            Box::new(|c: &mut Value| c["iss"] = json!("https://evil.example")),
+        ),
+        (
+            "audience",
+            Box::new(|c: &mut Value| c["aud"] = json!("other-client")),
+        ),
+        (
+            "expiry",
+            Box::new(|c: &mut Value| c["exp"] = json!(now() - 1)),
+        ),
         ("subject", Box::new(|c: &mut Value| c["sub"] = json!(""))),
         ("nonce", Box::new(|c: &mut Value| c["nonce"] = Value::Null)),
     ];
@@ -504,7 +536,11 @@ async fn id_token_claims_are_checked() {
         assert_eq!(location(&reply), "/login?error=sso", "{name}");
     }
     assert_eq!(
-        scalar(&inst.state, "SELECT count(*) FROM users WHERE sso_sub IS NOT NULL").await,
+        scalar(
+            &inst.state,
+            "SELECT count(*) FROM users WHERE sso_sub IS NOT NULL"
+        )
+        .await,
         0
     );
 
@@ -525,7 +561,10 @@ async fn id_token_claims_are_checked() {
     assert_eq!(location(&reply), "/login?error=pending_approval");
     let id = sso_user_id(&inst.state, "user-2").await;
     let (login, email, status, _) = user_row(&inst.state, id).await;
-    assert_eq!((login.as_str(), email, status.as_str()), ("Grace", None, "pending"));
+    assert_eq!(
+        (login.as_str(), email, status.as_str()),
+        ("Grace", None, "pending")
+    );
 }
 
 #[tokio::test]
@@ -546,11 +585,21 @@ async fn pkce_verifier_matches_the_challenge() {
 
 /// `Authorization` header of a token request from `CLIENT_ID` with the encoded `secret`.
 fn basic(encoded_secret: &str) -> String {
-    format!("Basic {}", STANDARD.encode(format!("{CLIENT_ID}:{encoded_secret}")))
+    format!(
+        "Basic {}",
+        STANDARD.encode(format!("{CLIENT_ID}:{encoded_secret}"))
+    )
 }
 
 async fn put_settings(inst: &Instance, input: Value) -> (StatusCode, Value) {
-    let (status, body, _) = api(&inst.app, "PUT", "/api/settings/sso", &inst.owner, Some(input)).await;
+    let (status, body, _) = api(
+        &inst.app,
+        "PUT",
+        "/api/settings/sso",
+        &inst.owner,
+        Some(input),
+    )
+    .await;
     (status, body)
 }
 
@@ -582,7 +631,11 @@ async fn a_new_issuer_or_client_id_needs_the_secret_again() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["error"]["message"], "Enter the client secret.");
     assert_eq!(
-        scalar(&inst.state, "SELECT count(*) FROM settings WHERE key = 'sso_client_secret'").await,
+        scalar(
+            &inst.state,
+            "SELECT count(*) FROM settings WHERE key = 'sso_client_secret'"
+        )
+        .await,
         0
     );
     assert_eq!(*other.token_form.lock().unwrap(), "");
@@ -594,7 +647,8 @@ async fn a_new_issuer_or_client_id_needs_the_secret_again() {
     let (status, body) = put_settings(&inst, input).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (url, cookie) = start_sign_in(&inst.app).await;
-    *other.id_token.lock().unwrap() = id_token(&claims(&other, "user-9", &query_param(&url, "nonce")));
+    *other.id_token.lock().unwrap() =
+        id_token(&claims(&other, "user-9", &query_param(&url, "nonce")));
     let reply = finish_sign_in(&inst.app, &query_param(&url, "state"), &cookie).await;
     assert_eq!(location(&reply), "/login?error=pending_approval");
     assert_eq!(
@@ -656,9 +710,12 @@ async fn create_key(app: &Router, session: &str) -> String {
 /// Status of an MCP `ping` with the API key `secret`.
 async fn ping(app: &Router, secret: &str) -> StatusCode {
     let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }).to_string();
-    send(app, mcp_request(Some(secret)).body(Body::from(body)).unwrap())
-        .await
-        .status
+    send(
+        app,
+        mcp_request(Some(secret)).body(Body::from(body)).unwrap(),
+    )
+    .await
+    .status
 }
 
 #[tokio::test]
@@ -685,10 +742,16 @@ async fn turning_sso_off_or_changing_the_issuer_ends_sso_access() {
     assert_eq!(signed_in_user(app, &session).await, Value::Null);
     assert_eq!(signed_in_user(app, &inst.owner).await["id"], owner_id);
     assert_eq!(scalar(&inst.state, SSO_GRANTS).await, 0);
-    assert_eq!(scalar(&inst.state, "SELECT count(*) FROM oauth_grants").await, 1);
+    assert_eq!(
+        scalar(&inst.state, "SELECT count(*) FROM oauth_grants").await,
+        1
+    );
     assert_eq!(ping(app, &sso_key).await, StatusCode::UNAUTHORIZED);
     assert_eq!(ping(app, &github_key).await, StatusCode::OK);
-    assert_eq!(scalar(&inst.state, "SELECT count(*) FROM api_keys").await, 1);
+    assert_eq!(
+        scalar(&inst.state, "SELECT count(*) FROM api_keys").await,
+        1
+    );
 
     // Turned on again with the saved secret, the approved account signs in again.
     let on = json!({ "enabled": true, "name": "Acme login", "issuer": inst.idp.base(), "clientId": CLIENT_ID });
@@ -709,10 +772,16 @@ async fn turning_sso_off_or_changing_the_issuer_ends_sso_access() {
     assert_eq!(signed_in_user(app, &session).await, Value::Null);
     assert_eq!(signed_in_user(app, &inst.owner).await["id"], owner_id);
     assert_eq!(scalar(&inst.state, SSO_GRANTS).await, 0);
-    assert_eq!(scalar(&inst.state, "SELECT count(*) FROM oauth_grants").await, 1);
+    assert_eq!(
+        scalar(&inst.state, "SELECT count(*) FROM oauth_grants").await,
+        1
+    );
     assert_eq!(ping(app, &sso_key).await, StatusCode::UNAUTHORIZED);
     assert_eq!(ping(app, &github_key).await, StatusCode::OK);
-    assert_eq!(scalar(&inst.state, "SELECT count(*) FROM api_keys").await, 1);
+    assert_eq!(
+        scalar(&inst.state, "SELECT count(*) FROM api_keys").await,
+        1
+    );
 }
 
 #[tokio::test]
@@ -735,8 +804,14 @@ async fn unreadable_settings_can_be_saved_again() {
     let reply = send(&app, request("GET", "/auth/sso/login", None, None)).await;
     assert_eq!(location(&reply), "/login?error=sso");
 
-    let (status, body, _) =
-        api(&app, "PUT", "/api/settings/sso", &owner, Some(settings_body(idp.base()))).await;
+    let (status, body, _) = api(
+        &app,
+        "PUT",
+        "/api/settings/sso",
+        &owner,
+        Some(settings_body(idp.base())),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body, _) = api(&app, "GET", "/api/settings/sso", &owner, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -765,8 +840,14 @@ async fn discovery_does_not_follow_redirects() {
     let state = new_state(&tmp, |_| {});
     let app = http::router(state.clone());
     let owner = owner_session(&state, "octocat").await;
-    let (status, body, _) =
-        api(&app, "PUT", "/api/settings/sso", &owner, Some(settings_body(&redirector))).await;
+    let (status, body, _) = api(
+        &app,
+        "PUT",
+        "/api/settings/sso",
+        &owner,
+        Some(settings_body(&redirector)),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(error_code(&body), "sso_discovery_failed");
 }
@@ -789,20 +870,26 @@ async fn sign_in_rules() {
     let state = new_state(&tmp, |_| {});
 
     // Nobody has set up the instance: no account is created.
-    let result = resolve_user(&state.db, &identity("octocat", "s-1")).await.unwrap();
+    let result = resolve_user(&state.db, &identity("octocat", "s-1"))
+        .await
+        .unwrap();
     assert_eq!(result, SignIn::SetupRequired);
     assert_eq!(scalar(&state, "SELECT count(*) FROM users").await, 0);
 
     // A login held by a GitHub account gets a suffix from issuer and subject.
     owner_session(&state, "octocat").await;
-    let result = resolve_user(&state.db, &identity("octocat", "s-1")).await.unwrap();
+    let result = resolve_user(&state.db, &identity("octocat", "s-1"))
+        .await
+        .unwrap();
     assert_eq!(result, SignIn::Pending);
     let id = sso_user_id(&state, "s-1").await;
     let suffix = &sha256_hex(b"https://idp.example|s-1")[..8];
     assert_eq!(user_row(&state, id).await.0, format!("octocat~{suffix}"));
 
     // Signing in again keeps the account pending and its login stable.
-    let result = resolve_user(&state.db, &identity("octocat", "s-1")).await.unwrap();
+    let result = resolve_user(&state.db, &identity("octocat", "s-1"))
+        .await
+        .unwrap();
     assert_eq!(result, SignIn::Pending);
     assert_eq!(user_row(&state, id).await.0, format!("octocat~{suffix}"));
     assert_eq!(scalar(&state, "SELECT count(*) FROM users").await, 2);
@@ -813,11 +900,17 @@ async fn sign_in_rules() {
         .write(move |conn| conn.execute("UPDATE users SET status = 'active' WHERE id = ?1", [id]))
         .await
         .unwrap();
-    let result = resolve_user(&state.db, &identity("ada", "s-1")).await.unwrap();
+    let result = resolve_user(&state.db, &identity("ada", "s-1"))
+        .await
+        .unwrap();
     assert_eq!(result, SignIn::User(id));
     assert_eq!(user_row(&state, id).await.0, "ada");
     assert_eq!(
-        scalar(&state, "SELECT count(*) FROM users WHERE last_login_at IS NOT NULL AND sso_sub = 's-1'").await,
+        scalar(
+            &state,
+            "SELECT count(*) FROM users WHERE last_login_at IS NOT NULL AND sso_sub = 's-1'"
+        )
+        .await,
         1
     );
 }

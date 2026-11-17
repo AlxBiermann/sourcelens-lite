@@ -386,7 +386,10 @@ fn c_cpp_and_php_constants_are_symbols_without_changing_chunks() {
     assert_disjoint(&chunks);
     assert!(chunks.iter().all(|chunk| chunk.kind != "constant"));
     // Include guards, function-like macros, declarations without a value and variables are not.
-    assert_eq!(constants(&symbols), ["DEFAULT_WIDTH", "MAX_SHAPES", "UNIT_NAME"]);
+    assert_eq!(
+        constants(&symbols),
+        ["DEFAULT_WIDTH", "MAX_SHAPES", "UNIT_NAME"]
+    );
     let width = symbol(&symbols, "DEFAULT_WIDTH");
     assert_eq!(width.start_line, line_of(c, "DEFAULT_WIDTH"));
     assert_eq!(
@@ -419,7 +422,12 @@ fn c_cpp_and_php_constants_are_symbols_without_changing_chunks() {
     assert!(chunks.iter().all(|chunk| chunk.kind != "constant"));
     assert_eq!(
         constants(&symbols),
-        ["DEFAULT_CURRENCY", "DEFAULT_LOCALE", "PRECISION", "ROUNDING"]
+        [
+            "DEFAULT_CURRENCY",
+            "DEFAULT_LOCALE",
+            "PRECISION",
+            "ROUNDING"
+        ]
     );
     let currency = symbol(&symbols, "DEFAULT_CURRENCY");
     assert_eq!(
@@ -433,7 +441,9 @@ fn c_cpp_and_php_constants_are_symbols_without_changing_chunks() {
         symbol(&symbols, "DEFAULT_LOCALE").qualified_name,
         "Acme.Invoices.DEFAULT_LOCALE"
     );
-    assert!(symbols.iter().any(|s| s.name == "render" && s.kind == "method"));
+    assert!(symbols
+        .iter()
+        .any(|s| s.name == "render" && s.kind == "method"));
 }
 
 #[test]

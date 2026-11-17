@@ -206,7 +206,9 @@ async fn demoting_an_sso_admin_revokes_their_api_keys() {
     let admin_key = created["key"]["id"].clone();
     let ping = || {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }).to_string();
-        mcp_request(Some(&kim_secret)).body(Body::from(body)).unwrap()
+        mcp_request(Some(&kim_secret))
+            .body(Body::from(body))
+            .unwrap()
     };
     assert_eq!(send(app, ping()).await.status, StatusCode::OK);
 
@@ -223,6 +225,11 @@ async fn demoting_an_sso_admin_revokes_their_api_keys() {
     assert_eq!(send(app, ping()).await.status, StatusCode::UNAUTHORIZED);
     let (status, listed, _) = api(app, "GET", "/api/keys", &admin, None).await;
     assert_eq!(status, StatusCode::OK);
-    let ids: Vec<_> = listed.as_array().unwrap().iter().map(|k| &k["id"]).collect();
+    let ids: Vec<_> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| &k["id"])
+        .collect();
     assert_eq!(ids, vec![&admin_key]);
 }

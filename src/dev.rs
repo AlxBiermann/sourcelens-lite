@@ -316,7 +316,14 @@ fn seed(conn: &Connection, admin: i64, member: i64, ts: i64) -> rusqlite::Result
     let added_by = setup_admin;
 
     // acme/api: connected, indexed by a connect job, a push and a scheduled sync.
-    let api = insert_repo(conn, 9_000_001, "acme/api", true, added_by, ts - 14 * SECS_PER_DAY)?;
+    let api = insert_repo(
+        conn,
+        9_000_001,
+        "acme/api",
+        true,
+        added_by,
+        ts - 14 * SECS_PER_DAY,
+    )?;
     let api_files = prepare_files(API_FILES);
     let indexed = index(conn, api, &api_files)?;
     let commits = demo_commits("acme/api", 3);
@@ -327,14 +334,22 @@ fn seed(conn: &Connection, admin: i64, member: i64, ts: i64) -> rusqlite::Result
         &[
             DemoJob::succeeded(Trigger::Connect, &commits[0], 14 * SECS_PER_DAY, 41)
                 .changed(indexed, indexed, 0, 0),
-            DemoJob::succeeded(Trigger::Webhook, &commits[1], 2 * SECS_PER_DAY, 6).changed(2, 2, 0, 0),
+            DemoJob::succeeded(Trigger::Webhook, &commits[1], 2 * SECS_PER_DAY, 6)
+                .changed(2, 2, 0, 0),
             DemoJob::succeeded(Trigger::Schedule, &commits[2], 3 * HOUR, 5).changed(1, 1, 1, 0),
         ],
     )?;
     repositories::record_index(conn, api, &commits[2], ts - 3 * HOUR + 5, CHUNKER_VERSION)?;
 
     // acme/web: connected, one generated file skipped, a manual sync that found nothing new.
-    let web = insert_repo(conn, 9_000_002, "acme/web", false, added_by, ts - 9 * SECS_PER_DAY)?;
+    let web = insert_repo(
+        conn,
+        9_000_002,
+        "acme/web",
+        false,
+        added_by,
+        ts - 9 * SECS_PER_DAY,
+    )?;
     let web_files = prepare_files(WEB_FILES);
     let indexed = index(conn, web, &web_files)?;
     let skipped = i64::try_from(web_files.len()).unwrap_or(i64::MAX) - indexed;
@@ -344,15 +359,32 @@ fn seed(conn: &Connection, admin: i64, member: i64, ts: i64) -> rusqlite::Result
         web,
         ts,
         &[
-            DemoJob::succeeded(Trigger::Connect, &commits[0], 9 * SECS_PER_DAY, 27)
-                .changed(indexed + skipped, indexed, 0, skipped),
+            DemoJob::succeeded(Trigger::Connect, &commits[0], 9 * SECS_PER_DAY, 27).changed(
+                indexed + skipped,
+                indexed,
+                0,
+                skipped,
+            ),
             DemoJob::succeeded(Trigger::Manual, &commits[0], SECS_PER_DAY, 2),
         ],
     )?;
-    repositories::record_index(conn, web, &commits[0], ts - 9 * SECS_PER_DAY + 27, CHUNKER_VERSION)?;
+    repositories::record_index(
+        conn,
+        web,
+        &commits[0],
+        ts - 9 * SECS_PER_DAY + 27,
+        CHUNKER_VERSION,
+    )?;
 
     // acme/legacy: indexed once, then the GitHub App lost access to it.
-    let legacy = insert_repo(conn, 9_000_003, "acme/legacy", true, added_by, ts - 60 * SECS_PER_DAY)?;
+    let legacy = insert_repo(
+        conn,
+        9_000_003,
+        "acme/legacy",
+        true,
+        added_by,
+        ts - 60 * SECS_PER_DAY,
+    )?;
     let legacy_files = prepare_files(LEGACY_FILES);
     let indexed = index(conn, legacy, &legacy_files)?;
     let commits = demo_commits("acme/legacy", 1);
@@ -389,7 +421,14 @@ fn seed(conn: &Connection, admin: i64, member: i64, ts: i64) -> rusqlite::Result
         params![legacy, RepoState::Disconnected, NO_ACCESS_REASON],
     )?;
 
-    insert_grant(conn, admin, "Claude Code", ts - 5 * SECS_PER_DAY, Some(ts - HOUR), ts)?;
+    insert_grant(
+        conn,
+        admin,
+        "Claude Code",
+        ts - 5 * SECS_PER_DAY,
+        Some(ts - HOUR),
+        ts,
+    )?;
     insert_grant(conn, member, "Cursor", ts - 2 * SECS_PER_DAY, None, ts)?;
     insert_api_key(conn, admin, "CI pipeline", ts)?;
     Ok(())

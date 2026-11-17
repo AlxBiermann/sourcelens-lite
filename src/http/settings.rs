@@ -160,7 +160,8 @@ struct SyncView {
 fn sync_view(settings: AutoSync) -> SyncView {
     let cron = schedule::parse(&settings.cron).ok();
     let next_run_at = if settings.enabled {
-        cron.as_ref().and_then(|cron| schedule::next_run(cron, now()))
+        cron.as_ref()
+            .and_then(|cron| schedule::next_run(cron, now()))
     } else {
         None
     };

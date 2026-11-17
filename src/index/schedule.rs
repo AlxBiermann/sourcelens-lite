@@ -72,7 +72,8 @@ pub async fn settings(state: &AppState) -> ApiResult<AutoSync> {
 /// Validates and stores new settings with the expression normalized, and wakes the scheduler.
 pub async fn apply(state: &AppState, input: AutoSync) -> ApiResult<AutoSync> {
     let cron = input.cron.split_whitespace().collect::<Vec<_>>().join(" ");
-    let parsed = parse(&cron).map_err(|message| ApiError::unprocessable("invalid_cron", message))?;
+    let parsed =
+        parse(&cron).map_err(|message| ApiError::unprocessable("invalid_cron", message))?;
     if next_run(&parsed, now()).is_none() {
         return Err(ApiError::unprocessable(
             "invalid_cron",

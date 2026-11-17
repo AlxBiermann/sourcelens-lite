@@ -242,9 +242,10 @@ async fn discover(state: &AppState, issuer: &str) -> Result<Discovered, String> 
     if !status.is_success() {
         return Err(format!("{url} answered with status {status}."));
     }
-    let document: Document = response.json().await.map_err(|_| {
-        format!("{url} did not return an OpenID Connect discovery document.")
-    })?;
+    let document: Document = response
+        .json()
+        .await
+        .map_err(|_| format!("{url} did not return an OpenID Connect discovery document."))?;
     let reported = document.issuer.unwrap_or_default();
     let reported = reported.trim_end_matches('/');
     if reported != issuer {
@@ -691,9 +692,18 @@ mod tests {
     fn http_endpoints_need_an_issuer_on_this_machine() {
         let local = "http://127.0.0.1:9000";
         let remote = "https://login.example.com";
-        assert_eq!(endpoint_problem("http://127.0.0.1:9000/token", local, "token_endpoint"), None);
-        assert_eq!(endpoint_problem("http://localhost/token", local, "token_endpoint"), None);
-        assert_eq!(endpoint_problem("https://login.example.com/token", remote, "token_endpoint"), None);
+        assert_eq!(
+            endpoint_problem("http://127.0.0.1:9000/token", local, "token_endpoint"),
+            None
+        );
+        assert_eq!(
+            endpoint_problem("http://localhost/token", local, "token_endpoint"),
+            None
+        );
+        assert_eq!(
+            endpoint_problem("https://login.example.com/token", remote, "token_endpoint"),
+            None
+        );
         assert_eq!(
             endpoint_problem("http://127.0.0.1:9000/token", remote, "token_endpoint").as_deref(),
             Some(

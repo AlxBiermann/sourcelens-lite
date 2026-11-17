@@ -887,9 +887,16 @@ async fn get_code_cuts_long_lines_in_text_and_structured_content() {
     assert!(body.contains("… [+399600 chars]"), "{body}");
     assert!(body.contains("line 3"));
     let structured = result["structuredContent"]["content"].as_str().unwrap();
-    assert!(structured.len() < 2_000, "content has {} bytes", structured.len());
+    assert!(
+        structured.len() < 2_000,
+        "content has {} bytes",
+        structured.len()
+    );
     assert!(structured.starts_with("line 1\nBBB"));
-    assert!(structured.ends_with("… [+399600 chars]\nline 3"), "{structured}");
+    assert!(
+        structured.ends_with("… [+399600 chars]\nline 3"),
+        "{structured}"
+    );
 }
 
 #[tokio::test]

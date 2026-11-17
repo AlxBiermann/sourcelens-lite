@@ -704,7 +704,9 @@ async fn scheduled_sync_keeps_a_queued_manual_job() {
         .await
         .unwrap();
     assert_eq!(
-        jobs::enqueue_all(&env.state, Trigger::Schedule).await.unwrap(),
+        jobs::enqueue_all(&env.state, Trigger::Schedule)
+            .await
+            .unwrap(),
         1
     );
     let trigger: String = env

@@ -16,7 +16,10 @@ fn dev_state(tmp: &TempDir) -> AppState {
 /// `Location` of a redirect and the session cookie it sets, if any.
 fn redirect(reply: &Reply) -> (String, Option<String>) {
     assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.text);
-    let location = reply.headers[header::LOCATION].to_str().unwrap().to_string();
+    let location = reply.headers[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .to_string();
     let session = reply
         .headers
         .get_all(header::SET_COOKIE)
@@ -100,8 +103,7 @@ async fn dev_login_signs_in_as_admin_or_sso_member() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(error_code(&body), "api_keys_unavailable");
 
-    let (location, _) =
-        dev_login(&state, "?as=admin&next=%2Foauth%2Fauthorize%3Fx%3D1").await;
+    let (location, _) = dev_login(&state, "?as=admin&next=%2Foauth%2Fauthorize%3Fx%3D1").await;
     assert_eq!(location, "/oauth/authorize?x=1");
     let (location, _) = dev_login(&state, "?next=https%3A%2F%2Fevil.example").await;
     assert_eq!(location, "/repositories");
@@ -116,7 +118,11 @@ async fn prepare_seeds_an_empty_database_once() {
     assert_eq!(first[1], 3, "three demo repositories");
     assert!(first[2] > 0 && first[3] == 2, "{first:?}");
     assert_eq!(
-        scalar(&state, "SELECT count(*) FROM users WHERE status = 'pending'").await,
+        scalar(
+            &state,
+            "SELECT count(*) FROM users WHERE status = 'pending'"
+        )
+        .await,
         2
     );
     assert_eq!(scalar(&state, "SELECT count(*) FROM api_keys").await, 1);
