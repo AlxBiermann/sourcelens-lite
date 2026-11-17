@@ -87,7 +87,8 @@ export function SettingsEmbeddings() {
     const input = toInput(form);
     setTest(null);
     setSaveError(null);
-    void action.run(async () => setTest(await api.post<EmbeddingTestResult>('/api/settings/embeddings/test', input)), {
+    // The server retries a slow provider for minutes; wait for its answer.
+    void action.run(async () => setTest(await api.post<EmbeddingTestResult>('/api/settings/embeddings/test', input, { timeoutMs: null })), {
       key: 'test',
       onError: (error) => setTest({ ok: false, error }),
     });
@@ -109,7 +110,7 @@ export function SettingsEmbeddings() {
     setTest(null);
     void action.run(
       async () => {
-        const saved = await api.put<EmbeddingSettings & { reembedRepositories: number }>('/api/settings/embeddings', input);
+        const saved = await api.put<EmbeddingSettings & { reembedRepositories: number }>('/api/settings/embeddings', input, { timeoutMs: null });
         setForm(toForm(saved));
         await settings.reload();
         return saved.reembedRepositories;

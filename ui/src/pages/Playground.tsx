@@ -117,7 +117,8 @@ export function Playground() {
     if (pathPrefix.trim()) next.set('path', pathPrefix.trim());
     // Pushing the unchanged URL would only add a duplicate history entry.
     if (next.toString() !== params.toString()) setParams(next);
-    setRun((n) => n + 1);
+    // Changed values start the search through the effect; the same search again needs `run`.
+    if (trimmed === q && repoId === repoParam && language === langParam && pathPrefix.trim() === pathParam) setRun((n) => n + 1);
   }
 
   // One permanent live region, so the first result count is announced too. Errors are announced by their notice.

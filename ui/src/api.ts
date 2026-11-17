@@ -235,7 +235,10 @@ function rememberReturnPath() {
 
 const TIMED_OUT = 'The request timed out. Try again.';
 
-export async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+/** `timeoutMs`: abort after this many milliseconds (default 90 s); `null` waits as long as the server takes. */
+export type RequestOptions = { timeoutMs?: number | null };
+
+export async function request<T>(method: string, path: string, body?: unknown, { timeoutMs = REQUEST_TIMEOUT_MS }: RequestOptions = {}): Promise<T> {
   let response: Response;
   try {
     response = await fetch(path, {
@@ -243,7 +246,7 @@ export async function request<T>(method: string, path: string, body?: unknown): 
       credentials: 'include',
       headers: body === undefined ? { accept: 'application/json' } : { accept: 'application/json', 'content-type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: timeoutMs === null ? undefined : AbortSignal.timeout(timeoutMs),
     });
   } catch (e) {
     if (e instanceof DOMException && e.name === 'TimeoutError') throw new ApiError(0, 'network', TIMED_OUT);
@@ -286,8 +289,8 @@ export async function request<T>(method: string, path: string, body?: unknown): 
 
 export const api = {
   get: <T>(path: string) => request<T>('GET', path),
-  post: <T>(path: string, body?: unknown) => request<T>('POST', path, body ?? {}),
-  put: <T>(path: string, body: unknown) => request<T>('PUT', path, body),
+  post: <T>(path: string, body?: unknown, options?: RequestOptions) => request<T>('POST', path, body ?? {}, options),
+  put: <T>(path: string, body: unknown, options?: RequestOptions) => request<T>('PUT', path, body, options),
   patch: <T>(path: string, body: unknown) => request<T>('PATCH', path, body),
   del: (path: string) => request<void>('DELETE', path),
 };
