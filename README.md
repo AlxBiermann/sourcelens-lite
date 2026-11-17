@@ -156,6 +156,7 @@ Then run `/mcp` in Claude Code. A request without credentials gets 401 with a `W
 
 - An OAuth token reads all connected repositories, including ones connected later.
 - Access tokens expire after 1 hour. The agent renews them with its refresh token, which expires 30 days after its last use; each refresh replaces both tokens. If a refresh token that was already replaced is presented again, SourceLens revokes the grant and the client must be allowed again.
+- For members who sign in with SSO, a client can renew its tokens only while the member's last SSO sign-in is at most 30 days old. After that the refresh fails with `invalid_grant` until the member signs in to SourceLens again; the client stays allowed.
 - Settings → MCP clients shows the MCP URL and the clients connected with OAuth: members see their own, admins all. "Revoke" stops a client at once.
 - API keys keep working. Members who sign in with SSO have no API keys and connect agents only with OAuth.
 
@@ -166,14 +167,18 @@ All tools are read-only. Repository names are full names (`owner/repo`), matched
 | Tool | What it does |
 |---|---|
 | `list_repositories` | Lists the repositories the key can search, with branch, indexed commit and file count. |
-| `search_code` | Searches by keywords, identifiers or (with embeddings) meaning. Arguments: `query`, optional `repositories`, `languages`, `pathPrefix`, `limit` (1–20, default 8). |
+| `list_files` | Lists the directories and files directly under a path of one repository, with file counts, languages and line counts. Arguments: `repository`, optional `pathPrefix`, `limit` (1–500, default 200). |
+| `search_code` | Searches by keywords, identifiers or (with embeddings) meaning. Arguments: `query`, optional `repositories`, `languages`, `pathPrefix`, `limit` (1–20, default 8), `offset` (0–40, default 0). The answer says when more results exist and which `offset` continues. |
+| `grep_code` | Finds every line that contains an exact text or matches a regular expression (`regex: true`, Rust regex syntax). Arguments: `pattern`, optional `regex`, `caseSensitive` (default true), `repositories`, `languages`, `pathPrefix`, `limit` (1–200, default 50). A search stops after 5 seconds and then says that it is incomplete. |
 | `get_code` | Reads a file or a line range (`startLine`, `endLine`). Without a range it returns the first 400 lines; at most 800 lines per call. |
 | `get_file_outline` | Lists the symbols of one file with kinds, signatures and line ranges. |
 | `find_symbol` | Finds where a function, class, type or other symbol is defined: exact names first, then prefixes, then substrings. Optional `repositories`, `kind`, `limit` (1–50, default 20). |
 
 Protocol details: stateless Streamable HTTP with JSON responses (`POST /mcp` only; `GET` and `DELETE` answer 405), protocol versions `2025-11-25`, `2025-06-18` and `2025-03-26`. Each key, and each client connected with OAuth, may send 10 requests per second with bursts of up to 20; above that the server answers 429.
 
-API keys can access all connected repositories (including ones connected later) or a selected list, and expire after 30 days, 90 days, 1 year or never. A revoked key stops working immediately.
+At most two `grep_code` searches run at the same time on an instance. A further one waits up to 2 seconds for a free slot and otherwise fails with "Other exhaustive searches are running. Retry in a few seconds."
+
+API keys can access all connected repositories (including ones connected later) or a selected list, and expire after 30 days, 90 days, 1 year or never. A revoked key stops working immediately. Members see, change and revoke only the keys they created; admins manage all keys.
 
 ## Search
 
@@ -183,7 +188,7 @@ API keys can access all connected repositories (including ones connected later) 
 - **Keyword search.** Full-text search over symbol names, paths and code. Identifiers are also split into their parts, so `user id lookup` finds `getUserById`. Chunks that contain all words get a higher score than chunks that contain only some.
 - **Semantic search** (only with embeddings). The query is embedded and compared with the chunk vectors.
 
-The response says which mode ran: `lexical` or `hybrid`. Test files rank lower unless the query mentions tests, and import blocks rank lower. At most three results come from the same file.
+The response says which mode ran: `lexical` or `hybrid`. Test files rank lower unless the query mentions tests, and import blocks rank lower. At most three results come from the same file. `offset` continues after the results already returned; each channel contributes a limited number of candidates, so a broad query can run out of results before offset 40.
 
 Results are chunks: a function, a method, a class that fits in one chunk, or a group of small neighbouring declarations. Large classes are split into their members.
 
@@ -195,7 +200,7 @@ Results are chunks: a function, a method, a class that fits in one chunk, or a g
 | Sections and headings as symbols | Markdown |
 | Indexed as text, in line windows | Every other text file, for example YAML, JSON, SQL, shell, Terraform, Dockerfiles |
 
-Not indexed: files larger than `SOURCELENS_MAX_FILE_BYTES` (1 MiB by default), binary files, minified files, generated files (for example `.pb.go`, `_pb2.py`, or a `@generated` / `Code generated … DO NOT EDIT` marker in the first ten lines), lockfiles, vendored directories (`node_modules`, `vendor`, `third_party`, …), symlinks and submodules.
+Not indexed: files larger than `SOURCELENS_MAX_FILE_BYTES` (1 MiB by default), binary files, files with the extension of a binary or data format (images, PDFs, archives, fonts, audio and video, compiled objects, model weights, database files, and `.svg`, `.csv`, `.tsv`, `.jsonl`, `.ndjson`, `.snap`, `.ipynb`; these are not downloaded), minified files, generated files (for example `.pb.go`, `_pb2.py`, or a `@generated` / `Code generated … DO NOT EDIT` marker in the first ten lines), lockfiles, vendored directories (`node_modules`, `vendor`, `third_party`, …), symlinks and submodules. Files with such an extension that an earlier version indexed leave the index when the next push is indexed or with "Rebuild index".
 
 ## Embeddings
 
@@ -216,11 +221,13 @@ ollama pull nomic-embed-text
 | Query prefix | `search_query: ` |
 | Document prefix | `search_document: ` |
 
-Changing the base URL, model, dimensions or document prefix re-embeds all chunks. Turning embeddings off keeps the stored vectors; search stops using them. If the provider fails during a search, that search falls back to `lexical`.
+Changing the base URL, model, dimensions or document prefix re-embeds all chunks. Turning embeddings off keeps the stored vectors; search stops using them. If the provider fails during a search, that search falls back to `lexical` and the response names the reason (`semanticUnavailable`: `timeout`, `provider_error` or `internal`); the Playground shows it. Requests to the embeddings server do not follow redirects. The vectors of the last 256 distinct queries are kept in memory, so a repeated query does not call the provider again.
 
 ## Sync
 
 Besides the `push` webhook, index jobs are queued by "Sync now" on a repository, by "Sync all" on "Repositories" (every connected repository; disconnected ones are skipped) and, for every connected repository, at each start. Every signed-in user can sync.
+
+A repository that lost its GitHub access is shown as disconnected and offers "Check access" instead of "Sync now": SourceLens asks GitHub whether the app can read the repository again and, if so, reconnects it and queues a sync. "Rebuild index" downloads every file again and asks for confirmation first.
 
 Under Settings → Sync an admin can also sync all repositories automatically. The schedule is a cron expression with five fields (minute hour day-of-month month day-of-week) in UTC, for example `*/15 * * * *` or `0 2 * * *`; the page shows it in words with the next run. Runs missed while SourceLens was down are not caught up; the jobs queued at start cover them. Like those, a scheduled job that finds nothing changed leaves no entry in the repository's activity, and a scheduled run leaves a sync that is already queued for a repository as it is.
 
@@ -230,7 +237,8 @@ There are two roles. Admins manage members and the settings (embeddings, sync sc
 
 - **GitHub accounts.** The person who sets up the instance signs in with GitHub and is an admin. Admins add further GitHub users by username under Settings → Members; they join as members. GitHub accounts keep their role, so the admin who set up the instance cannot be demoted or removed.
 - **SSO.** Under Settings → Sign-in an admin connects one OpenID Connect provider (for example Entra ID, Google, Okta, Keycloak, Authentik or Auth0): button label (at most 24 characters), issuer URL, client ID and client secret. Register the redirect URL shown there, `<public URL>/auth/sso/callback`, with the provider. The issuer must be an `https` URL (`http` only for `localhost`, `127.0.0.1` or `::1`); saving reads `<issuer>/.well-known/openid-configuration` and fails if the provider reports a different issuer or its endpoints do not follow the same rule. The login page then shows "Sign in with <label>". SSO sign-in works only once the instance is set up. The saved client secret is kept only while the issuer and client ID stay the same; after changing either, enter the secret again. Turning SSO off or changing the issuer signs out everyone who signed in with SSO, disconnects their MCP clients and deletes the API keys they created.
-- **Approval.** Someone who signs in with SSO for the first time appears under Settings → Members as "Awaiting approval" and gets no session until an admin clicks "Approve"; then they sign in again. "Reject" deletes the request; signing in again creates a new one. Admins see how many people wait for approval on "Repositories" and on the Members tab. The username is the verified email address, else the provider's `preferred_username`, else its subject.
+- **Approval.** Someone who signs in with SSO for the first time appears under Settings → Members as "Awaiting approval" and gets no session until an admin clicks "Approve"; then they sign in again. "Reject" deletes the request; signing in again creates a new one. Admins see how many people wait for approval on "Repositories" and on the Members tab. The username is the email address if the provider sends `email_verified: true`, else the provider's `preferred_username`, else its subject.
+- **Sessions.** A GitHub sign-in lasts 30 days, an SSO sign-in 7 days. Agents that an SSO member connected with OAuth stop renewing their tokens 30 days after that member's last SSO sign-in (see [OAuth](#oauth)).
 - **Roles.** Admins can make approved SSO accounts admins ("Make admin") and SSO admins members again ("Make member"). Making an SSO admin a member deletes the API keys that account created. Nobody changes their own role, and admins cannot be removed until they are members again.
 - **SSO members** can search, sync, connect any repository the GitHub App was given (they have no GitHub token, so the app's installations decide; suspended installations and ones GitHub answers with an error for are skipped) and connect agents with [OAuth](#oauth). They cannot see or create API keys. SSO admins have every admin right, including API keys.
 
@@ -249,7 +257,7 @@ SourceLens reads its configuration from environment variables (and from a `.env`
 | `SOURCELENS_MAX_ARCHIVE_BYTES` | `2147483648` | Repository archives larger than this fail the index job. Archives (tarballs) are downloaded when more than 200 files changed or GitHub truncates the file tree of a very large repository. |
 | `SOURCELENS_DEV_ORIGIN` | unset | Extra browser origin allowed to call the API, for the UI dev server. |
 | `SOURCELENS_DEV_MODE` | unset | `1` or `true`: sign-in without GitHub and demo data, for development only (see [Building from source and development](#building-from-source-and-development)). Allowed only with a `localhost` public URL and a loopback listen address, which then defaults to `127.0.0.1:3000`. |
-| `RUST_LOG` | `info` | Log filter. |
+| `RUST_LOG` | `info` | Log filter. At `info`, every request except `/healthz` writes one line with method, path (never the query string), status, latency in milliseconds and a request id (log target `sourcelens::http`). The id is also sent as the `x-request-id` response header. |
 
 ### GitHub App from the environment
 
@@ -274,8 +282,9 @@ A production setup needs:
 - **The final URL before you create the GitHub App.** The app stores the webhook URL and callback URL from the moment it is created. An app created for a `localhost` URL has its webhook switched off, so set up the production instance with its final URL from the start (a fresh data volume runs the setup again). If the URL changes later, set the new `SOURCELENS_PUBLIC_URL` and update the app on GitHub: `https://github.com/settings/apps/<slug>` for an app on a personal account, `https://github.com/organizations/<org>/settings/apps/<slug>` for an organization app. Change "Homepage URL", "Callback URL", "Setup URL" and, under "Webhook", the webhook URL.
 - **A persistent volume for `/data`.** It holds the SQLite database with the indexed source code of every connected repository, and `secret.key`. Treat it like the source code itself: restrict access and back it up. Without `secret.key` (or the same `SOURCELENS_SECRET_KEY`), the stored GitHub App credentials and SSO client secret cannot be decrypted.
 - **One instance per team.** Every member can search every connected repository. Members who sign in with GitHub can connect any repository that both they and the GitHub App can read; members who sign in with SSO, any repository the GitHub App can read. Run separate instances for groups that must not see each other's code.
+- **HTTPS.** When `SOURCELENS_PUBLIC_URL` starts with `https://`, every response carries `Strict-Transport-Security: max-age=31536000`.
 
-The container listens on port 3000, runs as a non-root user (uid 10001) and has a Docker health check on `GET /healthz`. If you mount a host directory instead of a named volume at `/data`, it must be writable by uid 10001.
+The container listens on port 3000, runs as a non-root user (uid 10001) and has a Docker health check on `GET /healthz`, which answers `ok` while the database responds and 503 otherwise. If you mount a host directory instead of a named volume at `/data`, it must be writable by uid 10001.
 
 ### Network exposure
 
@@ -307,7 +316,7 @@ Outbound, the server connects to:
 | `api.github.com` | GitHub REST API: app and installation tokens, the app's installations, branches, file trees, file contents, repository archives, the signed-in user, member lookup, the conversion of the app manifest |
 | `github.com` | OAuth: exchanging the sign-in code for a token and refreshing it (`/login/oauth/access_token`) |
 | `codeload.github.com` | Repository archives: GitHub answers the archive request on `api.github.com` with a redirect to this host, which the server follows. Archives are used when more than 200 files changed or GitHub truncates the file tree of a very large repository |
-| The embeddings base URL | Embeddings, only if configured |
+| The embeddings base URL | Embeddings, only if configured; redirects are not followed |
 | The SSO provider | The discovery document (`<issuer>/.well-known/openid-configuration`) when an admin saves the SSO settings, and the token endpoint at each SSO sign-in, both without following redirects; only if configured |
 
 The server's HTTP client uses the proxy given in `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` and skips it for hosts listed in `NO_PROXY` (for example an internal embeddings server or SSO provider).
@@ -442,6 +451,7 @@ Tests and lints:
 
 ```sh
 cargo test
+cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -475,7 +485,7 @@ Anyone who can reach a dev-mode server can sign in as admin. SourceLens therefor
 - Read-only. SourceLens never writes to GitHub, and the MCP tools only read the index.
 - One branch per repository.
 - Indexing on push needs GitHub to reach `POST /webhooks/github`. Without that, use "Sync now", "Sync all" or a sync schedule (cron, at most once a minute).
-- Failed index jobs are not retried automatically. The next push, the next scheduled sync, a restart or "Sync now" runs the job again.
+- Failed index jobs are not retried automatically. The next push, the next scheduled sync, a restart or "Sync now" runs the job again. The repository's activity shows the error; for an internal error it reads "Internal error: " followed by the cause.
 - Members share access: every member can search all connected repositories, and an OAuth token for MCP reads all of them. Only admins manage members and settings.
 - SSO with one OpenID Connect provider that offers discovery and a client secret. Plain OAuth 2 providers without OpenID Connect are not supported.
 - Embeddings only through the OpenAI-compatible `/embeddings` API.
