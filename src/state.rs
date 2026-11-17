@@ -10,6 +10,7 @@ use crate::db::Db;
 use crate::github::app::GitHub;
 use crate::http::oauth_server::PendingCode;
 use crate::rate::RateLimiter;
+use crate::search::vector::QueryVectorCache;
 
 pub const SECS_PER_DAY: i64 = 86_400;
 
@@ -22,7 +23,8 @@ pub struct AppState {
     pub db: Db,
     pub key: Arc<SecretKey>,
     pub http: reqwest::Client,
-    /// Like `http`, but never follows redirects; used for SSO discovery and the token exchange.
+    /// Like `http`, but never follows redirects; used for SSO discovery, the token exchange and the
+    /// embeddings provider.
     pub sso_http: reqwest::Client,
     pub github: Arc<GitHub>,
     pub job_notify: Arc<tokio::sync::Notify>,
@@ -43,6 +45,8 @@ pub struct AppState {
     pub search_rate: Arc<RateLimiter>,
     /// Exhaustive searches running at once; owned by `search::grep`.
     pub grep_slots: Arc<tokio::sync::Semaphore>,
+    /// Embedded search queries by vector fingerprint; owned by `search::vector`.
+    pub query_vectors: Arc<Mutex<QueryVectorCache>>,
 }
 
 impl AppState {
@@ -88,6 +92,7 @@ impl AppState {
             grep_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::search::grep::MAX_CONCURRENT,
             )),
+            query_vectors: Arc::new(Mutex::new(QueryVectorCache::default())),
         })
     }
 }

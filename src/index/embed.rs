@@ -117,7 +117,7 @@ impl Stored {
     fn embedder(&self, state: &AppState) -> Embedder {
         let config = &self.settings.config;
         Embedder::new(
-            state.http.clone(),
+            state.sso_http.clone(),
             &config.base_url,
             &config.model,
             self.api_key.clone(),
@@ -167,14 +167,28 @@ pub async fn settings(state: &AppState) -> ApiResult<EmbeddingSettings> {
     Ok(stored(state).await?.view())
 }
 
+/// What a search needs to embed its query.
+pub struct Loaded {
+    pub config: EmbeddingConfig,
+    pub embedder: Embedder,
+    /// Fingerprint of the stored vectors; `None` before a vector table was built.
+    pub fingerprint: Option<String>,
+}
+
 /// `None` when embeddings are disabled.
-pub async fn load(state: &AppState) -> ApiResult<Option<(EmbeddingConfig, Embedder)>> {
+pub async fn load(state: &AppState) -> ApiResult<Option<Loaded>> {
     let stored = stored(state).await?;
     if !stored.settings.config.enabled {
         return Ok(None);
     }
     let embedder = stored.embedder(state);
-    Ok(Some((stored.settings.config, embedder)))
+    Ok(Some(Loaded {
+        config: stored.settings.config,
+        embedder,
+        fingerprint: stored
+            .fingerprint
+            .and_then(|bytes| String::from_utf8(bytes).ok()),
+    }))
 }
 
 // ── embed phase ─────────────────────────────────────────────────────────────
@@ -390,29 +404,29 @@ fn store_batch(
         )));
     }
     let mut embedded = 0u32;
-    for (id, result) in ids.iter().zip(results) {
-        match result {
-            Ok(vector) => {
-                // Only chunks that still exist and are still pending get a vector.
-                let changed = tx.execute(
-                    "UPDATE chunks SET embed_state = ?2 WHERE id = ?1 AND embed_state = ?3",
-                    params![id, EMBED_DONE, EMBED_PENDING],
-                )?;
-                if changed == 1 {
-                    tx.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", [id])?;
-                    store::put_vector(&tx, *id, run.repo_id, &store::to_blob(vector))?;
-                    embedded += 1;
+    {
+        let mut set_state = tx.prepare_cached(
+            "UPDATE chunks SET embed_state = ?2 WHERE id = ?1 AND embed_state = ?3",
+        )?;
+        let mut delete_vector = tx.prepare_cached("DELETE FROM vec_chunks WHERE chunk_id = ?1")?;
+        for (id, result) in ids.iter().zip(results) {
+            match result {
+                Ok(vector) => {
+                    // Only chunks that still exist and are still pending get a vector.
+                    let changed = set_state.execute(params![id, EMBED_DONE, EMBED_PENDING])?;
+                    if changed == 1 {
+                        delete_vector.execute([id])?;
+                        store::put_vector(&tx, *id, run.repo_id, &store::to_blob(vector))?;
+                        embedded += 1;
+                    }
                 }
-            }
-            Err(message) => {
-                tracing::warn!(
-                    chunk_id = id,
-                    "embedding provider rejected a chunk: {message}"
-                );
-                tx.execute(
-                    "UPDATE chunks SET embed_state = ?2 WHERE id = ?1 AND embed_state = ?3",
-                    params![id, EMBED_REJECTED, EMBED_PENDING],
-                )?;
+                Err(message) => {
+                    tracing::warn!(
+                        chunk_id = id,
+                        "embedding provider rejected a chunk: {message}"
+                    );
+                    set_state.execute(params![id, EMBED_REJECTED, EMBED_PENDING])?;
+                }
             }
         }
     }
@@ -531,7 +545,7 @@ pub async fn test_connection(
     let api_key = resolve_api_key(input, &saved)?;
     let config = input.config.clone().normalized();
     let embedder = Embedder::new(
-        state.http.clone(),
+        state.sso_http.clone(),
         &config.base_url,
         &config.model,
         api_key,
@@ -594,7 +608,7 @@ async fn tested_settings(
         return Ok((settings, None));
     }
     let embedder = Embedder::new(
-        state.http.clone(),
+        state.sso_http.clone(),
         &config.base_url,
         &config.model,
         api_key,

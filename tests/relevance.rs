@@ -229,6 +229,7 @@ async fn lexical_relevance_floor() {
                     ..Filter::default()
                 },
                 limit: Some(K),
+                offset: 0,
             },
         )
         .await

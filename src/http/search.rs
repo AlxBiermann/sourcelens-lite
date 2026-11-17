@@ -29,6 +29,7 @@ struct SearchBody {
     languages: Vec<String>,
     path_prefix: Option<String>,
     limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -37,6 +38,9 @@ struct SearchResult {
     mode: &'static str,
     terms: Vec<String>,
     results: Vec<SearchHit>,
+    has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantic_unavailable: Option<&'static str>,
 }
 
 async fn search_handler(
@@ -83,6 +87,7 @@ async fn run_search(state: &AppState, body: SearchBody) -> ApiResult<SearchResul
             query: body.query,
             filter,
             limit: body.limit,
+            offset: body.offset.unwrap_or(0),
         },
     )
     .await?;
@@ -90,6 +95,8 @@ async fn run_search(state: &AppState, body: SearchBody) -> ApiResult<SearchResul
         mode: response.mode,
         terms: response.terms,
         results: response.hits,
+        has_more: response.has_more,
+        semantic_unavailable: response.semantic_unavailable,
     })
 }
 

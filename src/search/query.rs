@@ -2,7 +2,8 @@
 
 use crate::index::store::camel_parts;
 
-const MAX_QUERY_CHARS: usize = 512;
+/// Characters of a query that are planned and embedded; the rest is ignored.
+pub const MAX_QUERY_CHARS: usize = 512;
 const MAX_SYMBOL_CANDIDATES: usize = 4;
 /// More groups make one request expensive (every group is a prefix term over the whole index).
 pub const MAX_GROUPS: usize = 16;

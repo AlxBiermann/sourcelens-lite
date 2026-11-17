@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::State;
+use axum::http::header::LOCATION;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -19,7 +20,7 @@ use serde_json::{json, Value};
 use sourcelens::index::embed::{self, EmbeddingConfig, EmbeddingSettingsInput};
 use sourcelens::index::embedder::{EmbedError, Embedder};
 use sourcelens::repositories::{self, Target};
-use sourcelens::search::{self, Filter, SearchRequest};
+use sourcelens::search::{self, Filter, SearchRequest, SearchResponse};
 use sourcelens::state::AppState;
 use tempfile::TempDir;
 
@@ -770,12 +771,14 @@ async fn vectors_make_search_hybrid_with_semantic_only_hits() {
                 ..Filter::default()
             },
             limit: Some(8),
+            offset: 0,
         },
     )
     .await
     .unwrap();
 
     assert_eq!(response.mode, "hybrid");
+    assert_eq!(response.semantic_unavailable, None);
     let first = response.hits.first().expect("no hits");
     assert!(first.content.contains("frobnicate"), "first hit: {first:?}");
     assert_eq!(first.matched_by, vec!["semantic"]);
@@ -809,12 +812,14 @@ async fn failing_provider_makes_search_lexical_after_one_attempt() {
                 ..Filter::default()
             },
             limit: Some(8),
+            offset: 0,
         },
     )
     .await
     .unwrap();
 
     assert_eq!(response.mode, "lexical");
+    assert_eq!(response.semantic_unavailable, Some("provider_error"));
     assert!(!response.hits.is_empty());
     assert_eq!(fake.requests().len() - before, 1);
     // The first retry would wait at least one second.
@@ -823,6 +828,82 @@ async fn failing_provider_makes_search_lexical_after_one_attempt() {
         "search took {:?}",
         started.elapsed()
     );
+}
+
+/// The sample repository, indexed and embedded through `fake`.
+async fn embedded_sample(state: &AppState, fake: &Fake) -> i64 {
+    let repo = insert_repo_async(state, 1, "acme/api", "connected").await;
+    index_sample(state, repo).await;
+    embed::apply_settings(state, settings_input(fake))
+        .await
+        .unwrap();
+    let job = start_job(state, repo).await;
+    embed::embed_pending(state, repo, job).await.unwrap();
+    repo
+}
+
+async fn search_repo(state: &AppState, repo: i64, query: &str) -> SearchResponse {
+    search::search(
+        state,
+        SearchRequest {
+            query: query.into(),
+            filter: Filter {
+                repo_ids: vec![repo],
+                ..Filter::default()
+            },
+            limit: Some(8),
+            offset: 0,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn query_vectors_are_embedded_once_per_query() {
+    let tmp = TempDir::new().unwrap();
+    let state = new_state(&tmp, |_| {});
+    let fake = Fake::start().await;
+    let repo = embedded_sample(&state, &fake).await;
+
+    let before = fake.request_count();
+    assert_eq!(search_repo(&state, repo, "zebra").await.mode, "hybrid");
+    assert_eq!(search_repo(&state, repo, "zebra").await.mode, "hybrid");
+    assert_eq!(fake.request_count() - before, 1);
+    assert_eq!(search_repo(&state, repo, "frobnicate").await.mode, "hybrid");
+    assert_eq!(fake.request_count() - before, 2);
+}
+
+#[tokio::test]
+async fn failed_query_embedding_is_reported_and_not_cached() {
+    let tmp = TempDir::new().unwrap();
+    let state = new_state(&tmp, |_| {});
+    let fake = Fake::start().await;
+    let repo = embedded_sample(&state, &fake).await;
+
+    let before = fake.request_count();
+    fake.script(&[(500, None)]);
+    let response = search_repo(&state, repo, "frobnicate").await;
+    assert_eq!(response.mode, "lexical");
+    assert_eq!(response.semantic_unavailable, Some("provider_error"));
+
+    let response = search_repo(&state, repo, "frobnicate").await;
+    assert_eq!(response.mode, "hybrid");
+    assert_eq!(response.semantic_unavailable, None);
+    assert_eq!(fake.request_count() - before, 2);
+}
+
+#[tokio::test]
+async fn long_queries_reach_the_provider_cut_to_512_characters() {
+    let tmp = TempDir::new().unwrap();
+    let state = new_state(&tmp, |_| {});
+    let fake = Fake::start().await;
+    let repo = embedded_sample(&state, &fake).await;
+
+    let query = "zebra ".repeat(400)[..2000].to_string();
+    search_repo(&state, repo, &query).await;
+    let sent = fake.requests().last().unwrap().inputs();
+    assert_eq!(sent, vec![format!("query: {}", &query[..512])]);
 }
 
 // ── HTTP: /api/settings/embeddings ─────────────────────────────────────────
@@ -864,6 +945,38 @@ async fn test_endpoint_reports_without_storing() {
     assert_eq!(scalar(&state, "SELECT count(*) FROM settings").await, 0);
     let (_, body, _) = api(&app, "GET", "/api/settings/embeddings", &owner, None).await;
     assert_eq!(body["enabled"], false);
+}
+
+#[tokio::test]
+async fn test_endpoint_does_not_follow_redirects() {
+    let tmp = TempDir::new().unwrap();
+    let state = new_state(&tmp, |_| {});
+    let fake = Fake::start().await;
+    let target = format!("{}/embeddings", fake.base_url);
+    let redirector = Router::new().route(
+        "/v1/embeddings",
+        post(move || {
+            let target = target.clone();
+            async move { (StatusCode::TEMPORARY_REDIRECT, [(LOCATION, target)]) }
+        }),
+    );
+    let redirector_base = serve(redirector).await;
+    let app = sourcelens::http::router(state.clone());
+    let owner = owner_session(&state, "alex").await;
+
+    let mut body = settings_body(&fake);
+    body["baseUrl"] = json!(format!("{redirector_base}/v1"));
+    let (status, body, _) = api(
+        &app,
+        "POST",
+        "/api/settings/embeddings/test",
+        &owner,
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], false);
+    assert_eq!(fake.request_count(), 0);
 }
 
 #[tokio::test]

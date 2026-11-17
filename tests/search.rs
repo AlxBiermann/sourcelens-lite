@@ -77,12 +77,23 @@ async fn fixture() -> Fixture {
 
 impl Fixture {
     async fn search(&self, query: &str, filter: Filter) -> SearchResponse {
+        self.page(query, filter, 8, 0).await
+    }
+
+    async fn page(
+        &self,
+        query: &str,
+        filter: Filter,
+        limit: usize,
+        offset: usize,
+    ) -> SearchResponse {
         search::search(
             &self.state,
             SearchRequest {
                 query: query.to_string(),
                 filter,
-                limit: Some(8),
+                limit: Some(limit),
+                offset,
             },
         )
         .await
@@ -250,11 +261,16 @@ async fn empty_query_is_rejected() {
             query: "  ? ! ".to_string(),
             filter: fx.scope(),
             limit: Some(8),
+            offset: 0,
         },
     )
     .await
     .unwrap_err();
     assert_eq!(err.code, "empty_query");
+    assert_eq!(
+        err.message,
+        "Use at least one word of two or more characters."
+    );
     assert_eq!(err.status.as_u16(), 400);
 }
 
@@ -288,6 +304,7 @@ async fn hits_are_capped_per_file_and_by_limit() {
             query: "widget".to_string(),
             filter: fx.scope(),
             limit: Some(50),
+            offset: 0,
         },
     )
     .await
@@ -299,6 +316,50 @@ async fn hits_are_capped_per_file_and_by_limit() {
         .count();
     assert_eq!(in_file, 3, "hits from one file are capped at three");
     assert!(response.hits.len() <= 20);
+}
+
+#[tokio::test]
+async fn offset_pages_through_the_ranked_hits() {
+    let fx = fixture().await;
+    let files: Vec<(String, String)> = (0..12)
+        .map(|i| {
+            (
+                format!("src/pages/p{i}.ts"),
+                format!(
+                    "export function pageCase{i}(): string {{\n  return \"pagingtoken {i}\";\n}}\n"
+                ),
+            )
+        })
+        .collect();
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, content)| (path.as_str(), content.as_str()))
+        .collect();
+    fx.index(&files).await;
+    let located = |response: &SearchResponse| -> Vec<(String, u32)> {
+        response
+            .hits
+            .iter()
+            .map(|hit| (hit.path.clone(), hit.start_line))
+            .collect()
+    };
+
+    let all = fx.page("pagingtoken", fx.scope(), 20, 0).await;
+    assert_eq!(all.hits.len(), 12, "hits: {:?}", located(&all));
+    assert!(!all.has_more);
+    let all = located(&all);
+
+    let first = fx.page("pagingtoken", fx.scope(), 4, 0).await;
+    assert_eq!(located(&first), all[..4]);
+    assert!(first.has_more);
+
+    let second = fx.page("pagingtoken", fx.scope(), 2, 2).await;
+    assert_eq!(located(&second), all[2..4]);
+    assert!(second.has_more);
+
+    let last = fx.page("pagingtoken", fx.scope(), 4, 8).await;
+    assert_eq!(located(&last), all[8..]);
+    assert!(!last.has_more);
 }
 
 #[test]

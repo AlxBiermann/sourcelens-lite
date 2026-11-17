@@ -120,7 +120,7 @@ pub fn connected_in(conn: &Connection, ids: &[i64]) -> rusqlite::Result<Vec<Repo
          ORDER BY full_name, id",
         placeholders(ids.len())
     );
-    conn.prepare(&sql)?
+    conn.prepare_cached(&sql)?
         .query_map(params_from_iter(ids), from_row)?
         .collect()
 }
@@ -154,7 +154,7 @@ pub fn full_names(conn: &Connection, ids: &[i64]) -> rusqlite::Result<HashMap<i6
         "SELECT id, full_name FROM repositories WHERE id IN ({})",
         placeholders(ids.len())
     );
-    conn.prepare(&sql)?
+    conn.prepare_cached(&sql)?
         .query_map(params_from_iter(ids), |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect()
 }

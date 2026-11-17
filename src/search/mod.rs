@@ -6,11 +6,11 @@ pub mod symbols;
 pub mod vector;
 
 use std::borrow::Cow;
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use rusqlite::types::{Value, ValueRef};
-use rusqlite::{params_from_iter, Connection};
+use rusqlite::types::Value;
+use rusqlite::{params_from_iter, Connection, OptionalExtension, MAIN_DB};
 use serde::Serialize;
 
 use crate::db::sql::placeholders;
@@ -24,6 +24,8 @@ use crate::state::AppState;
 pub const DEFAULT_LIMIT: usize = 8;
 /// Most results one request may ask for.
 pub const MAX_LIMIT: usize = 20;
+/// Most results one request may skip.
+pub const MAX_OFFSET: usize = 40;
 
 const SYMBOL_WEIGHT: f64 = 2.0;
 const TEXT_WEIGHT: f64 = 1.0;
@@ -122,6 +124,8 @@ pub struct SearchRequest {
     pub filter: Filter,
     /// Clamped to `1..=MAX_LIMIT`; `None` = [`DEFAULT_LIMIT`].
     pub limit: Option<usize>,
+    /// Hits skipped before the returned ones; clamped to [`MAX_OFFSET`].
+    pub offset: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -149,6 +153,11 @@ pub struct SearchResponse {
     pub mode: &'static str,
     pub terms: Vec<String>,
     pub hits: Vec<SearchHit>,
+    /// Another hit follows the returned ones.
+    pub has_more: bool,
+    /// Why the semantic channel failed: "timeout" | "provider_error" | "internal".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_unavailable: Option<&'static str>,
 }
 
 /// Symbol, lexical and (when configured) semantic channels, fused, weighted by priors and capped per file.
@@ -156,40 +165,67 @@ pub async fn search(state: &AppState, req: SearchRequest) -> Result<SearchRespon
     let Some(plan) = query::plan(&req.query) else {
         return Err(ApiError::bad_request(
             "empty_query",
-            "Enter a search query.",
+            "Use at least one word of two or more characters.",
         ));
     };
     let limit = req.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let offset = req.offset.min(MAX_OFFSET);
     let terms = plan.terms.clone();
     if req.filter.repo_ids.is_empty() {
         return Ok(SearchResponse {
             mode: "lexical",
             terms,
             hits: Vec::new(),
+            has_more: false,
+            semantic_unavailable: None,
         });
     }
-    let semantic =
-        vector::search(state, req.query.trim(), &req.filter, SEMANTIC_CHANNEL_LIMIT).await;
-    let mode = if semantic.is_some() {
+    let trimmed = req.query.trim();
+    // Bounds the provider input and the query-vector cache key like the lexical plan.
+    let semantic_query = match trimmed.char_indices().nth(query::MAX_QUERY_CHARS) {
+        Some((end, _)) => &trimmed[..end],
+        None => trimmed,
+    };
+    let plan = Arc::new(plan);
+    let filter = Arc::new(req.filter);
+    let lexical = {
+        let (plan, filter) = (plan.clone(), filter.clone());
+        state
+            .db
+            .read(move |conn| lexical_lists(conn, &plan, &filter))
+    };
+    let (semantic, lists) = tokio::join!(
+        vector::search(state, semantic_query, &filter, SEMANTIC_CHANNEL_LIMIT),
+        lexical
+    );
+    let mut lists = lists?;
+    let mode = if semantic.ids.is_some() {
         "hybrid"
     } else {
         "lexical"
     };
-    let filter = req.filter;
-    let hits = state
+    if let Some(ids) = semantic.ids {
+        lists.push(("semantic", SEMANTIC_WEIGHT, ids));
+    }
+    let (hits, has_more) = state
         .db
-        .read(move |conn| ranked_hits(conn, &plan, &filter, semantic, limit))
+        .read(move |conn| ranked_hits(conn, &plan, &lists, limit, offset))
         .await?;
-    Ok(SearchResponse { mode, terms, hits })
+    Ok(SearchResponse {
+        mode,
+        terms,
+        hits,
+        has_more,
+        semantic_unavailable: semantic.unavailable,
+    })
 }
 
-fn ranked_hits(
+/// The symbol and full-text channels: `(channel, weight, ranked chunk ids)`.
+fn lexical_lists(
     conn: &Connection,
     plan: &QueryPlan,
     filter: &Filter,
-    semantic: Option<Vec<i64>>,
-    limit: usize,
-) -> rusqlite::Result<Vec<SearchHit>> {
+) -> rusqlite::Result<Vec<(&'static str, f64, Vec<i64>)>> {
     let mut lists: Vec<(&'static str, f64, Vec<i64>)> = Vec::new();
 
     let mut symbol_ids: Vec<i64> = Vec::new();
@@ -213,11 +249,19 @@ fn ranked_hits(
         let ids = lexical::search(conn, &expr, filter, TEXT_CHANNEL_LIMIT)?;
         lists.push(("text_any", TEXT_WEIGHT, ids));
     }
-    if let Some(ids) = semantic {
-        lists.push(("semantic", SEMANTIC_WEIGHT, ids));
-    }
+    Ok(lists)
+}
 
-    let fused = fuse::fuse(&lists);
+/// `lists` fused, weighted by priors and capped per file; `limit` hits after the first `offset`,
+/// and whether another hit follows them.
+fn ranked_hits(
+    conn: &Connection,
+    plan: &QueryPlan,
+    lists: &[(&'static str, f64, Vec<i64>)],
+    limit: usize,
+    offset: usize,
+) -> rusqlite::Result<(Vec<SearchHit>, bool)> {
+    let fused = fuse::fuse(lists);
     let ids: Vec<i64> = fused.iter().map(|(id, _, _)| *id).collect();
     let meta = chunk_meta(conn, &ids)?;
     let exempt_tests = plan
@@ -240,6 +284,8 @@ fn ranked_hits(
         .collect();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
 
+    // One hit beyond the page tells whether there is a next one.
+    let wanted = offset + limit + 1;
     let mut per_file: HashMap<i64, usize> = HashMap::new();
     let mut selected: Vec<(&ChunkMeta, f64, Vec<&'static str>)> = Vec::new();
     for (id, score, channels) in ranked {
@@ -252,27 +298,24 @@ fn ranked_hits(
         }
         *count += 1;
         selected.push((chunk, score, channels));
-        if selected.len() == limit {
+        if selected.len() == wanted {
             break;
         }
     }
+    let has_more = selected.len() == wanted;
+    selected.truncate(offset + limit);
+    selected.drain(..offset.min(selected.len()));
 
     let mut repo_ids: Vec<i64> = selected.iter().map(|(chunk, _, _)| chunk.repo_id).collect();
     repo_ids.sort_unstable();
     repo_ids.dedup();
     let repository_names = repositories::full_names(conn, &repo_ids)?;
-    // Each file's content is read once, however many of its chunks are hits.
-    let mut contents: HashMap<i64, Vec<u8>> = HashMap::new();
     let mut hits = Vec::with_capacity(selected.len());
     for (chunk, score, matched_by) in selected {
         let Some(repository) = repository_names.get(&chunk.repo_id) else {
             continue;
         };
-        let bytes = match contents.entry(chunk.file_id) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(file_content(conn, chunk.file_id)?),
-        };
-        let content = slice(bytes, chunk.start_byte, chunk.end_byte);
+        let content = chunk_text(conn, chunk.file_id, chunk.start_byte, chunk.end_byte)?;
         hits.push(SearchHit {
             repository: repository.clone(),
             path: chunk.path.clone(),
@@ -287,7 +330,7 @@ fn ranked_hits(
             matched_by,
         });
     }
-    Ok(hits)
+    Ok((hits, has_more))
 }
 
 /// Everything about a hit's chunk except its content.
@@ -336,22 +379,35 @@ fn chunk_meta(conn: &Connection, ids: &[i64]) -> rusqlite::Result<HashMap<i64, C
     rows.collect()
 }
 
-fn file_content(conn: &Connection, file_id: i64) -> rusqlite::Result<Vec<u8>> {
-    conn.prepare_cached("SELECT content FROM files WHERE id = ?1")?
-        .query_row([file_id], |row| {
-            Ok(match row.get_ref(0)? {
-                ValueRef::Blob(bytes) | ValueRef::Text(bytes) => bytes.to_vec(),
-                _ => Vec::new(),
-            })
-        })
-}
-
-/// `bytes[start..end]` (clamped) as text, replacing invalid UTF-8.
-fn slice(bytes: &[u8], start: i64, end: i64) -> String {
-    let offset = |at: i64| usize::try_from(at).unwrap_or(0).min(bytes.len());
-    let end = offset(end);
-    let start = offset(start).min(end);
-    String::from_utf8_lossy(&bytes[start..end]).into_owned()
+/// The file's content from `start_byte` to `end_byte` (clamped) as text, replacing invalid UTF-8.
+/// Reads only that range of the BLOB.
+fn chunk_text(
+    conn: &Connection,
+    file_id: i64,
+    start_byte: i64,
+    end_byte: i64,
+) -> rusqlite::Result<String> {
+    let blob = match conn.blob_open(MAIN_DB, "files", "content", file_id, true) {
+        Ok(blob) => blob,
+        // Skipped files have NULL content and no chunks; this only guards against such a row.
+        Err(err) => {
+            let is_null: Option<bool> = conn
+                .prepare_cached("SELECT content IS NULL FROM files WHERE id = ?1")?
+                .query_row([file_id], |row| row.get(0))
+                .optional()?;
+            return match is_null {
+                Some(true) => Ok(String::new()),
+                _ => Err(err),
+            };
+        }
+    };
+    let offset = |at: i64| usize::try_from(at).unwrap_or(0).min(blob.len());
+    let end = offset(end_byte);
+    let start = offset(start_byte).min(end);
+    let mut bytes = vec![0; end - start];
+    blob.read_at_exact(&mut bytes, start)?;
+    Ok(String::from_utf8(bytes)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned()))
 }
 
 fn names_in(conn: &Connection, chunk: &ChunkMeta) -> rusqlite::Result<Vec<String>> {
@@ -395,7 +451,7 @@ pub(crate) fn retain_matching(
     sql.push_str(&format!(" WHERE c.id IN ({})", placeholders(ids.len())));
     let mut values: Vec<Value> = ids.iter().map(|&id| Value::from(id)).collect();
     lexical::push_filter(&mut sql, &mut values, filter);
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let matching: HashSet<i64> = stmt
         .query_map(params_from_iter(values), |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;

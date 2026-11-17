@@ -80,7 +80,7 @@ pub fn search(
     ));
     values.push(Value::from(i64::try_from(limit).unwrap_or(i64::MAX)));
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(params_from_iter(values), |row| row.get(0))?;
     rows.collect()
 }

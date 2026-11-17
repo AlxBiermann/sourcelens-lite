@@ -749,6 +749,7 @@ async fn search_code(
             query: query.to_string(),
             filter: Filter::new(repo_ids, languages, path_prefix)?,
             limit: Some(limit),
+            offset: 0,
         },
     )
     .await?;
