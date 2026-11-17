@@ -9,6 +9,8 @@ pub mod settings;
 pub mod setup;
 pub mod ui;
 
+use std::time::Duration;
+
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Path, Request, State};
 use axum::http::request::Parts;
@@ -19,8 +21,10 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use tower_http::compression::CompressionLayer;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{MakeSpan, OnResponse, TraceLayer};
+use tracing::Span;
 
+use crate::crypto;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -42,6 +46,12 @@ const SECURITY_HEADERS: [(HeaderName, &str); 4] = [
     (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
 ];
 
+/// Sent on every response when the public URL is https.
+const STRICT_TRANSPORT_SECURITY: &str = "max-age=31536000";
+
+/// Layers, outermost first: request id → access log (trace) → compression → security headers →
+/// same-origin check → routes. `/healthz` sits outside the request id and the access log, so
+/// health probes do not fill the log; it still gets the security headers.
 pub fn router(state: AppState) -> Router {
     let mut app_routes = Router::new()
         .merge(setup::routes())
@@ -59,9 +69,19 @@ pub fn router(state: AppState) -> Router {
     let webhook_routes =
         crate::github::webhook::routes().layer(DefaultBodyLimit::max(WEBHOOK_BODY_LIMIT));
     let mcp_routes = crate::mcp::routes().layer(DefaultBodyLimit::max(MCP_BODY_LIMIT));
+    let health_routes =
+        Router::new()
+            .route("/healthz", get(healthz))
+            .layer(middleware::map_response_with_state(
+                state.clone(),
+                add_security_headers,
+            ));
+    let access_log = TraceLayer::new_for_http()
+        .make_span_with(RequestSpan)
+        .on_request(())
+        .on_response(AccessLog);
 
     Router::new()
-        .route("/healthz", get(|| async { "ok" }))
         .merge(app_routes)
         .merge(webhook_routes)
         .merge(mcp_routes)
@@ -70,16 +90,94 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             require_same_origin,
         ))
-        .layer(middleware::map_response(add_security_headers))
+        .layer(middleware::map_response_with_state(
+            state.clone(),
+            add_security_headers,
+        ))
         .layer(CompressionLayer::new())
-        .layer(TraceLayer::new_for_http())
+        .layer(access_log)
+        .layer(middleware::from_fn(assign_request_id))
+        .merge(health_routes)
         .with_state(state)
 }
 
-async fn add_security_headers(mut response: Response) -> Response {
+async fn healthz(State(state): State<AppState>) -> Response {
+    let checked = state
+        .db
+        .read(|conn| conn.query_row("SELECT 1", [], |_| Ok(())))
+        .await;
+    match checked {
+        Ok(()) => "ok".into_response(),
+        Err(err) => {
+            tracing::warn!("health check failed: {err}");
+            (StatusCode::SERVICE_UNAVAILABLE, "database unavailable").into_response()
+        }
+    }
+}
+
+/// Id of one request, shown in its access log line and returned as `x-request-id`.
+#[derive(Clone)]
+struct RequestId(String);
+
+async fn assign_request_id(mut req: Request, next: Next) -> Response {
+    let id = crypto::random_hex(8);
+    let value = HeaderValue::from_str(&id);
+    req.extensions_mut().insert(RequestId(id));
+    let mut response = next.run(req).await;
+    if let Ok(value) = value {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-request-id"), value);
+    }
+    response
+}
+
+/// Span of a request: method, path and request id. Never the query string or the full URI, at
+/// any log level, because one-time secrets (`setup_token`, OAuth `code` and `state`) travel there;
+/// every trace event of the request (response, failure, end of stream) is recorded in this span.
+#[derive(Clone, Copy)]
+struct RequestSpan;
+
+impl<B> MakeSpan<B> for RequestSpan {
+    fn make_span(&mut self, request: &axum::http::Request<B>) -> Span {
+        let id = request
+            .extensions()
+            .get::<RequestId>()
+            .map_or("", |id| id.0.as_str());
+        tracing::info_span!(
+            "request",
+            method = %request.method(),
+            path = %request.uri().path(),
+            request_id = %id
+        )
+    }
+}
+
+/// The access log: one `INFO` line per request once its response is ready.
+#[derive(Clone, Copy)]
+struct AccessLog;
+
+impl<B> OnResponse<B> for AccessLog {
+    fn on_response(self, response: &axum::http::Response<B>, latency: Duration, span: &Span) {
+        tracing::info!(
+            parent: span,
+            status = response.status().as_u16(),
+            latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
+            "request finished"
+        );
+    }
+}
+
+async fn add_security_headers(State(state): State<AppState>, mut response: Response) -> Response {
     let headers = response.headers_mut();
     for (name, value) in SECURITY_HEADERS {
         headers.insert(name, HeaderValue::from_static(value));
+    }
+    if state.cfg.public_is_https() {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static(STRICT_TRANSPORT_SECURITY),
+        );
     }
     response
 }

@@ -377,7 +377,7 @@ fn first_commit(fake: &mut Fake) {
             ("src/lib.rs", LIB_RS),
             ("src/util.py", UTIL_V1),
             ("README.md", README),
-            ("assets/logo.png", LOGO),
+            ("assets/logo.dat", LOGO),
             ("node_modules/left-pad/index.js", VENDORED),
         ],
     );
@@ -406,7 +406,7 @@ async fn first_index_records_files_counts_and_skips() {
 
     let files = env.files().await;
     assert_eq!(files.len(), 4, "{files:?}");
-    assert_eq!(files["assets/logo.png"].as_deref(), Some("binary"));
+    assert_eq!(files["assets/logo.dat"].as_deref(), Some("binary"));
     assert_eq!(files["src/lib.rs"], None);
     assert!(!files.contains_key("node_modules/left-pad/index.js"));
     assert!(!files.contains_key("link"));
@@ -452,7 +452,7 @@ async fn second_commit_fetches_only_the_changed_file() {
             &[
                 ("src/lib.rs", LIB_RS),
                 ("src/util.py", UTIL_V2),
-                ("assets/logo.png", LOGO),
+                ("assets/logo.dat", LOGO),
                 ("node_modules/left-pad/index.js", VENDORED),
             ],
         );
@@ -661,6 +661,23 @@ async fn failed_job_keeps_the_error_message() {
     let job = env.run("manual", false).await.unwrap();
     assert_eq!(job.status, "failed");
     assert!(job.error.is_some_and(|e| e.contains("gone")));
+}
+
+#[tokio::test]
+async fn failed_job_stores_the_internal_error_cause() {
+    let env = setup().await;
+    first_commit(&mut env.fake());
+    env.state
+        .db
+        .write(|conn| conn.execute_batch("DROP TABLE chunks_fts"))
+        .await
+        .unwrap();
+
+    let job = env.run("connect", false).await.unwrap();
+    assert_eq!(job.status, "failed");
+    let error = job.error.unwrap_or_default();
+    assert!(error.starts_with("Internal error: "), "{error}");
+    assert!(error.contains("chunks_fts"), "{error}");
 }
 
 // ── Queue behaviour (no GitHub involved) ─────────────────────────────────────

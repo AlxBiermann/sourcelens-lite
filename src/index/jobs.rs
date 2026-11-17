@@ -21,6 +21,8 @@ const FINISH_RETRIES: u32 = 5;
 const FINISH_FIRST_PAUSE: Duration = Duration::from_secs(1);
 /// Error of a job whose real result could not be written.
 const RESULT_NOT_SAVED: &str = "The job result could not be saved.";
+/// Longest internal error cause stored with a failed job, in characters.
+const ERROR_CAUSE_CHARS: usize = 300;
 
 /// Queues a job; a repository has at most one queued job, a newer request replaces its target.
 /// A `schedule` or `startup` request keeps the trigger of an already queued job, so a job queued
@@ -172,7 +174,7 @@ async fn step(state: &AppState) -> Result<bool, StepError> {
         ))),
     };
     if let Err(err) = &result {
-        tracing::warn!(job_id, repo_id, "index job failed: {}", err.message);
+        tracing::warn!(job_id, repo_id, "index job failed: {}", job_error(err));
     }
     finish(state, job_id, repo_id, trigger, result)
         .await
@@ -260,9 +262,9 @@ async fn finish(
 ) -> ApiResult<()> {
     let discard = matches!(trigger, Trigger::Startup | Trigger::Schedule)
         && matches!(&result, Ok(o) if o.files_changed == 0 && o.files_deleted == 0 && o.files_skipped == 0 && o.embedded == 0);
-    let (status, error) = match result {
+    let (status, error) = match &result {
         Ok(_) => (JobStatus::Succeeded, None),
-        Err(err) => (JobStatus::Failed, Some(err.message)),
+        Err(err) => (JobStatus::Failed, Some(job_error(err))),
     };
     let finished_at = now();
     let mut pause = FINISH_FIRST_PAUSE;
@@ -289,6 +291,17 @@ async fn finish(
     // A queued job of the same repository may have waited for this one.
     state.job_notify.notify_waiters();
     Ok(())
+}
+
+/// Error text of a failed job: the cause of an internal error, otherwise the error's message.
+fn job_error(err: &ApiError) -> String {
+    match &err.cause {
+        Some(cause) => {
+            let cause: String = cause.chars().take(ERROR_CAUSE_CHARS).collect();
+            format!("Internal error: {cause}")
+        }
+        None => err.message.clone(),
+    }
 }
 
 fn record_result(

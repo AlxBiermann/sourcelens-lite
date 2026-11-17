@@ -13,6 +13,9 @@ pub struct ApiError {
     pub message: String,
     /// How GitHub answered when a GitHub call caused this error.
     pub github: Option<GitHubFailure>,
+    /// What went wrong behind an internal error; logged and stored with failed jobs, never sent
+    /// in a response.
+    pub cause: Option<String>,
 }
 
 /// GitHub's answer behind an [`ApiError`], so callers can tell missing access from rate limits.
@@ -32,6 +35,7 @@ impl ApiError {
             code,
             message: message.into(),
             github: None,
+            cause: None,
         }
     }
 
@@ -64,12 +68,15 @@ impl ApiError {
     }
 
     pub fn internal(cause: impl fmt::Display) -> Self {
+        let cause = cause.to_string();
         tracing::error!("internal error: {cause}");
-        Self::new(
+        let mut err = Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
             "Internal error.",
-        )
+        );
+        err.cause = Some(cause);
+        err
     }
 
     /// The same error, marked with GitHub's answer.
