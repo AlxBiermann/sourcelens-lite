@@ -1,13 +1,22 @@
 version: 2
 
-# Minor and patch updates arrive as one grouped pull request per ecosystem;
-# major updates stay separate pull requests.
+# Minor and patch updates arrive grouped; major updates stay separate pull requests.
+# Groups follow what CI proves: tooling is covered by a green run, while grammar and UI
+# runtime updates change behavior no test checks.
+#
+# Node.js is pinned to major 26 (LTS). Dependabot ignores major updates of the node image and
+# of @types/node; raise the major by hand in Dockerfile, workflows/ci.yml, ui/package.json
+# and README.md together.
 updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
     groups:
+      # Grammar updates change parse trees, and not every language has a chunker test.
+      tree-sitter-minor-patch:
+        patterns: ["tree-sitter*"]
+        update-types: [minor, patch]
       cargo-minor-patch:
         patterns: ["*"]
         update-types: [minor, patch]
@@ -16,15 +25,28 @@ updates:
     directory: /ui
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
     groups:
-      npm-minor-patch:
-        patterns: ["*"]
+      # Ships in the embedded UI. CI only typechecks and builds it; check the running app.
+      npm-runtime-minor-patch:
+        dependency-type: production
+        update-types: [minor, patch]
+      # Build tooling, covered by the CI typecheck and build. TypeScript minors can break
+      # typechecking (package.json allows patches only), so its updates arrive on their own.
+      npm-tooling-minor-patch:
+        dependency-type: development
+        exclude-patterns: ["typescript"]
         update-types: [minor, patch]
 
   - package-ecosystem: docker
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
     groups:
       docker-minor-patch:
         patterns: ["*"]
