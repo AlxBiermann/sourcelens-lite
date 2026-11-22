@@ -436,7 +436,7 @@ If you set `SOURCELENS_SECRET_KEY`, keep it with the backup.
 
 ## Building from source and development
 
-Prerequisites: the Rust toolchain pinned in `rust-toolchain.toml` (1.96.1 with clippy and rustfmt, for example via `rustup`) and Node.js 24.
+Prerequisites: the Rust toolchain pinned in `rust-toolchain.toml` (1.96.1 with clippy and rustfmt, for example via `rustup`) and Node.js 26.
 
 Build the UI first; the binary embeds `ui/dist` at compile time (without it, the server answers web pages with "UI not built"):
 
