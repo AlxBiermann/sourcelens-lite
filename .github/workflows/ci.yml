@@ -70,7 +70,7 @@ jobs:
       - name: Check advisories
         # RUSTSEC-2026-0543 (chrono unmaintained) has no fixed version; the step reports without failing the run.
         continue-on-error: true
-        uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
+        uses: EmbarkStudios/cargo-deny-action@81891abc19297b21343b15ef67dc61e4aea74fda # v2.1.4
         with:
           command: check advisories
 
